@@ -1,0 +1,255 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Query rate by transport",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (transport) (rate(outisdns_queries_total[1m]))",
+          "legendFormat": "{{transport}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end query latency",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(outisdns_query_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(outisdns_query_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(outisdns_query_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Upstreams healthy",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(outisdns_upstream_health)", "legendFormat": "healthy" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Current QPS",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(outisdns_queries_total[1m]))", "legendFormat": "qps" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Success rate",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.99 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(outisdns_response_rcode_total{rcode=~\"NOERROR|NXDOMAIN\"}[1m])) / sum(rate(outisdns_response_rcode_total[1m]))",
+          "legendFormat": "success"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failovers (5m)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(increase(outisdns_failovers_total[5m]))", "legendFormat": "failovers" }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Upstream health",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": { "mappings": [
+          {
+            "type": "value",
+            "options": {
+              "0": { "text": "DOWN", "color": "red" },
+              "1": { "text": "DEGRADED", "color": "yellow" },
+              "2": { "text": "UP", "color": "green" }
+            }
+          }
+        ] },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "outisdns_upstream_state",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{upstream}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Upstream latency p95",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (upstream, le) (rate(outisdns_upstream_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{upstream}}"
+        }
+      ]
+    },
+    {
+      "type": "piechart",
+      "title": "Response codes (5m)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 19 },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (rcode) (increase(outisdns_response_rcode_total[5m]))",
+          "legendFormat": "{{rcode}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Drops: ACL / rate limit / overload / malformed",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 19 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15, "showPoints": "never" },
+          "stacking": { "mode": "normal" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "rate(outisdns_acl_denied_total[1m])", "legendFormat": "acl denied" },
+        { "refId": "B", "expr": "rate(outisdns_rate_limit_dropped_total[1m])", "legendFormat": "rate limited" },
+        { "refId": "C", "expr": "rate(outisdns_overload_dropped_total[1m])", "legendFormat": "overload" },
+        { "refId": "D", "expr": "rate(outisdns_malformed_packets_total[1m])", "legendFormat": "malformed" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Gateway workload",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 19 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "udp in-flight" },
+            "properties": [{ "id": "unit", "value": "short" }]
+          }
+        ]
+      },
+      "targets": [
+        { "refId": "A", "expr": "outisdns_udp_inflight", "legendFormat": "udp in-flight" },
+        { "refId": "B", "expr": "outisdns_tcp_connections", "legendFormat": "tcp connections" },
+        { "refId": "C", "expr": "outisdns_active_upstreams", "legendFormat": "active upstreams" },
+        { "refId": "D", "expr": "outisdns_cache_entries", "legendFormat": "cache entries" }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["outisdns", "dns"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "OutisDNS",
+  "uid": "outisdns",
+  "version": 1
+}

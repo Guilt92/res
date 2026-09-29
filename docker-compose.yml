@@ -1,0 +1,57 @@
+# OutisDNS full stack: gateway + Prometheus + Grafana. No database.
+#
+# Start:   docker-compose up -d --build
+# DNS:     dig @127.0.0.1 -p 15353 example.com
+# API:     http://localhost:8080/  (dashboard), /metrics, /api/status,
+#          /api/diagnostics, /api/config (export/import)
+# Metrics: http://localhost:9090/  (Prometheus)
+# Charts:  http://localhost:3000/  (Grafana, admin/admin)
+
+services:
+  outisdns:
+    build:
+      context: .
+      # Host networking + proxy args let the builder reach crates.io behind a
+      # localhost-only HTTP proxy; harmless on networks without a proxy.
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      # Whole directory (rw): the gateway rewrites the config atomically via
+      # temp-file + fsync + rename and keeps a .backup next to it.
+      - ./config:/etc/outisdns:rw
+      - ./dashboard:/app/dashboard:ro
+    ports:
+      - "15353:53/udp"
+      - "15353:53/tcp"
+      - "8080:8080"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - outisdns
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped

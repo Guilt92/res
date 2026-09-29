@@ -1,0 +1,82 @@
+# OutisDNS benchmark configuration.
+#
+# Talks only to local mock upstreams (bench/run.sh starts them), so results
+# are reproducible without depending on external resolvers or network policy.
+
+[server]
+udp_addr = "127.0.0.1:15353"
+tcp_addr = "127.0.0.1:15353"
+api_addr = "127.0.0.1:18080"
+dashboard_dir = "dashboard"
+max_udp_packet_size = 4096
+max_inflight_udp = 8192
+max_tcp_connections = 512
+max_queries_per_tcp_conn = 100
+tcp_idle_timeout_ms = 10000
+upstream_tcp_fallback = false
+shutdown_grace_ms = 2000
+
+# 3 attempts x 500ms fit inside the 2s deadline, so failover can use every
+# attempt the configuration asks for.
+[query]
+timeout = "2s"
+upstream_timeout = "500ms"
+max_attempts = 3
+
+[acl]
+allowed_cidrs = ["127.0.0.0/8", "::1/128"]
+denied_cidrs = []
+
+[ratelimit]
+enabled = false
+per_ip_qps = 50.0
+per_ip_burst = 100
+max_tracked_clients = 65536
+global_qps = 50000.0
+global_burst = 100000
+
+[failover]
+retry_on_servfail = false
+
+[health]
+enabled = true
+interval = "5s"
+timeout = "2s"
+failure_threshold = 3
+recovery_threshold = 2
+min_successes = 1
+tcp_probes = false
+probes = [{ name = "bench.test", type = "A" }]
+
+[selection]
+strategy = "weighted_reliability"
+latency_reference_ms = 50.0
+
+[cache]
+enabled = false
+max_entries = 4096
+min_ttl_secs = 0
+max_ttl_secs = 3600
+
+[logging]
+format = "json"
+filter = "info"
+servfail_sample_every = 0
+
+[[upstreams]]
+name = "mock-1"
+address = "127.0.0.1"
+port = 15300
+protocol = "udp"
+enabled = true
+priority = 1
+weight = 1
+
+[[upstreams]]
+name = "mock-2"
+address = "127.0.0.1"
+port = 15301
+protocol = "udp"
+enabled = true
+priority = 1
+weight = 1

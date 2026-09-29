@@ -1,0 +1,140 @@
+# OutisDNS production configuration.
+#
+# Single source of truth: a human-readable TOML file, written atomically by
+# the API (temp file + fsync + rename). The previous valid version is kept
+# next to it as `outisdns.toml.backup` and used automatically when the primary
+# file fails to load. There is no database anywhere in the stack.
+
+[server]
+udp_addr = "0.0.0.0:53"
+tcp_addr = "0.0.0.0:53"
+api_addr = "0.0.0.0:8080"
+dashboard_dir = "dashboard"
+max_udp_packet_size = 4096
+max_inflight_udp = 8192
+max_tcp_connections = 512
+max_queries_per_tcp_conn = 100
+tcp_idle_timeout_ms = 10000
+upstream_tcp_fallback = true
+shutdown_grace_ms = 5000
+
+# Overall deadline for one client query across all attempts, plus the cap for
+# a single upstream attempt and the failover budget. Keep
+# `max_attempts * upstream_timeout <= timeout`, otherwise later attempts are
+# cut short by the deadline before they can run.
+[query]
+timeout = "2s"
+upstream_timeout = "500ms"
+max_attempts = 3
+
+# Fail-closed: only these networks may use the resolver.
+# Add your customer networks here (public CIDRs are fine).
+[acl]
+allowed_cidrs = [
+  "127.0.0.0/8",
+  "::1/128",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "169.254.0.0/16",
+  "fc00::/7",
+]
+denied_cidrs = []
+
+[ratelimit]
+enabled = true
+per_ip_qps = 50.0
+per_ip_burst = 100
+max_tracked_clients = 65536
+global_qps = 50000.0
+global_burst = 100000
+
+[failover]
+# SERVFAIL is a valid DNS response; only retry it when you know your
+# upstreams produce spurious SERVFAILs.
+retry_on_servfail = false
+
+[health]
+enabled = true
+interval = "5s"
+timeout = "2s"
+failure_threshold = 3
+recovery_threshold = 2
+min_successes = 1
+tcp_probes = false
+probes = [
+  { name = "example.com", type = "A" },
+  { name = "example.com", type = "AAAA" },
+  { name = ".", type = "NS" },
+]
+
+[selection]
+strategy = "weighted_reliability" # weighted_reliability | best_score | random_healthy
+latency_reference_ms = 50.0
+
+[cache]
+enabled = false
+max_entries = 4096
+min_ttl_secs = 0
+max_ttl_secs = 3600
+
+[logging]
+format = "json"
+filter = "info"
+servfail_sample_every = 0
+
+# Upstream pool. `priority` defines strict tiers (selection never crosses a
+# tier boundary); `weight` splits traffic inside a tier.
+[[upstreams]]
+name = "cloudflare-1"
+address = "1.1.1.1"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 1
+weight = 1
+
+[[upstreams]]
+name = "cloudflare-2"
+address = "1.0.0.1"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 1
+weight = 1
+
+[[upstreams]]
+name = "google-1"
+address = "8.8.8.8"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 2
+weight = 1
+
+[[upstreams]]
+name = "google-2"
+address = "8.8.4.4"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 2
+weight = 1
+
+[[upstreams]]
+name = "quad9-1"
+address = "9.9.9.9"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 3
+weight = 1
+
+[[upstreams]]
+name = "quad9-2"
+address = "149.112.112.112"
+port = 53
+protocol = "udp"
+enabled = true
+priority = 3
+weight = 1

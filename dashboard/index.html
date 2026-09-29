@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OutisDNS Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { font-size: 18px; margin: 0; color: var(--accent); }
+  header .sub { color: var(--muted); font-size: 12px; }
+  #updated { margin-left: auto; color: var(--muted); font-size: 12px; }
+  main { padding: 20px; max-width: 1280px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px;
+  }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .card .value { font-size: 22px; margin-top: 4px; }
+  .card .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  h2 { font-size: 14px; margin: 26px 0 10px; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+  table {
+    width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+  }
+  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge.up { background: rgba(63,185,80,.15); color: var(--ok); border: 1px solid var(--ok); }
+  .badge.degraded { background: rgba(210,153,34,.15); color: var(--warn); border: 1px solid var(--warn); }
+  .badge.down { background: rgba(248,81,73,.15); color: var(--bad); border: 1px solid var(--bad); }
+  .badge.off { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid var(--muted); }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed var(--border); }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); }
+  .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 6px; }
+  .bar > i { display: block; height: 100%; background: var(--ok); }
+  footer { color: var(--muted); font-size: 11px; padding: 18px 20px; text-align: center; }
+  a { color: var(--accent); }
+  .err { color: var(--bad); }
+  .warn { color: var(--warn); }
+  #emergency {
+    display: none; margin: 16px 0 0; padding: 10px 14px; border-radius: 6px;
+    background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad);
+    font-weight: 600;
+  }
+  textarea {
+    width: 100%; min-height: 320px; background: #0a0d12; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    tab-size: 2;
+  }
+  .btns { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: #21262d; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover { background: #388bfd; color: #fff; }
+  #cfg-msg { font-size: 12px; }
+  .mono { font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OutisDNS</h1>
+  <span class="sub">health-aware DNS gateway</span>
+  <span class="sub" id="version"></span>
+  <span id="updated">connecting…</span>
+</header>
+
+<main>
+  <div id="emergency">NO_HEALTHY_UPSTREAM: every upstream is down — clients are getting SERVFAIL. Check the Upstream table and recent events.</div>
+
+  <div class="cards" id="cards" style="margin-top:16px"></div>
+
+  <h2>Upstreams</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th><th>Address</th><th>Health</th><th>Tier</th>
+        <th class="num">Queries</th><th class="num">Success</th>
+        <th class="num">P95 ms</th><th class="num">Timeouts</th>
+        <th>Last check</th>
+      </tr>
+    </thead>
+    <tbody id="upstream-rows"><tr><td colspan="9">loading…</td></tr></tbody>
+  </table>
+
+  <div class="grid2">
+    <div>
+      <h2>Response codes</h2>
+      <div class="card" id="rcodes"></div>
+    </div>
+    <div>
+      <h2>Data plane</h2>
+      <div class="card" id="dataplane"></div>
+    </div>
+    <div>
+      <h2>Gateway</h2>
+      <div class="card" id="gateway"></div>
+    </div>
+    <div>
+      <h2>Diagnostics</h2>
+      <div class="card" id="diagnostics"></div>
+    </div>
+  </div>
+
+  <h2>Recent events</h2>
+  <table>
+    <thead>
+      <tr><th>When</th><th>Kind</th><th>Action</th><th>Upstream</th><th>Detail</th></tr>
+    </thead>
+    <tbody id="event-rows"><tr><td colspan="5">loading…</td></tr></tbody>
+  </table>
+
+  <h2>Configuration</h2>
+  <div class="card">
+    <div class="kv"><span class="k">File</span><span class="mono" id="cfg-path">—</span></div>
+    <div class="kv"><span class="k">Source</span><span class="mono" id="cfg-source">—</span></div>
+    <div class="kv"><span class="k">Error</span><span class="mono" id="cfg-error">—</span></div>
+    <textarea id="cfg-text" spellcheck="false" placeholder="loading…"></textarea>
+    <div class="btns">
+      <button class="primary" id="cfg-apply">Apply (atomic write)</button>
+      <button id="cfg-reload">Reload from server</button>
+      <span id="cfg-msg"></span>
+    </div>
+  </div>
+</main>
+
+<footer>
+  JSON API: <a href="/api/status">/api/status</a> ·
+  <a href="/api/stats">/api/stats</a> ·
+  <a href="/api/diagnostics">/api/diagnostics</a> ·
+  <a href="/api/upstreams">/api/upstreams</a> ·
+  <a href="/api/events">/api/events</a> ·
+  metrics: <a href="/metrics">/metrics</a>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (n, d = 0) => Number(n ?? 0).toLocaleString(undefined,
+  { maximumFractionDigits: d, minimumFractionDigits: d });
+const uptime = (s) => {
+  s = Math.floor(s || 0);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+        m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m " + sec + "s";
+};
+const ago = (s) => s == null ? "—" :
+  s < 2 ? "just now" : s < 60 ? Math.floor(s) + "s ago" :
+  s < 3600 ? Math.floor(s / 60) + "m ago" : Math.floor(s / 3600) + "h ago";
+const bytes = (b) => b == null ? "—" : b >= 1048576 ? (b / 1048576).toFixed(1) + " MiB" : b + " B";
+
+function card(label, value, hint) {
+  return `<div class="card"><div class="label">${esc(label)}</div>` +
+         `<div class="value">${value}</div>` +
+         (hint ? `<div class="hint">${hint}</div>` : "") + `</div>`;
+}
+function kv(k, v) {
+  return `<div class="kv"><span class="k">${esc(k)}</span><span>${v}</span></div>`;
+}
+
+async function get(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+function renderStatus(s, st) {
+  $("version").textContent = "v" + (s.version || "?");
+  const qps = st.qps ?? 0;
+  const lat = st.latency || {};
+  const up = s.upstreams || {};
+  const cfg = s.config || {};
+  const inflight = s.inflight || {};
+  const emergency = (s.emergency || {}).no_healthy_upstreams;
+  $("emergency").style.display = emergency ? "block" : "none";
+
+  const latHint = lat.samples
+    ? `p50 ${fmt(lat.p50_ms, 1)} · p99 ${fmt(lat.p99_ms, 1)} ms`
+    : "no samples yet";
+
+  $("cards").innerHTML = [
+    card("Current QPS", fmt(qps, 1), "1s moving window"),
+    card("Queries", fmt(st.queries_total),
+         `${fmt(st.queries_udp)} udp · ${fmt(st.queries_tcp)} tcp`),
+    card("Latency P95", lat.samples ? fmt(lat.p95_ms, 1) + " ms" : "—", latHint),
+    card("Success rate", st.responses_total
+         ? (100 * (st.success_rate ?? 1)).toFixed(2) + "%" : "—",
+         st.responses_total ? `${fmt(st.error_count)} error responses` : "no responses yet"),
+    card("Upstreams",
+         `<span class="badge up">${up.healthy ?? 0} up</span>` +
+         ((up.degraded || 0) ? ` <span class="badge degraded">${up.degraded} deg</span>` : "") +
+         ((up.down || 0) ? ` <span class="badge down">${up.down} down</span>` : ""),
+         `${up.enabled ?? 0} of ${up.total ?? 0} enabled`),
+    card("Failovers", fmt(st.failovers), "queries needing >1 attempt"),
+    card("In-flight UDP", fmt(inflight.udp),
+         `${fmt(inflight.tcp_connections)} tcp conns`),
+    card("Uptime", uptime(s.uptime_seconds),
+         cfg.error
+           ? `<span class="err">config: ${esc(cfg.source)} (${esc(cfg.error).slice(0, 60)})</span>`
+           : `config: ${esc(cfg.source || "—")}`),
+  ].join("");
+
+  $("rcodes").innerHTML = Object.entries(st.rcode || {})
+    .filter(([, v]) => v > 0)
+    .map(([k, v]) => kv(k, fmt(v)))
+    .join("") || kv("traffic", "none yet");
+
+  const cache = st.cache || {};
+  const t = st.query_errors || {};
+  $("dataplane").innerHTML = [
+    kv("Cache", cache.enabled
+        ? `${cache.entries} entries · ${(100 * (cache.hit_ratio || 0)).toFixed(1)}% hits`
+        : "disabled"),
+    kv("ACL denied", fmt(st.acl_denied)),
+    kv("Rate limited", fmt(st.rate_limited)),
+    kv("Malformed dropped", fmt(st.malformed)),
+    kv("Overload dropped", fmt(st.overload_dropped)),
+    kv("SERVFAIL upstream", fmt((t.upstream_failure || 0) + (t.servfail || 0))),
+    kv("No candidates", fmt(t.no_upstreams || 0)),
+    kv("Config errors", fmt(st.config_errors)),
+  ].join("");
+
+  const q = s.query || {};
+  $("gateway").innerHTML = [
+    kv("Strategy", (s.selector || {}).strategy || "?"),
+    kv("Listeners",
+       `udp ${(s.listeners || {}).udp || "?"} · tcp ${(s.listeners || {}).tcp || "?"} · api ${(s.listeners || {}).api || "?"}`),
+    kv("ACL", `${(s.acl || {}).allowed_networks ?? 0} allowed / ${(s.acl || {}).denied_networks ?? 0} denied networks`),
+    kv("Rate limit", (s.rate_limit || {}).enabled
+        ? `${(s.rate_limit || {}).per_ip_qps}/s per IP (global ${(s.rate_limit || {}).global_qps}/s, ${fmt((s.rate_limit || {}).tracked_clients)} tracked)`
+        : "disabled"),
+    kv("Query budget",
+       `${q.max_attempts ?? "?"} attempts · ${q.upstream_timeout_ms ?? "?"}ms/upstream · ${q.timeout_ms ?? "?"}ms total${q.retry_on_servfail ? " · retry SERVFAIL" : ""}`),
+    kv("Health checks", (s.health_check || {}).enabled
+        ? `every ${(s.health_check || {}).interval_ms}ms · down after ${(s.health_check || {}).failure_threshold} · up after ${(s.health_check || {}).recovery_threshold}`
+        : "disabled"),
+    kv("Log format", s.log_format || "?"),
+  ].join("");
+}
+
+function renderUpstreams(list) {
+  const rows = (list.upstreams || []).map((u) => {
+    const health = u.enabled
+      ? `<span class="badge ${esc(u.health)}">${esc(u.health)}</span>`
+      : `<span class="badge off">disabled</span>`;
+    const lat = (u.latency && u.latency.samples) ? fmt(u.latency.p95_ms, 1) : "—";
+    return `<tr>
+      <td>${esc(u.name)}</td>
+      <td>${esc(u.address)}:${fmt(u.port)} ${esc(String(u.protocol).toUpperCase())}</td>
+      <td>${health}</td>
+      <td>prio ${fmt(u.priority)} · w${fmt(u.weight)}</td>
+      <td class="num">${fmt(u.queries)}</td>
+      <td class="num">${u.queries ? (100 * (u.success_rate ?? 1)).toFixed(1) + "%" : "—"}</td>
+      <td class="num">${lat}</td>
+      <td class="num">${fmt(u.timeouts)}</td>
+      <td>${ago(u.last_check_ago_secs)}</td>
+    </tr>`;
+  }).join("");
+  $("upstream-rows").innerHTML = rows ||
+    `<tr><td colspan="9">no upstreams configured — DNS will answer SERVFAIL until one is added</td></tr>`;
+}
+
+function renderEvents(data) {
+  const rows = (data.events || []).map((e) => {
+    const when = new Date(e.ts_ms).toLocaleTimeString();
+    const parts = [];
+    if (e.reason) parts.push("reason=" + e.reason);
+    if (e.fallback) parts.push("→ " + e.fallback);
+    if (e.from && e.to) parts.push(e.from + " → " + e.to);
+    if (e.attempts) parts.push("attempt " + e.attempts);
+    if (e.extra_latency_ms != null) parts.push("+" + e.extra_latency_ms + "ms");
+    if (e.detail && Object.keys(e.detail || {}).length)
+      parts.push(esc(JSON.stringify(e.detail)));
+    return `<tr>
+      <td>${esc(when)}</td>
+      <td>${esc(e.kind)}</td>
+      <td>${esc(e.action)}</td>
+      <td>${esc(e.upstream ?? "—")}</td>
+      <td class="mono">${parts.join(" · ") || "—"}</td>
+    </tr>`;
+  }).join("");
+  $("event-rows").innerHTML = rows ||
+    `<tr><td colspan="5">no events recorded yet</td></tr>`;
+}
+
+function renderDiagnostics(d) {
+  const res = d.resources || {};
+  const ev = d.events || {};
+  const emg = (d.emergency || {}).no_healthy_upstreams;
+  $("diagnostics").innerHTML = [
+    kv("PID", fmt(d.pid)),
+    kv("RSS", bytes(res.resident_memory_bytes)),
+    kv("Open FDs", fmt(res.open_fds)),
+    kv("Config", `${esc(d.config?.source ?? "?")}${d.config?.error ? ` <span class="err">(${esc(d.config.error).slice(0, 60)})</span>` : ""}`),
+    kv("QPS", fmt(d.qps, 1)),
+    kv("Failovers total", fmt(d.failovers_total)),
+    kv("Events", `config ${ev.config ?? 0} · health ${ev.health ?? 0} · failover ${ev.failover ?? 0}`),
+    kv("Emergency", emg ? `<span class="err">NO_HEALTHY_UPSTREAM</span>` : "no"),
+  ].join("");
+}
+
+// ---- configuration editor -------------------------------------------------
+let cfgLoaded = false;
+async function loadConfig() {
+  try {
+    const c = await get("/api/config");
+    $("cfg-path").textContent = c.path ?? "(in-memory only)";
+    $("cfg-source").textContent = (c.source ?? "?") + (c.error ? "" : "");
+    $("cfg-error").innerHTML = c.error
+      ? `<span class="err">${esc(c.error)}</span>` : "none";
+    $("cfg-text").value = c.toml || "";
+    cfgLoaded = true;
+    $("cfg-msg").innerHTML = `<span class="warn">loaded</span>`;
+  } catch (e) {
+    $("cfg-msg").innerHTML = `<span class="err">load failed: ${esc(e.message)}</span>`;
+  }
+}
+
+async function applyConfig() {
+  const msg = $("cfg-msg");
+  msg.innerHTML = "applying…";
+  try {
+    const r = await fetch("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ toml: $("cfg-text").value }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+    msg.innerHTML = `<span class="ok" style="color:var(--ok)">applied` +
+      (body.persisted ? " + written atomically" : " (memory only)") + `</span>`;
+    refresh();
+  } catch (e) {
+    msg.innerHTML = `<span class="err">rejected: ${esc(e.message)} (running config unchanged)</span>`;
+  }
+}
+
+// ---- polling --------------------------------------------------------------
+let failures = 0;
+async function refresh() {
+  try {
+    const [status, stats, upstreams] = await Promise.all([
+      get("/api/status"), get("/api/stats"), get("/api/upstreams"),
+    ]);
+    renderStatus(status, stats);
+    renderUpstreams(upstreams);
+    failures = 0;
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    failures++;
+    $("updated").innerHTML = `<span class="err">update failed (${esc(e.message)}) — API unreachable?</span>`;
+  }
+}
+async function refreshSlow() {
+  try {
+    const [events, diag] = await Promise.all([
+      get("/api/events?limit=25"), get("/api/diagnostics"),
+    ]);
+    renderEvents(events);
+    renderDiagnostics(diag);
+  } catch (e) { /* surfaced by the fast poll when persistent */ }
+}
+
+loadConfig();
+refresh();
+refreshSlow();
+setInterval(refresh, 2000);
+setInterval(refreshSlow, 6000);
+$("cfg-apply").addEventListener("click", applyConfig);
+$("cfg-reload").addEventListener("click", loadConfig);
+</script>
+</body>
+</html>

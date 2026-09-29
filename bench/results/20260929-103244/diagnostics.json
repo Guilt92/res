@@ -1,0 +1,162 @@
+{
+    "cache": {
+        "enabled": false,
+        "entries": 0,
+        "max_entries": 4096
+    },
+    "config": {
+        "error": null,
+        "path": "bench/bench.toml",
+        "source": "file",
+        "upstreams": 2,
+        "warnings": [
+            "server.upstream_tcp_fallback is off: truncated (TC=1) answers are passed through"
+        ]
+    },
+    "config_errors_total": 0,
+    "emergency": {
+        "no_healthy_upstreams": false
+    },
+    "events": {
+        "config": 1,
+        "failover": 0,
+        "health": 0
+    },
+    "failovers_total": 0,
+    "health_check": {
+        "enabled": true,
+        "interval_ms": 5000,
+        "probes": 1,
+        "timeout_ms": 2000
+    },
+    "inflight": {
+        "tcp_connections": 0,
+        "udp": 0
+    },
+    "listeners": {
+        "api": "127.0.0.1:18080",
+        "configured_api": "127.0.0.1:18080",
+        "configured_tcp": "127.0.0.1:15353",
+        "configured_udp": "127.0.0.1:15353",
+        "tcp": "127.0.0.1:15353",
+        "udp": "127.0.0.1:15353"
+    },
+    "pid": 138598,
+    "qps": 19402.74,
+    "query": {
+        "max_attempts": 3,
+        "retry_on_servfail": false,
+        "timeout_ms": 2000,
+        "upstream_timeout_ms": 500
+    },
+    "ratelimit": {
+        "enabled": false,
+        "tracked_clients": 0
+    },
+    "recent_config_events": [
+        {
+            "action": "startup",
+            "detail": {
+                "path": "bench/bench.toml"
+            },
+            "kind": "config",
+            "ts_ms": 1790665365210
+        }
+    ],
+    "recent_failovers": [],
+    "resources": {
+        "open_fds": 14,
+        "resident_memory_bytes": 15073280
+    },
+    "upstreams": {
+        "degraded": 0,
+        "down": 0,
+        "enabled": 2,
+        "healthy": 2,
+        "list": [
+            {
+                "address": "127.0.0.1",
+                "consecutive_failures": 0,
+                "consecutive_successes": 3,
+                "enabled": true,
+                "failures": 0,
+                "health": "up",
+                "health_failures": 0,
+                "health_latency": 3.9925389999999994,
+                "health_rounds": 3,
+                "id": 1,
+                "last_check_ago_secs": 1,
+                "last_error": null,
+                "last_failure_ago_secs": null,
+                "last_state_change_ago_secs": null,
+                "last_success_ago_secs": 0,
+                "latency": {
+                    "avg_ms": 2.8,
+                    "last_ms": 2.62,
+                    "max_ms": 6.806,
+                    "min_ms": 0.335,
+                    "p50_ms": 2.675,
+                    "p95_ms": 4.776,
+                    "p99_ms": 5.424,
+                    "samples": 146707
+                },
+                "name": "mock-1",
+                "ok": 146707,
+                "port": 15300,
+                "priority": 1,
+                "protocol": "udp",
+                "queries": 146707,
+                "refused": 0,
+                "servfail": 0,
+                "servfail_rate": 0.0,
+                "success_rate": 1.0,
+                "timeout_rate": 0.0,
+                "timeouts": 0,
+                "weight": 1
+            },
+            {
+                "address": "127.0.0.1",
+                "consecutive_failures": 0,
+                "consecutive_successes": 3,
+                "enabled": true,
+                "failures": 0,
+                "health": "up",
+                "health_failures": 0,
+                "health_latency": 5.944521666666667,
+                "health_rounds": 3,
+                "id": 2,
+                "last_check_ago_secs": 1,
+                "last_error": null,
+                "last_failure_ago_secs": null,
+                "last_state_change_ago_secs": null,
+                "last_success_ago_secs": 0,
+                "latency": {
+                    "avg_ms": 2.917,
+                    "last_ms": 3.984,
+                    "max_ms": 9.153,
+                    "min_ms": 0.486,
+                    "p50_ms": 2.677,
+                    "p95_ms": 4.901,
+                    "p99_ms": 7.364,
+                    "samples": 146848
+                },
+                "name": "mock-2",
+                "ok": 146848,
+                "port": 15301,
+                "priority": 1,
+                "protocol": "udp",
+                "queries": 146848,
+                "refused": 0,
+                "servfail": 0,
+                "servfail_rate": 0.0,
+                "success_rate": 1.0,
+                "timeout_rate": 0.0,
+                "timeouts": 0,
+                "weight": 1
+            }
+        ],
+        "total": 2
+    },
+    "uptime_seconds": 18,
+    "version": "0.1.0"
+}

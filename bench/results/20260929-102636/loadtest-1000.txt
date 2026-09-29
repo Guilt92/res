@@ -1,0 +1,21 @@
+loadtest target=127.0.0.1:15353 qps=1000 duration=15s workers=4 (udp=4, tcp=0) window=32 prefix=lt.example.com
+--- system (recorded for reproducibility) ---
+hostname:    OuTiS-Pc
+os:          Ubuntu 24.04.4 LTS
+kernel:      7.0.0-34-generic
+cpu:         Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz (4 cpus)
+memory:      15.5 GiB
+profile:     release 0.1.0
+--- results ---
+timestamp:  1790665014
+sent:        15000
+received:    15000
+failed:      0
+qps_target:  1000
+qps_achieved:1000.0
+failure_rate:0.0000%
+p50_ms:      0.504
+p95_ms:      2.646
+p99_ms:      5.476
+max_ms:      14.156
+avg_ms:      0.817

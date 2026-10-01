@@ -416,7 +416,7 @@ impl Default for CacheConfig {
 pub struct LoggingConfig {
     /// `json` (production) or `pretty` (development).
     pub format: LogFormat,
-    /// tracing filter, e.g. `info,outisdns=debug`.
+    /// tracing filter, e.g. `info,res=debug`.
     pub filter: String,
     /// Log a warning for every Nth SERVFAIL response (0 = never).
     pub servfail_sample_every: u32,
@@ -439,6 +439,107 @@ impl Default for LoggingConfig {
     }
 }
 
+/// How client IP addresses are exposed in events, logs, the API and the
+/// dashboard.
+///
+/// DNS client addresses are operationally useful (abuse, ACL and rate-limit
+/// troubleshooting) but are personal data, so the default is to keep the
+/// network prefix and drop the host part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIpPrivacy {
+    /// Show the network part only: IPv4 → `10.0.0.x`, IPv6 → `2001:db8::x`
+    /// (default). Aggregates are still per real address internally.
+    #[default]
+    Masked,
+    /// Expose the full address everywhere.
+    Full,
+    /// Do not track client addresses at all (no top-client table, no address
+    /// in events or logs).
+    Off,
+}
+
+impl ClientIpPrivacy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientIpPrivacy::Masked => "masked",
+            ClientIpPrivacy::Full => "full",
+            ClientIpPrivacy::Off => "off",
+        }
+    }
+}
+
+/// Monitoring integration (dashboard time-series source + traffic introspection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MonitoringConfig {
+    /// Base URL of a Prometheus server (`http://prometheus:9090`) used by
+    /// `GET /api/timeseries?source=prometheus|auto`. Empty string (default)
+    /// disables the proxy and the dashboard falls back to the gateway's own
+    /// native history.
+    ///
+    /// The `RES_PROMETHEUS_URL` environment variable overrides this
+    /// value (applied on every parse).
+    pub prometheus_url: String,
+    /// Client-address exposure (see [`ClientIpPrivacy`]). `off` disables the
+    /// top-client table entirely.
+    pub client_ip_privacy: ClientIpPrivacy,
+    /// Maximum tracked client addresses (bounded memory; `0` disables).
+    pub top_clients_max: usize,
+    /// Maximum tracked queried names (bounded memory; `0` disables).
+    pub top_domains_max: usize,
+    /// How many top clients are exported as Prometheus series
+    /// (`res_client_*`, masked labels by default). `0` disables the
+    /// export. Kept small so per-client metrics cannot explode in cardinality.
+    pub client_metrics_max: usize,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            prometheus_url: String::new(),
+            client_ip_privacy: ClientIpPrivacy::default(),
+            top_clients_max: 4_096,
+            top_domains_max: 8_192,
+            client_metrics_max: 100,
+        }
+    }
+}
+
+impl MonitoringConfig {
+    pub fn enabled(&self) -> bool {
+        !self.prometheus_url.trim().is_empty()
+    }
+
+    /// Whether per-client request counting is active at all.
+    pub fn track_clients(&self) -> bool {
+        self.client_ip_privacy != ClientIpPrivacy::Off && self.top_clients_max > 0
+    }
+
+    /// Whether per-name request counting is active.
+    pub fn track_domains(&self) -> bool {
+        self.top_domains_max > 0
+    }
+
+    /// Effective top-client table capacity (`0` = disabled by privacy).
+    pub fn client_table_cap(&self) -> usize {
+        if self.track_clients() {
+            self.top_clients_max
+        } else {
+            0
+        }
+    }
+
+    /// Effective top-domain table capacity (`0` = disabled).
+    pub fn domain_table_cap(&self) -> usize {
+        if self.track_domains() {
+            self.top_domains_max
+        } else {
+            0
+        }
+    }
+}
+
 /// The full persisted configuration (file + API mutations).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -452,6 +553,7 @@ pub struct AppConfig {
     pub selection: SelectionConfig,
     pub cache: CacheConfig,
     pub logging: LoggingConfig,
+    pub monitoring: MonitoringConfig,
     pub upstreams: Vec<UpstreamConfig>,
 }
 
@@ -476,9 +578,20 @@ impl AppConfig {
     /// Parse + validate a TOML document.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut cfg: Self = toml::from_str(text).map_err(|e| format!("parse error: {e}"))?;
+        cfg.apply_env_overrides();
         cfg.normalize_upstream_ids();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Environment overrides (highest precedence, applied on every parse so
+    /// reloads and API imports keep them).
+    fn apply_env_overrides(&mut self) {
+        if let Ok(v) = std::env::var("RES_PROMETHEUS_URL") {
+            if !v.trim().is_empty() {
+                self.monitoring.prometheus_url = v.trim().to_string();
+            }
+        }
     }
 
     /// Startup loader with a last-known-good fallback chain:
@@ -489,7 +602,7 @@ impl AppConfig {
     ///
     /// A malformed configuration file must never keep the gateway from
     /// starting: the problem is reported (`source`, `error`) and surfaced via
-    /// `/api/status` and `outisdns_config_errors_total`.
+    /// `/api/status` and `res_config_errors_total`.
     pub fn load_with_fallback(path: &Path) -> LoadedConfig {
         match Self::load(path) {
             Ok(config) => LoadedConfig {
@@ -505,11 +618,15 @@ impl AppConfig {
                         source: "backup",
                         error: Some(primary_err.to_string()),
                     },
-                    Err(backup_err) => LoadedConfig {
-                        config: Self::default(),
-                        source: "defaults",
-                        error: Some(format!("primary: {primary_err}; backup: {backup_err}")),
-                    },
+                    Err(backup_err) => {
+                        let mut config = Self::default();
+                        config.apply_env_overrides();
+                        LoadedConfig {
+                            config,
+                            source: "defaults",
+                            error: Some(format!("primary: {primary_err}; backup: {backup_err}")),
+                        }
+                    }
                 }
             }
         }
@@ -567,6 +684,15 @@ impl AppConfig {
 
         if self.query.max_attempts == 0 {
             return Err("query.max_attempts must be >= 1".into());
+        }
+        if self.monitoring.top_clients_max > 1_000_000 {
+            return Err("monitoring.top_clients_max must be <= 1000000".into());
+        }
+        if self.monitoring.top_domains_max > 1_000_000 {
+            return Err("monitoring.top_domains_max must be <= 1000000".into());
+        }
+        if self.monitoring.client_metrics_max > 10_000 {
+            return Err("monitoring.client_metrics_max must be <= 10000".into());
         }
         if self.query.upstream_timeout_ms == 0 {
             return Err("query.upstream_timeout must be > 0".into());
@@ -702,6 +828,8 @@ pub struct RuntimeConfig {
     pub failover: FailoverConfig,
     pub selection: SelectionConfig,
     pub cache: CacheConfig,
+    /// Client-address exposure on the data plane (events + top-client table).
+    pub client_ip_privacy: ClientIpPrivacy,
 }
 
 impl RuntimeConfig {
@@ -721,6 +849,7 @@ impl RuntimeConfig {
             failover: app.failover.clone(),
             selection: app.selection.clone(),
             cache: app.cache.clone(),
+            client_ip_privacy: app.monitoring.client_ip_privacy,
         })
     }
 }
@@ -929,7 +1058,7 @@ mod tests {
 
     #[test]
     fn example_config_loads() {
-        let cfg = AppConfig::load(Path::new("config/outisdns.toml")).expect("example config");
+        let cfg = AppConfig::load(Path::new("config/res.toml")).expect("example config");
         assert_eq!(cfg.upstreams.len(), 6);
         assert_eq!(cfg.query.timeout_ms, 2000);
         assert_eq!(cfg.query.upstream_timeout_ms, 500);
@@ -945,7 +1074,7 @@ mod tests {
 
     #[test]
     fn fallback_uses_backup_then_defaults() {
-        let dir = std::env::temp_dir().join(format!("outisdns-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("res-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cfg.toml");
 
@@ -970,5 +1099,73 @@ mod tests {
         assert_eq!(loaded.config.query.timeout_ms, 4_000);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_privacy_is_masked_with_bounded_tables() {
+        let m = MonitoringConfig::default();
+        assert_eq!(m.client_ip_privacy, ClientIpPrivacy::Masked);
+        assert_eq!(m.client_table_cap(), 4_096);
+        assert_eq!(m.domain_table_cap(), 8_192);
+        assert!(m.track_clients());
+        assert!(m.track_domains());
+        assert_eq!(m.client_metrics_max, 100, "bounded per-client export");
+    }
+
+    #[test]
+    fn rejects_unbounded_client_metrics_export() {
+        let mut cfg = base();
+        cfg.monitoring.client_metrics_max = 10_001;
+        assert!(
+            cfg.validate().is_err(),
+            "client metrics export must be cardinality-bounded"
+        );
+        cfg.monitoring.client_metrics_max = 10_000;
+        assert!(cfg.validate().is_ok());
+        cfg.monitoring.client_metrics_max = 0;
+        assert!(cfg.validate().is_ok(), "0 disables the export");
+    }
+
+    #[test]
+    fn privacy_off_disables_client_tracking_but_not_domains() {
+        let mut cfg = base();
+        cfg.monitoring.client_ip_privacy = ClientIpPrivacy::Off;
+        assert_eq!(cfg.monitoring.client_table_cap(), 0);
+        assert!(!cfg.monitoring.track_clients());
+        assert!(
+            cfg.monitoring.domain_table_cap() > 0,
+            "domains still tracked"
+        );
+    }
+
+    #[test]
+    fn rejects_unbounded_traffic_tables() {
+        let mut cfg = base();
+        cfg.monitoring.top_clients_max = 1_000_001;
+        assert!(cfg.validate().is_err(), "client cap must be bounded");
+        cfg.monitoring.top_clients_max = 4_096;
+        cfg.monitoring.top_domains_max = 1_000_001;
+        assert!(cfg.validate().is_err(), "domain cap must be bounded");
+    }
+
+    #[test]
+    fn privacy_round_trips_through_toml_and_reaches_the_hot_path() {
+        let mut cfg = base();
+        cfg.monitoring.client_ip_privacy = ClientIpPrivacy::Full;
+        cfg.monitoring.top_clients_max = 128;
+
+        let text = cfg.to_toml().expect("serialize");
+        assert!(
+            text.contains("client_ip_privacy = \"full\""),
+            "privacy must be visible in the exported config:\n{text}"
+        );
+        let parsed = AppConfig::parse(&text).expect("parse");
+        assert_eq!(parsed.monitoring.client_ip_privacy, ClientIpPrivacy::Full);
+        assert_eq!(parsed.monitoring.top_clients_max, 128);
+
+        let rt = RuntimeConfig::from_app(&parsed).expect("runtime");
+        assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Full);
+        let rt = RuntimeConfig::from_app(&base()).expect("runtime");
+        assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Masked);
     }
 }

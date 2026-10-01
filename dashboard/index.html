@@ -1,395 +1,1805 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-js-errors="0">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OutisDNS Dashboard</title>
+<title>res · Observability</title>
 <style>
-  :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
-    --ok: #3fb950; --warn: #d29922; --bad: #f85149;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  header {
-    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
-    padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
-  }
-  header h1 { font-size: 18px; margin: 0; color: var(--accent); }
-  header .sub { color: var(--muted); font-size: 12px; }
-  #updated { margin-left: auto; color: var(--muted); font-size: 12px; }
-  main { padding: 20px; max-width: 1280px; margin: 0 auto; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-    padding: 12px 14px;
-  }
-  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-  .card .value { font-size: 22px; margin-top: 4px; }
-  .card .hint { color: var(--muted); font-size: 11px; margin-top: 2px; }
-  h2 { font-size: 14px; margin: 26px 0 10px; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
-  table {
-    width: 100%; border-collapse: collapse; background: var(--panel);
-    border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
-  }
-  th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
-  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
-  tr:last-child td { border-bottom: none; }
-  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .badge.up { background: rgba(63,185,80,.15); color: var(--ok); border: 1px solid var(--ok); }
-  .badge.degraded { background: rgba(210,153,34,.15); color: var(--warn); border: 1px solid var(--warn); }
-  .badge.down { background: rgba(248,81,73,.15); color: var(--bad); border: 1px solid var(--bad); }
-  .badge.off { background: rgba(139,148,158,.15); color: var(--muted); border: 1px solid var(--muted); }
-  .grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
-  .kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed var(--border); }
-  .kv:last-child { border-bottom: none; }
-  .kv .k { color: var(--muted); }
-  .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 6px; }
-  .bar > i { display: block; height: 100%; background: var(--ok); }
-  footer { color: var(--muted); font-size: 11px; padding: 18px 20px; text-align: center; }
-  a { color: var(--accent); }
-  .err { color: var(--bad); }
-  .warn { color: var(--warn); }
-  #emergency {
-    display: none; margin: 16px 0 0; padding: 10px 14px; border-radius: 6px;
-    background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad);
-    font-weight: 600;
-  }
-  textarea {
-    width: 100%; min-height: 320px; background: #0a0d12; color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: 10px;
-    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    tab-size: 2;
-  }
-  .btns { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-  button {
-    background: #21262d; color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer;
-  }
-  button:hover { border-color: var(--accent); color: var(--accent); }
-  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
-  button.primary:hover { background: #388bfd; color: #fff; }
-  #cfg-msg { font-size: 12px; }
-  .mono { font-size: 12px; }
+/* Shabnam (SIL OFL 1.1, Saber Rastikerdar) — bundled in fonts/ so the
+   dashboard renders identically in Docker and on machines without the font. */
+@font-face{
+  font-family:"Shabnam";
+  src:url("fonts/Shabnam.ttf") format("truetype");
+  font-weight:400;font-style:normal;font-display:swap;
+}
+@font-face{
+  font-family:"Shabnam";
+  src:url("fonts/Shabnam-Medium.ttf") format("truetype");
+  font-weight:500;font-style:normal;font-display:swap;
+}
+@font-face{
+  font-family:"Shabnam";
+  src:url("fonts/Shabnam-Bold.ttf") format("truetype");
+  font-weight:700;font-style:normal;font-display:swap;
+}
+:root{
+  --bg:#0b0f14; --panel:#121821; --panel2:#0e141c; --line:#1e2836; --line2:#273345;
+  --fg:#d7e0ec; --dim:#8494ab; --faint:#5b6b82;
+  --ok:#3fb950; --warn:#d29922; --crit:#f85149; --info:#58a6ff;
+  --accent:#4cc2ff;
+  --sans:"Shabnam",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"Shabnam","SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+  --code:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  font:13px/1.45 var(--sans)}
+a{color:var(--info)}
+.mono{font-family:var(--mono)}
+h2{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
+  margin:22px 0 8px;font-weight:600}
+h2 .sub{color:var(--faint);letter-spacing:0;text-transform:none;font-weight:400;margin-left:10px}
+.wrap{max-width:1580px;margin:0 auto;padding:0 18px 60px}
+
+/* ---------- header ---------- */
+header{position:sticky;top:0;z-index:30;background:rgba(11,15,20,.94);
+  backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.hbar{max-width:1580px;margin:0 auto;padding:10px 18px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.brand{font-weight:700;font-size:15px;letter-spacing:.04em}
+.brand .v{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+.pill{display:inline-flex;align-items:center;gap:7px;border-radius:20px;
+  padding:3px 12px;font-size:12px;font-weight:600;border:1px solid transparent}
+.pill .dot{width:8px;height:8px;border-radius:50%}
+.pill.ok{background:rgba(63,185,80,.12);border-color:rgba(63,185,80,.4);color:#7ee787}
+.pill.ok .dot{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.pill.idle{background:rgba(88,166,255,.10);border-color:rgba(88,166,255,.35);color:#79c0ff}
+.pill.idle .dot{background:var(--info)}
+.pill.warn{background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.45);color:#e3b341}
+.pill.warn .dot{background:var(--warn)}
+.pill.crit{background:rgba(248,81,73,.14);border-color:rgba(248,81,73,.5);color:#ff7b72}
+.pill.crit .dot{background:var(--crit);animation:blink 1.2s infinite}
+@keyframes blink{50%{opacity:.35}}
+.hspace{flex:1}
+.ctl{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+.ctl select,.ctl button{background:var(--panel);color:var(--fg);border:1px solid var(--line2);
+  border-radius:6px;padding:4px 8px;font-size:12px;outline:none}
+.ctl select:hover,.ctl button:hover{border-color:#3b4a61}
+.ctl label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.chip{font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:5px;
+  border:1px solid var(--line2);color:var(--dim);background:var(--panel2)}
+.chip.native{border-color:#1f6feb55;color:#79c0ff}
+.chip.prom{border-color:#23863655;color:#7ee787}
+.chip.stale{border-color:#9e6a0355;color:#e3b341}
+#updated{font-family:var(--mono);font-size:11px;color:var(--faint)}
+
+/* ---------- banners ---------- */
+#emergency{display:none;margin-top:14px;padding:10px 14px;border-radius:8px;
+  background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.5);color:#ff9d97;font-weight:600}
+#apiproblem{display:none;margin-top:14px;padding:8px 14px;border-radius:8px;
+  background:rgba(210,153,34,.1);border:1px solid rgba(210,153,34,.45);color:#e3b341}
+#notraffic{display:none;margin-top:14px;padding:10px 14px;border-radius:8px;
+  background:rgba(88,166,255,.08);border:1px solid rgba(88,166,255,.35);color:#79c0ff;
+  font-weight:600}
+#notraffic span{font-weight:400;color:var(--dim);display:block;margin-top:3px;font-size:12px}
+
+/* ---------- KPI ---------- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;min-width:0}
+.kpi .k{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi .v{font-family:var(--mono);font-size:19px;font-weight:600;margin-top:2px;color:#e6edf3}
+.kpi .v small{font-size:11px;color:var(--dim);font-weight:400}
+.kpi .t{font-size:10.5px;color:var(--faint);font-family:var(--mono);height:13px}
+.kpi .t.up{color:#7ee787}.kpi .t.dn{color:#ff7b72}.kpi .t.flat{color:var(--faint)}
+.kpi.bad .v{color:#ff7b72}.kpi.good .v{color:#7ee787}
+
+/* ---------- traffic panels ---------- */
+.tgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
+.tpanel{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;min-width:0;display:flex;flex-direction:column}
+.tpanel .tptitle{font-size:11.5px;font-weight:600;color:#c9d5e4;letter-spacing:.03em;
+  margin-bottom:7px}
+.barlist{display:flex;flex-direction:column;gap:4px;min-height:40px}
+.barlist .br{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:baseline}
+.barlist .lab{font-family:var(--mono);font-size:11.5px;color:#c9d5e4;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.barlist .val{font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:nowrap}
+.barlist .val i{font-style:normal;color:var(--faint);margin-left:6px}
+.barlist .track{grid-column:1/-1;height:5px;background:#0d131b;border:1px solid var(--line);
+  border-radius:3px;overflow:hidden}
+.barlist .fill{height:100%;background:var(--accent);border-radius:3px}
+.tmeta{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-top:9px;
+  display:flex;gap:12px;flex-wrap:wrap}
+.tmeta b{color:var(--dim);font-weight:600}
+.tmeta .warnbit{color:#e3b341}
+.tpanel .tpsub{font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);
+  margin:10px 0 5px;font-weight:600}
+
+/* ---------- key/value stat lists ---------- */
+.stats{display:flex;flex-direction:column;gap:2px;min-height:40px}
+.stats .sr{display:flex;justify-content:space-between;gap:12px;padding:2.5px 0;
+  border-bottom:1px dotted #1a2330;font-size:12px}
+.stats .sr:last-child{border-bottom:none}
+.stats .sr .k{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stats .sr .v{font-family:var(--mono);color:#e6edf3;white-space:nowrap}
+.stats .sr .v.na{color:var(--faint)}
+.stats .sr .v.bad{color:#ff7b72}
+.stats .sr .v.good{color:#7ee787}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:#79c0ff}
+th.sortable.on{color:#79c0ff}
+th.sortable::after{content:" ↕";color:var(--faint);font-weight:400}
+th.sortable.on::after{content:" ↓"}
+
+/* ---------- signals ---------- */
+.signals{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:6px}
+.sig{display:flex;gap:10px;align-items:flex-start;background:var(--panel2);
+  border:1px solid var(--line);border-left-width:3px;border-radius:6px;padding:7px 10px}
+.sig.ok{border-left-color:var(--ok)}.sig.info{border-left-color:var(--info)}
+.sig.warn{border-left-color:var(--warn)}.sig.crit{border-left-color:var(--crit)}
+.sig .st{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.06em;
+  padding:1px 5px;border-radius:4px;flex:0 0 auto;margin-top:1px}
+.sig.ok .st{color:#7ee787;background:rgba(63,185,80,.12)}
+.sig.info .st{color:#79c0ff;background:rgba(88,166,255,.12)}
+.sig.warn .st{color:#e3b341;background:rgba(210,153,34,.14)}
+.sig.crit .st{color:#ff7b72;background:rgba(248,81,73,.14)}
+.sig .tx{min-width:0}
+.sig .tx b{font-weight:600;color:#e6edf3}
+.sig .tx span{display:block;color:var(--dim);font-size:11.5px;margin-top:1px}
+
+/* ---------- charts ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:10px}
+.chart{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:9px 11px 6px;min-width:0}
+.chart .chead{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  margin-bottom:4px;min-height:16px}
+.chart .ctitle{font-size:11.5px;font-weight:600;color:#c9d5e4;letter-spacing:.03em}
+.chart canvas{width:100%;height:170px;display:block}
+.legend{display:flex;gap:10px;flex-wrap:wrap;font-family:var(--mono);font-size:10.5px;color:var(--dim)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.legend .lv{color:#c9d5e4}
+.nodata{display:flex;align-items:center;justify-content:center;height:170px;color:var(--faint);
+  font-size:12px;border:1px dashed var(--line2);border-radius:6px}
+
+/* ---------- tables ---------- */
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;overflow:hidden;font-size:12px}
+th{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);
+  text-align:left;padding:7px 9px;border-bottom:1px solid var(--line2);background:var(--panel2);
+  white-space:nowrap;font-weight:600}
+td{padding:6px 9px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:#16202c}
+tbody tr.focus{background:#13243a;outline:1px solid #1f6feb}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+.state{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;
+  font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.state .d{width:8px;height:8px;border-radius:50%}
+.state.up{color:#7ee787}.state.up .d{background:var(--ok);box-shadow:0 0 5px var(--ok)}
+.state.degraded{color:#e3b341}.state.degraded .d{background:var(--warn)}
+.state.down{color:#ff7b72}.state.down .d{background:var(--crit)}
+.state.disabled{color:var(--faint)}.state.disabled .d{background:#484f58}
+.tag{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:4px;
+  border:1px solid var(--line2);color:var(--dim)}
+.tag.ok{color:#7ee787;border-color:#23863655}
+.tag.bad{color:#ff7b72;border-color:#f8514955}
+
+/* ---------- timeline ---------- */
+.tfilters{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.tfilters button{background:var(--panel);border:1px solid var(--line2);color:var(--dim);
+  border-radius:14px;padding:3px 12px;font-size:11.5px;cursor:pointer}
+.tfilters button.on{background:#13243a;border-color:#1f6feb;color:#79c0ff}
+#events{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.ev{display:grid;grid-template-columns:78px 74px 1fr;gap:10px;padding:6px 12px;
+  border-bottom:1px solid var(--line);font-size:12px;align-items:baseline}
+.ev:last-child{border-bottom:none}
+.ev .t{font-family:var(--mono);color:var(--faint);font-size:11px}
+.ev .k{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--dim)}
+.ev .m{color:var(--fg);white-space:normal;word-break:break-word}
+.ev.crit .k{color:#ff7b72}.ev.warn .k{color:#e3b341}
+.ev.crit{background:rgba(248,81,73,.05)}
+.ev .cnt{font-family:var(--mono);font-size:10px;background:#1f2937;border:1px solid var(--line2);
+  border-radius:9px;padding:0 7px;margin-left:7px;color:#9fb0c6}
+.empty{padding:16px;color:var(--faint);text-align:center;font-size:12px}
+
+/* ---------- config ---------- */
+details.cfg{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+details.cfg summary{cursor:pointer;padding:9px 13px;font-size:12px;color:var(--dim);font-weight:600}
+details.cfg[open] summary{border-bottom:1px solid var(--line)}
+.cfgbody{padding:12px}
+.cfgbody textarea{width:100%;height:300px;background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line2);border-radius:6px;font-family:var(--code);font-size:12px;
+  padding:10px;resize:vertical;white-space:pre}
+.cfgrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+button.primary{background:#1f6feb;border:none;color:#fff;border-radius:6px;
+  padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+button.primary:hover{background:#2f81f7}
+button.ghost{background:var(--panel2);border:1px solid var(--line2);color:var(--fg);
+  border-radius:6px;padding:6px 12px;font-size:12.5px;cursor:pointer}
+.cfgmeta{font-family:var(--mono);font-size:11px;color:var(--dim);display:flex;gap:16px;flex-wrap:wrap}
+#cfg-msg{font-size:12px}
+#cfg-msg.err{color:#ff7b72}#cfg-msg.ok{color:#7ee787}
+
+/* ---------- tooltip ---------- */
+#tip{position:fixed;z-index:50;pointer-events:none;display:none;background:#0a0e13ee;
+  border:1px solid var(--line2);border-radius:6px;padding:6px 9px;font-family:var(--mono);
+  font-size:11px;color:var(--fg);box-shadow:0 4px 16px #0009;max-width:340px}
+#tip .tt{color:var(--faint);margin-bottom:3px}
+#tip .row{display:flex;justify-content:space-between;gap:14px}
+#tip .row i{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px}
+footer{margin-top:34px;color:var(--faint);font-size:11px;border-top:1px solid var(--line);
+  padding-top:10px;display:flex;gap:18px;flex-wrap:wrap}
+#js-errors{display:none}
 </style>
+<script>
+/* Headless-CI error probe: any uncaught error/rejection is mirrored into the
+   DOM (data-js-errors + #js-errors) so `chrome --headless --dump-dom` can
+   assert a clean render. */
+window.__jsErrors = [];
+function __reportJsError(msg){
+  window.__jsErrors.push(String(msg));
+  document.documentElement.setAttribute('data-js-errors', String(window.__jsErrors.length));
+  var el = document.getElementById('js-errors');
+  if (el) el.textContent = window.__jsErrors.join(' | ');
+}
+window.addEventListener('error', function(e){ __reportJsError(e.message || e.type); });
+window.addEventListener('unhandledrejection', function(e){
+  __reportJsError('promise: ' + (e.reason && e.reason.message || e.reason));
+});
+</script>
 </head>
 <body>
+<div id="js-errors"></div>
+
 <header>
-  <h1>OutisDNS</h1>
-  <span class="sub">health-aware DNS gateway</span>
-  <span class="sub" id="version"></span>
-  <span id="updated">connecting…</span>
+  <div class="hbar">
+    <span class="brand">res<span class="v" id="version">…</span></span>
+    <span class="pill ok" id="verdict"><span class="dot"></span><span id="verdict-text">…</span></span>
+    <span class="ctl" id="uptime-wrap" style="font-family:var(--mono);font-size:11px">up <span id="uptime">—</span></span>
+    <span class="hspace"></span>
+    <span class="ctl">
+      <label>range
+        <select id="range-sel">
+          <option value="5m" selected>5 min</option>
+          <option value="15m">15 min</option>
+          <option value="1h">1 hour</option>
+          <option value="6h">6 hours</option>
+          <option value="24h">24 hours</option>
+          <option value="7d">7 days</option>
+        </select>
+      </label>
+      <label>source
+        <select id="source-sel">
+          <option value="native" selected>native</option>
+          <option value="auto">auto</option>
+          <option value="prometheus">prometheus</option>
+        </select>
+      </label>
+      <label title="Auto-refresh the live section and history"><input type="checkbox" id="auto-chk" checked> auto</label>
+      <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
+      <span id="updated">connecting…</span>
+    </span>
+  </div>
 </header>
 
-<main>
-  <div id="emergency">NO_HEALTHY_UPSTREAM: every upstream is down — clients are getting SERVFAIL. Check the Upstream table and recent events.</div>
+<div class="wrap">
+  <div id="emergency">NO_HEALTHY_UPSTREAM — every upstream is down, clients are receiving SERVFAIL. Check the upstream table and the timeline below.</div>
+  <div id="notraffic">No DNS queries received yet
+    <span>Traffic-derived metrics are not measurements yet: QPS is 0, packet/byte/query-type counters are 0, failover/timeout/rate-limit/ACL counters are 0, and latency, success rate, percentiles, cache hit ratio, per-client rates and average payload sizes show <b>N/A</b> instead of default values. The top-client table, the upstream-state lists and the failover list are empty, and charts show “No data” until the first request arrives.</span>
+  </div>
+  <div id="apiproblem">Control-plane API unreachable — charts and live data are stale.</div>
 
-  <div class="cards" id="cards" style="margin-top:16px"></div>
+  <!-- ============ DNS SERVICE (primary) ============ -->
+  <h2>DNS service <span class="sub">live query-path counters · refreshed every 2s from /api/status and /api/stats</span></h2>
+  <div class="kpis" id="kpis"></div>
 
-  <h2>Upstreams</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Name</th><th>Address</th><th>Health</th><th>Tier</th>
-        <th class="num">Queries</th><th class="num">Success</th>
-        <th class="num">P95 ms</th><th class="num">Timeouts</th>
-        <th>Last check</th>
-      </tr>
-    </thead>
-    <tbody id="upstream-rows"><tr><td colspan="9">loading…</td></tr></tbody>
-  </table>
-
-  <div class="grid2">
-    <div>
-      <h2>Response codes</h2>
-      <div class="card" id="rcodes"></div>
+  <!-- ============ SERVICE STATISTICS ============ -->
+  <h2>Service statistics <span class="sub">totals plus measured rates — unmeasured values stay <b>N/A</b>, measured zeros stay <b>0</b></span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Query outcomes</div>
+      <div class="stats" id="svc-stats"><div class="empty">loading…</div></div>
     </div>
-    <div>
-      <h2>Data plane</h2>
-      <div class="card" id="dataplane"></div>
+    <div class="tpanel">
+      <div class="tptitle">Latency &amp; rates</div>
+      <div class="stats" id="lat-stats"><div class="empty">loading…</div></div>
     </div>
-    <div>
-      <h2>Gateway</h2>
-      <div class="card" id="gateway"></div>
+    <div class="tpanel">
+      <div class="tptitle">Response codes</div>
+      <div class="stats" id="rcode-stats"><div class="empty">loading…</div></div>
     </div>
-    <div>
-      <h2>Diagnostics</h2>
-      <div class="card" id="diagnostics"></div>
+    <div class="tpanel">
+      <div class="tptitle">Packet statistics</div>
+      <div class="stats" id="pkt-stats"><div class="empty">loading…</div></div>
     </div>
   </div>
 
-  <h2>Recent events</h2>
-  <table>
-    <thead>
-      <tr><th>When</th><th>Kind</th><th>Action</th><th>Upstream</th><th>Detail</th></tr>
-    </thead>
-    <tbody id="event-rows"><tr><td colspan="5">loading…</td></tr></tbody>
+  <!-- ============ TOP CLIENTS ============ -->
+  <h2>Top clients <span class="sub">per-client outcomes, rates and payload volume <span class="chip" id="privacy-chip">—</span> · click a header to sort</span></h2>
+  <div style="overflow-x:auto">
+  <table id="cl-table">
+    <thead><tr>
+      <th data-sort="requests" class="sortable">Client</th>
+      <th class="num sortable" data-sort="requests">Requests</th>
+      <th class="num">Share</th>
+      <th class="num sortable" data-sort="rps">RPS</th>
+      <th class="num">OK</th>
+      <th class="num sortable" data-sort="failed">Failed</th>
+      <th class="num sortable" data-sort="timeouts">Timeouts</th>
+      <th class="num">Rate-lim</th>
+      <th class="num">ACL</th>
+      <th class="num sortable" data-sort="latency">Avg</th>
+      <th class="num sortable" data-sort="latency">P95</th>
+      <th class="num sortable" data-sort="bytes">Bytes</th>
+    </tr></thead>
+    <tbody id="cl-rows"><tr><td colspan="12" class="empty">loading…</td></tr></tbody>
   </table>
+  </div>
+  <div class="tmeta" id="cl-table-meta"></div>
 
-  <h2>Configuration</h2>
-  <div class="card">
-    <div class="kv"><span class="k">File</span><span class="mono" id="cfg-path">—</span></div>
-    <div class="kv"><span class="k">Source</span><span class="mono" id="cfg-source">—</span></div>
-    <div class="kv"><span class="k">Error</span><span class="mono" id="cfg-error">—</span></div>
-    <textarea id="cfg-text" spellcheck="false" placeholder="loading…"></textarea>
-    <div class="btns">
-      <button class="primary" id="cfg-apply">Apply (atomic write)</button>
-      <button id="cfg-reload">Reload from server</button>
-      <span id="cfg-msg"></span>
+  <!-- ============ TRAFFIC ============ -->
+  <h2>Traffic <span class="sub">queried names, question types and transport from bounded in-memory tables</span></h2>
+  <div class="tgrid">
+    <div class="tpanel" id="tp-domains">
+      <div class="tptitle">Top queried names</div>
+      <div class="barlist" id="dm-list"><div class="empty">loading…</div></div>
+      <div class="tmeta" id="dm-meta"></div>
+    </div>
+    <div class="tpanel" id="tp-qtypes">
+      <div class="tptitle">Question types</div>
+      <div class="barlist" id="qt-list"><div class="empty">loading…</div></div>
+      <div class="tmeta" id="qt-meta"></div>
+    </div>
+    <div class="tpanel" id="tp-transport">
+      <div class="tptitle">Transport</div>
+      <div class="barlist" id="tr-list"><div class="empty">loading…</div></div>
+      <div class="tpsub">Response codes</div>
+      <div class="barlist" id="rc-list"><div class="empty">loading…</div></div>
+      <div class="tmeta" id="tr-meta"></div>
     </div>
   </div>
-</main>
+  <div class="tmeta" id="traffic-meta"></div>
 
-<footer>
-  JSON API: <a href="/api/status">/api/status</a> ·
-  <a href="/api/stats">/api/stats</a> ·
-  <a href="/api/diagnostics">/api/diagnostics</a> ·
-  <a href="/api/upstreams">/api/upstreams</a> ·
-  <a href="/api/events">/api/events</a> ·
-  metrics: <a href="/metrics">/metrics</a>
-</footer>
+  <h2>Assessment <span class="sub">derived from live stats + the selected history window — every line maps to a real metric</span></h2>
+  <div class="signals" id="signals"><div class="sig info"><span class="st">…</span><div class="tx">collecting data</div></div></div>
+
+  <!-- ============ INFRASTRUCTURE (secondary) ============ -->
+  <h2>Process &amp; capacity <span class="sub">host-level gauges — secondary to the DNS service metrics above</span></h2>
+  <div class="kpis" id="kpis-infra"></div>
+
+  <!-- ============ HISTORY ============ -->
+  <h2>DNS service history <span class="sub" id="hist-meta">no data loaded</span></h2>
+  <div class="grid">
+    <div class="chart" id="w-ch-qps"><div class="chead"><span class="ctitle">Query rate</span><span class="legend" data-legend="ch-qps"></span></div><canvas id="ch-qps"></canvas></div>
+    <div class="chart" id="w-ch-requests"><div class="chead"><span class="ctitle">Requests per bucket</span><span class="legend" data-legend="ch-requests"></span></div><canvas id="ch-requests"></canvas></div>
+    <div class="chart" id="w-ch-lat"><div class="chead"><span class="ctitle">Client latency (ms)</span><span class="legend" data-legend="ch-lat"></span></div><canvas id="ch-lat"></canvas></div>
+    <div class="chart" id="w-ch-success"><div class="chead"><span class="ctitle">Success vs failure (%)</span><span class="legend" data-legend="ch-success"></span></div><canvas id="ch-success"></canvas></div>
+    <div class="chart" id="w-ch-packets"><div class="chead"><span class="ctitle">Packet rate (UDP in/out)</span><span class="legend" data-legend="ch-packets"></span></div><canvas id="ch-packets"></canvas></div>
+    <div class="chart" id="w-ch-size"><div class="chead"><span class="ctitle">Payload size (avg bytes)</span><span class="legend" data-legend="ch-size"></span></div><canvas id="ch-size"></canvas></div>
+  </div>
+  <div class="grid" style="margin-top:10px">
+    <div class="chart" id="w-ch-errors"><div class="chead"><span class="ctitle">Error breakdown (%)</span><span class="legend" data-legend="ch-errors"></span></div><canvas id="ch-errors"></canvas></div>
+    <div class="chart" id="w-ch-rcodes"><div class="chead"><span class="ctitle">Response codes (%)</span><span class="legend" data-legend="ch-rcodes"></span></div><canvas id="ch-rcodes"></canvas></div>
+    <div class="chart" id="w-ch-failovers"><div class="chead"><span class="ctitle">Failovers (per min)</span><span class="legend" data-legend="ch-failovers"></span></div><canvas id="ch-failovers"></canvas></div>
+    <div class="chart" id="w-ch-policy"><div class="chead"><span class="ctitle">Admission control (events per min)</span><span class="legend" data-legend="ch-policy"></span></div><canvas id="ch-policy"></canvas></div>
+    <div class="chart" id="w-ch-cache"><div class="chead"><span class="ctitle">Cache hit ratio (%)</span><span class="legend" data-legend="ch-cache"></span></div><canvas id="ch-cache"></canvas></div>
+  </div>
+
+  <h2>Upstream history <span class="sub">per-upstream and pool behaviour — where a client-visible failure originated</span></h2>
+  <div class="grid">
+    <div class="chart" id="w-ch-avail"><div class="chead"><span class="ctitle">Upstream availability</span><span class="legend" data-legend="ch-avail"></span></div><canvas id="ch-avail"></canvas></div>
+    <div class="chart" id="w-ch-uplat"><div class="chead"><span class="ctitle">Upstream latency p95 (ms)</span><span class="legend" data-legend="ch-uplat"></span></div><canvas id="ch-uplat"></canvas></div>
+    <div class="chart" id="w-ch-uptimeout"><div class="chead"><span class="ctitle">Upstream timeout rate (%)</span><span class="legend" data-legend="ch-uptimeout"></span></div><canvas id="ch-uptimeout"></canvas></div>
+    <div class="chart" id="w-ch-upqps"><div class="chead"><span class="ctitle">Upstream query rate</span><span class="legend" data-legend="ch-upqps"></span></div><canvas id="ch-upqps"></canvas></div>
+  </div>
+
+  <h2>Process history <span class="sub">host resource utilisation — secondary diagnostics</span></h2>
+  <div class="grid">
+    <div class="chart" id="w-ch-cpu"><div class="chead"><span class="ctitle">Process CPU (%)</span><span class="legend" data-legend="ch-cpu"></span></div><canvas id="ch-cpu"></canvas></div>
+    <div class="chart" id="w-ch-rss"><div class="chead"><span class="ctitle">Memory RSS (MB)</span><span class="legend" data-legend="ch-rss"></span></div><canvas id="ch-rss"></canvas></div>
+    <div class="chart" id="w-ch-fds"><div class="chead"><span class="ctitle">Open file descriptors</span><span class="legend" data-legend="ch-fds"></span></div><canvas id="ch-fds"></canvas></div>
+    <div class="chart" id="w-ch-load"><div class="chead"><span class="ctitle">In-flight UDP &amp; TCP connections</span><span class="legend" data-legend="ch-load"></span></div><canvas id="ch-load"></canvas></div>
+  </div>
+
+  <!-- ============ CURRENT UPSTREAM STATE ============ -->
+  <h2>Current upstream state <span class="sub">who is eligible for selection, who is receiving traffic now, who is avoided — from /api/upstreams</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Pool</div>
+      <div class="stats" id="up-state"><div class="empty">loading…</div></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Eligible for selection</div>
+      <div class="barlist" id="up-eligible"><div class="empty">loading…</div></div>
+      <div class="tpsub">Avoided (down while others are healthy)</div>
+      <div class="barlist" id="up-avoided"><div class="empty">—</div></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Receiving traffic now</div>
+      <div class="barlist" id="up-inuse"><div class="empty">loading…</div></div>
+      <div class="tpsub">Eligible but idle (backup)</div>
+      <div class="barlist" id="up-idle"><div class="empty">—</div></div>
+    </div>
+  </div>
+
+  <!-- ============ FAILOVER MONITORING ============ -->
+  <h2>Failover monitoring <span class="sub">totals, per-upstream counts and recent transitions — every value from real events</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Totals</div>
+      <div class="stats" id="fo-stats"><div class="empty">loading…</div></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Failovers per upstream</div>
+      <div class="barlist" id="fo-ups"><div class="empty">loading…</div></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Recent failovers</div>
+      <div class="barlist" id="fo-recent"><div class="empty">loading…</div></div>
+      <div class="tmeta" id="fo-meta"></div>
+    </div>
+  </div>
+
+  <!-- ============ UPSTREAMS ============ -->
+  <h2>Upstreams <span class="sub">troubleshooting table · click a row to highlight it in the charts</span></h2>
+  <div style="overflow-x:auto">
+  <table id="up-table">
+    <thead><tr>
+      <th>State</th><th>Use</th><th>Name</th><th>Address</th><th class="num">Pri/Wt</th>
+      <th class="num">QPS</th><th class="num">Attempts</th><th class="num">OK</th><th class="num">Failed</th><th class="num">Timeouts</th>
+      <th class="num">Success</th><th class="num">Failure</th><th class="num">Timeout</th>
+      <th class="num">Avg</th><th class="num">P50</th><th class="num">P95</th><th class="num">P99</th>
+      <th class="num">Failovers</th>
+      <th>Last success</th><th>Last failure</th><th>State changed</th><th>Last check</th><th>Check result</th><th>Last error</th>
+    </tr></thead>
+    <tbody id="up-rows"><tr><td colspan="24" class="empty">loading…</td></tr></tbody>
+  </table>
+  </div>
+
+  <!-- ============ TIMELINE ============ -->
+  <h2>Incident timeline <span class="sub">health transitions, failovers, config changes and system events (bounded in-memory rings)</span></h2>
+  <div class="tfilters" id="tfilters">
+    <button data-f="all" class="on">all</button>
+    <button data-f="health">health</button>
+    <button data-f="failover">failover</button>
+    <button data-f="config">config</button>
+    <button data-f="system">system</button>
+  </div>
+  <div id="events"><div class="empty">loading…</div></div>
+
+  <!-- ============ CONFIG ============ -->
+  <h2>Configuration <span class="sub">atomic on-disk persistence with last-known-good backup</span></h2>
+  <details class="cfg">
+    <summary>Edit running configuration (TOML)</summary>
+    <div class="cfgbody">
+      <div class="cfgmeta">
+        <span>file: <span id="cfg-path">—</span></span>
+        <span>source: <span id="cfg-source">—</span></span>
+        <span>error: <span id="cfg-error">—</span></span>
+      </div>
+      <textarea id="cfg-text" spellcheck="false" placeholder="loading…"></textarea>
+      <div class="cfgrow">
+        <button class="primary" id="cfg-apply">Apply (atomic write)</button>
+        <button class="ghost" id="cfg-reload">Reload from server</button>
+        <span id="cfg-msg"></span>
+      </div>
+    </div>
+  </details>
+
+  <footer>
+    <span>res observability dashboard — zero external dependencies, all graphs backed by live gateway metrics.</span>
+    <span>timeseries: <span class="mono" id="foot-ts">—</span></span>
+    <span>events: <span class="mono" id="foot-ev">—</span></span>
+    <span id="foot-ready">render: —</span>
+  </footer>
+</div>
+
+<div id="tip"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
-  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmt = (n, d = 0) => Number(n ?? 0).toLocaleString(undefined,
-  { maximumFractionDigits: d, minimumFractionDigits: d });
-const uptime = (s) => {
-  s = Math.floor(s || 0);
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
-        m = Math.floor((s % 3600) / 60), sec = s % 60;
-  return (d ? d + "d " : "") + (d || h ? h + "h " : "") + m + "m " + sec + "s";
+"use strict";
+/* =========================================================================
+ * State
+ * ====================================================================== */
+const RANGES = ["5m","15m","1h","6h","24h","7d"];
+const PALETTE = ["#4cc2ff","#7ee787","#ffa657","#ff7b72","#d2a8ff","#79c0ff","#e3b341","#f778ba","#56d364","#a5d6ff"];
+const $ = id => document.getElementById(id);
+
+const state = {
+  range: "5m",
+  // `native` (default): this gateway's own history — always its own data.
+  // `auto` falls back to Prometheus when configured, which may be scraping a
+  // *different* instance in a multi-gateway setup.
+  source: "native",
+  auto: true,
+  hist: null,          // last /api/timeseries payload
+  histAt: 0,
+  status: null, stats: null, upstreams: [], upState: null,
+  clients: null, clientSort: "requests",
+  events: [], monitoring: null,
+  focus: null,         // focused upstream name
+  filter: "all",
+  apiFails: 0, lastOk: 0,
+  upColors: {},
+  histTimer: null, curTimer: null, monTimer: null,
 };
-const ago = (s) => s == null ? "—" :
-  s < 2 ? "just now" : s < 60 ? Math.floor(s) + "s ago" :
-  s < 3600 ? Math.floor(s / 60) + "m ago" : Math.floor(s / 3600) + "h ago";
-const bytes = (b) => b == null ? "—" : b >= 1048576 ? (b / 1048576).toFixed(1) + " MiB" : b + " B";
 
-function card(label, value, hint) {
-  return `<div class="card"><div class="label">${esc(label)}</div>` +
-         `<div class="value">${value}</div>` +
-         (hint ? `<div class="hint">${hint}</div>` : "") + `</div>`;
-}
-function kv(k, v) {
-  return `<div class="kv"><span class="k">${esc(k)}</span><span>${v}</span></div>`;
-}
+/* Series metadata: label, unit, color for every canonical series key. */
+const META = {
+  qps:            ["Query rate","qps","#4cc2ff"],
+  queries:        ["Requests","","#4cc2ff"],
+  packets_in:     ["Packets in","","#79c0ff"],
+  packets_out:    ["Packets out","","#ffa657"],
+  avg_req_bytes:  ["Avg request","B","#4cc2ff"],
+  avg_resp_bytes: ["Avg response","B","#7ee787"],
+  success_pct:    ["Success","%","#7ee787"],
+  error_pct:      ["Errors","%","#ff7b72"],
+  servfail_pct:   ["SERVFAIL","%","#ffa657"],
+  nxdomain_pct:   ["NXDOMAIN","%","#d2a8ff"],
+  refused_pct:    ["REFUSED","%","#ff7b72"],
+  deadline_pct:   ["Deadline","%","#d2a8ff"],
+  timeout_pct:    ["Upstream timeout","%","#ff7b72"],
+  failover_per_min:["Failovers","/min","#e3b341"],
+  rate_limited_per_min:["Rate limited","/min","#d2a8ff"],
+  acl_denied_per_min:["ACL denied","/min","#79c0ff"],
+  overload_per_min:["Overload","/min","#f85149"],
+  malformed_per_min:["Malformed","/min","#8b949e"],
+  cache_hit_pct:  ["Hit ratio","%","#7ee787"],
+  p50_ms:         ["P50","ms","#7ee787"],
+  p95_ms:         ["P95","ms","#ffa657"],
+  p99_ms:         ["P99","ms","#ff7b72"],
+  inflight:       ["UDP in-flight","","#4cc2ff"],
+  tcp_open:       ["TCP conns","","#79c0ff"],
+  rss_mb:         ["RSS","MB","#d2a8ff"],
+  cpu_pct:        ["CPU","%","#ffa657"],
+  fds:            ["FDs","","#e3b341"],
+  healthy:        ["Healthy","","#7ee787"],
+  degraded:       ["Degraded","","#e3b341"],
+  down:           ["Down","","#ff7b72"],
+  cache_entries:  ["Entries","","#7ee787"],
+  tcp_conn_per_min:["TCP accepts","/min","#79c0ff"],
+};
 
-async function get(path) {
-  const r = await fetch(path, { cache: "no-store" });
-  if (!r.ok) throw new Error(path + " -> " + r.status);
-  return r.json();
-}
+/* Chart definitions: canvas id -> series keys (global) or per-upstream key. */
+const CHARTS = [
+  {id:"ch-qps",      keys:["qps"]},
+  {id:"ch-requests", keys:["queries"]},
+  {id:"ch-lat",      keys:["p50_ms","p95_ms","p99_ms"]},
+  {id:"ch-success",  keys:["success_pct","error_pct"]},
+  {id:"ch-packets",  keys:["packets_in","packets_out"]},
+  {id:"ch-size",     keys:["avg_req_bytes","avg_resp_bytes"]},
+  {id:"ch-errors",   keys:["servfail_pct","deadline_pct","timeout_pct"]},
+  {id:"ch-rcodes",   keys:["servfail_pct","nxdomain_pct","refused_pct"]},
+  {id:"ch-failovers",keys:["failover_per_min"]},
+  {id:"ch-policy",   keys:["rate_limited_per_min","acl_denied_per_min","overload_per_min","malformed_per_min"]},
+  {id:"ch-avail",    keys:["healthy","degraded","down"], step:true},
+  {id:"ch-uplat",    up:"p95_ms"},
+  {id:"ch-uptimeout",up:"timeout_pct"},
+  {id:"ch-upqps",    up:"qps"},
+  {id:"ch-cpu",      keys:["cpu_pct"]},
+  {id:"ch-rss",      keys:["rss_mb"]},
+  {id:"ch-fds",      keys:["fds"]},
+  {id:"ch-load",     keys:["inflight","tcp_open"]},
+  {id:"ch-cache",    keys:["cache_hit_pct"]},
+];
 
-function renderStatus(s, st) {
-  $("version").textContent = "v" + (s.version || "?");
-  const qps = st.qps ?? 0;
-  const lat = st.latency || {};
-  const up = s.upstreams || {};
-  const cfg = s.config || {};
-  const inflight = s.inflight || {};
-  const emergency = (s.emergency || {}).no_healthy_upstreams;
-  $("emergency").style.display = emergency ? "block" : "none";
-
-  const latHint = lat.samples
-    ? `p50 ${fmt(lat.p50_ms, 1)} · p99 ${fmt(lat.p99_ms, 1)} ms`
-    : "no samples yet";
-
-  $("cards").innerHTML = [
-    card("Current QPS", fmt(qps, 1), "1s moving window"),
-    card("Queries", fmt(st.queries_total),
-         `${fmt(st.queries_udp)} udp · ${fmt(st.queries_tcp)} tcp`),
-    card("Latency P95", lat.samples ? fmt(lat.p95_ms, 1) + " ms" : "—", latHint),
-    card("Success rate", st.responses_total
-         ? (100 * (st.success_rate ?? 1)).toFixed(2) + "%" : "—",
-         st.responses_total ? `${fmt(st.error_count)} error responses` : "no responses yet"),
-    card("Upstreams",
-         `<span class="badge up">${up.healthy ?? 0} up</span>` +
-         ((up.degraded || 0) ? ` <span class="badge degraded">${up.degraded} deg</span>` : "") +
-         ((up.down || 0) ? ` <span class="badge down">${up.down} down</span>` : ""),
-         `${up.enabled ?? 0} of ${up.total ?? 0} enabled`),
-    card("Failovers", fmt(st.failovers), "queries needing >1 attempt"),
-    card("In-flight UDP", fmt(inflight.udp),
-         `${fmt(inflight.tcp_connections)} tcp conns`),
-    card("Uptime", uptime(s.uptime_seconds),
-         cfg.error
-           ? `<span class="err">config: ${esc(cfg.source)} (${esc(cfg.error).slice(0, 60)})</span>`
-           : `config: ${esc(cfg.source || "—")}`),
-  ].join("");
-
-  $("rcodes").innerHTML = Object.entries(st.rcode || {})
-    .filter(([, v]) => v > 0)
-    .map(([k, v]) => kv(k, fmt(v)))
-    .join("") || kv("traffic", "none yet");
-
-  const cache = st.cache || {};
-  const t = st.query_errors || {};
-  $("dataplane").innerHTML = [
-    kv("Cache", cache.enabled
-        ? `${cache.entries} entries · ${(100 * (cache.hit_ratio || 0)).toFixed(1)}% hits`
-        : "disabled"),
-    kv("ACL denied", fmt(st.acl_denied)),
-    kv("Rate limited", fmt(st.rate_limited)),
-    kv("Malformed dropped", fmt(st.malformed)),
-    kv("Overload dropped", fmt(st.overload_dropped)),
-    kv("SERVFAIL upstream", fmt((t.upstream_failure || 0) + (t.servfail || 0))),
-    kv("No candidates", fmt(t.no_upstreams || 0)),
-    kv("Config errors", fmt(st.config_errors)),
-  ].join("");
-
-  const q = s.query || {};
-  $("gateway").innerHTML = [
-    kv("Strategy", (s.selector || {}).strategy || "?"),
-    kv("Listeners",
-       `udp ${(s.listeners || {}).udp || "?"} · tcp ${(s.listeners || {}).tcp || "?"} · api ${(s.listeners || {}).api || "?"}`),
-    kv("ACL", `${(s.acl || {}).allowed_networks ?? 0} allowed / ${(s.acl || {}).denied_networks ?? 0} denied networks`),
-    kv("Rate limit", (s.rate_limit || {}).enabled
-        ? `${(s.rate_limit || {}).per_ip_qps}/s per IP (global ${(s.rate_limit || {}).global_qps}/s, ${fmt((s.rate_limit || {}).tracked_clients)} tracked)`
-        : "disabled"),
-    kv("Query budget",
-       `${q.max_attempts ?? "?"} attempts · ${q.upstream_timeout_ms ?? "?"}ms/upstream · ${q.timeout_ms ?? "?"}ms total${q.retry_on_servfail ? " · retry SERVFAIL" : ""}`),
-    kv("Health checks", (s.health_check || {}).enabled
-        ? `every ${(s.health_check || {}).interval_ms}ms · down after ${(s.health_check || {}).failure_threshold} · up after ${(s.health_check || {}).recovery_threshold}`
-        : "disabled"),
-    kv("Log format", s.log_format || "?"),
-  ].join("");
-}
-
-function renderUpstreams(list) {
-  const rows = (list.upstreams || []).map((u) => {
-    const health = u.enabled
-      ? `<span class="badge ${esc(u.health)}">${esc(u.health)}</span>`
-      : `<span class="badge off">disabled</span>`;
-    const lat = (u.latency && u.latency.samples) ? fmt(u.latency.p95_ms, 1) : "—";
-    return `<tr>
-      <td>${esc(u.name)}</td>
-      <td>${esc(u.address)}:${fmt(u.port)} ${esc(String(u.protocol).toUpperCase())}</td>
-      <td>${health}</td>
-      <td>prio ${fmt(u.priority)} · w${fmt(u.weight)}</td>
-      <td class="num">${fmt(u.queries)}</td>
-      <td class="num">${u.queries ? (100 * (u.success_rate ?? 1)).toFixed(1) + "%" : "—"}</td>
-      <td class="num">${lat}</td>
-      <td class="num">${fmt(u.timeouts)}</td>
-      <td>${ago(u.last_check_ago_secs)}</td>
-    </tr>`;
-  }).join("");
-  $("upstream-rows").innerHTML = rows ||
-    `<tr><td colspan="9">no upstreams configured — DNS will answer SERVFAIL until one is added</td></tr>`;
-}
-
-function renderEvents(data) {
-  const rows = (data.events || []).map((e) => {
-    const when = new Date(e.ts_ms).toLocaleTimeString();
-    const parts = [];
-    if (e.reason) parts.push("reason=" + e.reason);
-    if (e.fallback) parts.push("→ " + e.fallback);
-    if (e.from && e.to) parts.push(e.from + " → " + e.to);
-    if (e.attempts) parts.push("attempt " + e.attempts);
-    if (e.extra_latency_ms != null) parts.push("+" + e.extra_latency_ms + "ms");
-    if (e.detail && Object.keys(e.detail || {}).length)
-      parts.push(esc(JSON.stringify(e.detail)));
-    return `<tr>
-      <td>${esc(when)}</td>
-      <td>${esc(e.kind)}</td>
-      <td>${esc(e.action)}</td>
-      <td>${esc(e.upstream ?? "—")}</td>
-      <td class="mono">${parts.join(" · ") || "—"}</td>
-    </tr>`;
-  }).join("");
-  $("event-rows").innerHTML = rows ||
-    `<tr><td colspan="5">no events recorded yet</td></tr>`;
-}
-
-function renderDiagnostics(d) {
-  const res = d.resources || {};
-  const ev = d.events || {};
-  const emg = (d.emergency || {}).no_healthy_upstreams;
-  $("diagnostics").innerHTML = [
-    kv("PID", fmt(d.pid)),
-    kv("RSS", bytes(res.resident_memory_bytes)),
-    kv("Open FDs", fmt(res.open_fds)),
-    kv("Config", `${esc(d.config?.source ?? "?")}${d.config?.error ? ` <span class="err">(${esc(d.config.error).slice(0, 60)})</span>` : ""}`),
-    kv("QPS", fmt(d.qps, 1)),
-    kv("Failovers total", fmt(d.failovers_total)),
-    kv("Events", `config ${ev.config ?? 0} · health ${ev.health ?? 0} · failover ${ev.failover ?? 0}`),
-    kv("Emergency", emg ? `<span class="err">NO_HEALTHY_UPSTREAM</span>` : "no"),
-  ].join("");
-}
-
-// ---- configuration editor -------------------------------------------------
-let cfgLoaded = false;
-async function loadConfig() {
+/* =========================================================================
+ * Helpers
+ * ====================================================================== */
+async function getJSON(path, timeoutMs=6000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const c = await get("/api/config");
-    $("cfg-path").textContent = c.path ?? "(in-memory only)";
-    $("cfg-source").textContent = (c.source ?? "?") + (c.error ? "" : "");
-    $("cfg-error").innerHTML = c.error
-      ? `<span class="err">${esc(c.error)}</span>` : "none";
-    $("cfg-text").value = c.toml || "";
-    cfgLoaded = true;
-    $("cfg-msg").innerHTML = `<span class="warn">loaded</span>`;
-  } catch (e) {
-    $("cfg-msg").innerHTML = `<span class="err">load failed: ${esc(e.message)}</span>`;
+    const r = await fetch(path, {signal: ctl.signal, cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status + " for " + path);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+const pad = n => String(n).padStart(2, "0");
+function fmtClock(ms){ const d=new Date(ms); return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds()); }
+function fmtClockShort(ms){
+  const d=new Date(ms);
+  if (state.range==="24h"||state.range==="7d")
+    return pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
+  return pad(d.getHours())+":"+pad(d.getMinutes());
+}
+function fmtAgo(secs){
+  if (secs==null) return "never";
+  if (secs < 60) return secs+"s ago";
+  if (secs < 3600) return Math.floor(secs/60)+"m ago";
+  if (secs < 86400) return Math.floor(secs/3600)+"h ago";
+  return Math.floor(secs/86400)+"d ago";
+}
+function fmtUptime(secs){
+  const d=Math.floor(secs/86400), h=Math.floor(secs%86400/3600), m=Math.floor(secs%3600/60);
+  if (d) return d+"d "+h+"h";
+  if (h) return h+"h "+m+"m";
+  return m+"m "+(secs%60)+"s";
+}
+/* `null`/undefined means "not measured yet" — never render it as a number.
+   Zero is only ever shown when the gateway actually counted zero. */
+function fmtVal(v, unit){
+  if (v==null || !isFinite(v)) return "N/A";
+  if (unit==="B") return fmtBytes(v);
+  const a = Math.abs(v);
+  let s;
+  if (unit==="%" || unit==="ms") s = a<10 ? v.toFixed(1) : v.toFixed(a<100?1:0);
+  else if (unit==="qps") s = a<10 ? v.toFixed(1) : v.toFixed(0);
+  else if (unit==="MB") s = v.toFixed(0);
+  else s = a<10 ? v.toFixed(1) : v.toFixed(0);
+  return s + (unit==="%" ? "%" : unit==="ms" ? "ms" : unit==="MB" ? "MB" : unit==="qps" ? "" : "");
+}
+/* Percent with an explicit "N/A" when there is no denominator. */
+function fmtPct(v, digits){
+  if (v==null || !isFinite(v)) return "N/A";
+  return (v*100).toFixed(digits==null?1:digits)+"%";
+}
+function seriesFrom(payload, key){
+  return (payload && payload.series && payload.series[key]) || [];
+}
+function lastVal(points){
+  for (let i=points.length-1;i>=0;i--) if (points[i][1]!=null) return points[i][1];
+  return null;
+}
+function prevVal(points){
+  let seen=false;
+  for (let i=points.length-1;i>=0;i--){
+    if (points[i][1]==null) continue;
+    if (seen) return points[i][1];
+    seen=true;
+  }
+  return null;
+}
+function median(arr){
+  if (!arr.length) return null;
+  const a=[...arr].sort((x,y)=>x-y), m=Math.floor(a.length/2);
+  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
+}
+function trendEl(cur, prev, unit, invertGood){
+  if (cur==null || prev==null) return {txt:"", cls:"flat"};
+  const d = cur - prev;
+  if (Math.abs(d) < Math.abs(cur)*0.03) return {txt:"→ "+fmtVal(cur,unit), cls:"flat"};
+  const arrow = d>0 ? "▲" : "▼";
+  const good = invertGood ? d<0 : d>0;
+  return {txt: arrow+" "+fmtVal(Math.abs(d),unit)+" vs prev", cls: good?"up":"dn"};
+}
+
+/* =========================================================================
+ * Canvas charts (zero dependencies)
+ * ====================================================================== */
+const chartHover = {};   // id -> {xs, series, box}
+
+function niceMax(v){
+  if (!isFinite(v) || v<=0) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v/e;
+  return (n<=1?1:n<=2?2:n<=5?5:10)*e;
+}
+
+function drawChart(def){
+  const canvas = $(def.id);
+  if (!canvas) return;
+  const wrap = canvas.parentElement;
+  const legendEl = wrap.querySelector('[data-legend="'+def.id+'"]');
+
+  // Assemble series.
+  let series = [];
+  if (def.up) {
+    const ups = state.hist && state.hist.upstreams ? state.hist.upstreams : {};
+    const names = Object.keys(ups).sort();
+    names.forEach((n,i) => {
+      const pts = ups[n] && ups[n][def.up];
+      if (pts) series.push({name:n, color:state.upColors[n]||PALETTE[i%PALETTE.length], points:pts, step:true});
+    });
+  } else {
+    for (const key of def.keys){
+      const meta = META[key] || [key,"","#8b949e"];
+      series.push({name:meta[0], color:meta[2], points:seriesFrom(state.hist, key), step:!!def.step});
+    }
+  }
+  if (state.focus){
+    series = series.filter(s => s.name===state.focus || !def.up);
+  }
+
+  const old = wrap.querySelector(".nodata");
+  if (old) old.remove();
+  const hasData = series.some(s => s.points.some(p => p[1]!=null));
+  canvas.style.display = hasData ? "block" : "none";
+  if (!hasData){
+    legendEl.innerHTML = "";
+    const d = document.createElement("div");
+    d.className = "nodata";
+    d.textContent = state.hist
+      ? "No data — no samples in this window (" + (state.hist.source||"?") + " source)"
+      : "No data — waiting for first history fetch…";
+    wrap.appendChild(d);
+    delete chartHover[def.id];
+    return;
+  }
+  canvas.style.display = "block";
+
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth || 400, H = canvas.clientHeight || 170;
+  canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+
+  const L=44, R=8, T=6, B=20;
+  const pw = W-L-R, ph = H-T-B;
+
+  // Domains.
+  let t0=Infinity, t1=-Infinity, v0=0, v1=-Infinity;
+  for (const s of series) for (const p of s.points){
+    if (p[0]<t0) t0=p[0];
+    if (p[0]>t1) t1=p[0];
+    if (p[1]!=null && p[1]>v1) v1=p[1];
+  }
+  if (t1<=t0){ t1 = t0+1000; }
+  if (v1<=0) v1 = 1;
+  v1 = niceMax(v1);
+
+  const X = t => L + (t-t0)/(t1-t0)*pw;
+  const Y = v => T + ph - (v-v0)/(v1-v0)*ph;
+
+  // Grid + Y labels.
+  ctx.strokeStyle = "#1c2634"; ctx.fillStyle = "#5b6b82";
+  ctx.font = '10px "Shabnam", sans-serif'; ctx.textAlign = "right";
+  const unit = META[(def.keys&&def.keys[0]) || ""] ? META[def.keys[0]][1] : "";
+  for (let i=0;i<=4;i++){
+    const v = v0 + (v1-v0)*i/4, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
+    ctx.fillText(fmtAxis(v, def), L-5, y+3);
+  }
+  // X labels.
+  ctx.textAlign = "center";
+  const ticks = 5;
+  for (let i=0;i<=ticks;i++){
+    const t = t0 + (t1-t0)*i/ticks, x = X(t);
+    ctx.fillText(fmtClockShort(t), Math.min(Math.max(x, L+24), W-R-24), H-6);
+  }
+
+  // Series lines.
+  for (const s of series){
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = s.name===state.focus ? 2.4 : 1.6;
+    ctx.beginPath();
+    let pen = false;
+    for (let i=0;i<s.points.length;i++){
+      const p = s.points[i];
+      if (p[1]==null){ pen = false; continue; }
+      const x = X(p[0]), y = Y(p[1]);
+      if (!pen){ ctx.moveTo(x,y); pen = true; }
+      else if (s.step){ ctx.lineTo(x, Y(s.points[i-1] && s.points[i-1][1]!=null ? s.points[i-1][1] : p[1])); ctx.lineTo(x,y); }
+      else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    // Last-value dot.
+    for (let i=s.points.length-1;i>=0;i--){
+      if (s.points[i][1]!=null){
+        ctx.fillStyle = s.color;
+        ctx.beginPath(); ctx.arc(X(s.points[i][0]), Y(s.points[i][1]), 2.4, 0, 7); ctx.fill();
+        break;
+      }
+    }
+  }
+
+  // Legend.
+  legendEl.innerHTML = series.map(s => {
+    const lv = lastVal(s.points);
+    const m = Object.values(META).find(v => v[0]===s.name);
+    const u = def.up ? (def.up.endsWith("_ms")?"ms":def.up.endsWith("_pct")?"%":"") : (m?m[1]:"");
+    return '<span><i style="background:'+s.color+'"></i>'+s.name+
+      ' <span class="lv">'+fmtVal(lv,u)+'</span></span>';
+  }).join("");
+
+  chartHover[def.id] = {xs: series, t0, t1, L, R, W, box: canvas.getBoundingClientRect()};
+}
+
+function fmtAxis(v, def){
+  if (def.keys){
+    const u = META[def.keys[0]] ? META[def.keys[0]][1] : "";
+    if (u==="%") return v.toFixed(v<10?1:0)+"%";
+    if (u==="ms") return v<10?v.toFixed(1):v.toFixed(0);
+    if (u==="MB") return v.toFixed(0);
+    if (u==="B") return v>=1024 ? (v/1024).toFixed(v>=10240?0:1)+"k" : v.toFixed(0);
+  }
+  if (v>=1000) return (v/1000).toFixed(v>=10000?0:1)+"k";
+  return v<10 ? v.toFixed(1) : v.toFixed(0);
+}
+
+/* Tooltip on hover. */
+const tip = $("tip");
+document.addEventListener("mousemove", e => {
+  let hit = null;
+  for (const [id, h] of Object.entries(chartHover)){
+    const canvas = $(id);
+    if (!canvas || canvas.style.display==="none") continue;
+    const r = canvas.getBoundingClientRect();
+    if (e.clientX>=r.left && e.clientX<=r.right && e.clientY>=r.top && e.clientY<=r.bottom){
+      hit = {h, x: e.clientX-r.left, r};
+      break;
+    }
+  }
+  if (!hit){ tip.style.display="none"; return; }
+  const {h, x} = hit;
+  const pw = h.W - h.L - h.R;
+  const frac = Math.min(Math.max((x-h.L)/pw, 0), 1);
+  const t = h.t0 + frac*(h.t1-h.t0);
+  // nearest shared timestamp across series
+  let bestT = null, bestD = Infinity;
+  for (const s of h.xs) for (const p of s.points){
+    const d = Math.abs(p[0]-t);
+    if (d<bestD){ bestD=d; bestT=p[0]; }
+  }
+  if (bestT==null){ tip.style.display="none"; return; }
+  let html = '<div class="tt">'+fmtClock(bestT)+'</div>';
+  for (const s of h.xs){
+    const p = s.points.find(p => p[0]===bestT);
+    const v = p ? p[1] : null;
+    if (v==null) continue;
+    html += '<div class="row"><span><i style="background:'+s.color+'"></i>'+s.name+'</span><b>'+fmtVal(v,"")+'</b></div>';
+  }
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  const tw = tip.offsetWidth;
+  tip.style.left = Math.min(e.clientX+14, window.innerWidth-tw-8)+"px";
+  tip.style.top = (e.clientY+14)+"px";
+});
+document.addEventListener("mouseleave", () => tip.style.display="none");
+
+/* =========================================================================
+ * KPIs + assessment
+ * ====================================================================== */
+function fmtBytes(n){
+  if (n==null || !isFinite(n)) return "N/A";
+  if (n >= 1048576) return (n/1048576).toFixed(1)+" MB";
+  if (n >= 1024) return (n/1024).toFixed(1)+" KB";
+  return Math.round(n)+" B";
+}
+function intOf(v){ return (v==null || !isFinite(v)) ? 0 : v; }
+
+function tilesHTML(list){
+  return list.map(k => {
+    const t = k.t ? '<div class="t '+k.t.cls+'">'+k.t.txt+'</div>' : '<div class="t"></div>';
+    return '<div class="kpi '+(k.cls||"")+'"><div class="k">'+k.k+'</div><div class="v">'+k.v+'</div>'+t+'</div>';
+  }).join("");
+}
+
+function renderKpis(){
+  const st = state.status, s = state.stats, h = state.hist;
+  if (!st || !s){ return; }
+  const t = s.traffic || {};
+  const rc = s.rcode || {};
+  const qpsL = lastVal(seriesFrom(h,"qps"));
+  const p95L = lastVal(seriesFrom(h,"p95_ms"));
+  const qpsP = prevVal(seriesFrom(h,"qps"));
+  const p95P = prevVal(seriesFrom(h,"p95_ms"));
+  const toPct = lastVal(seriesFrom(h,"timeout_pct"));
+  const measured = s.success_rate != null;
+
+  /* ---- DNS service (primary) ---- */
+  const service = [
+    {k:"Queries", v:String(intOf(s.queries_total)),
+      t:{txt:intOf(s.queries_udp)+" udp · "+intOf(s.queries_tcp)+" tcp", cls:"flat"}},
+    {k:"QPS", v:fmtVal(s.qps,"qps"), t:trendEl(qpsL, qpsP, "qps", false)},
+    {k:"Responses", v:String(intOf(s.responses_total)),
+      t: measured ? {txt:intOf(s.success_count)+" ok", cls:"flat"} : {txt:"no responses yet", cls:"flat"}},
+    {k:"Success", v: measured ? (s.success_rate*100).toFixed(1)+"%" : "N/A",
+      cls: measured ? (s.error_rate>0.01 ? "bad" : "good") : "",
+      t: measured ? {txt:(s.error_count)+" err", cls: s.error_count ? "dn":"flat"}
+                  : {txt:"no responses yet", cls:"flat"}},
+    {k:"P95 now", v:fmtVal(s.latency.p95_ms,"ms"), t:trendEl(p95L, p95P, "ms", true)},
+    {k:"P50 / P99", v:fmtVal(s.latency.p50_ms,"ms")+' <small>/</small> '+fmtVal(s.latency.p99_ms,"ms"),
+      t: measured ? undefined : {txt:"no samples yet", cls:"flat"}},
+    {k:"Timeouts (hist)", v: toPct==null?"N/A":toPct.toFixed(1)+"%",
+      cls: (toPct||0)>1?"bad":"", t:{txt: intOf(s.query_errors.deadline)+" deadline", cls: s.query_errors.deadline?"dn":"flat"}},
+    {k:"SERVFAIL", v:String(intOf(rc.SERVFAIL)), cls: rc.SERVFAIL>0?"bad":"",
+      t:{txt:"client answers", cls:"flat"}},
+    {k:"NXDOMAIN", v:String(intOf(rc.NXDOMAIN)), t:{txt:"client answers", cls:"flat"}},
+    {k:"REFUSED", v:String(intOf(rc.REFUSED)), cls: rc.REFUSED>0?"bad":"",
+      t:{txt:"acl + upstream", cls:"flat"}},
+    {k:"UDP packets", v:intOf(t.udp_packets_received),
+      t:{txt:intOf(t.udp_packets_sent)+" sent", cls:"flat"}},
+    {k:"Bytes in / out", v:fmtBytes(t.request_bytes)+" <small>/</small> "+fmtBytes(t.response_bytes),
+      t: t.avg_request_bytes==null
+          ? {txt:"no queries yet", cls:"flat"}
+          : {txt:"avg "+fmtBytes(t.avg_request_bytes)+" / "+fmtBytes(t.avg_response_bytes), cls:"flat"}},
+    {k:"Failovers", v:intOf(s.failovers), t:{txt:"lifetime", cls:"flat"}},
+    {k:"Rate limited", v:intOf(s.rate_limited), cls: s.rate_limited>0?"bad":"",
+      t:{txt:"lifetime", cls:"flat"}},
+    {k:"ACL denied", v:intOf(s.acl_denied), cls: s.acl_denied>0?"bad":"", t:{txt:"lifetime", cls:"flat"}},
+    {k:"Malformed", v:intOf(s.malformed), cls: s.malformed>0?"bad":"", t:{txt:"packets", cls:"flat"}},
+    {k:"Overload", v:intOf(s.overload_dropped), cls: s.overload_dropped>0?"bad":"",
+      t:{txt:"in-flight drops", cls:"flat"}},
+    {k:"Cache", v: !s.cache.enabled ? "off"
+        : (s.cache.hit_ratio==null ? "N/A" : (s.cache.hit_ratio*100).toFixed(0)+"%"),
+      t:{txt: s.cache.entries+" entries", cls:"flat"}},
+  ];
+  $("kpis").innerHTML = tilesHTML(service);
+
+  /* ---- Process & capacity (secondary) ---- */
+  const infra = [
+    {k:"Upstreams", v:st.upstreams.healthy+" <small>/</small> "+st.upstreams.total,
+      cls: st.upstreams.healthy===0?"bad":st.upstreams.degraded>0?"":"good",
+      t:{txt:st.upstreams.down+" down · "+st.upstreams.degraded+" degr", cls: st.upstreams.down?"dn":"flat"}},
+    {k:"In-flight", v:st.inflight.udp, t:{txt:st.inflight.tcp_connections+" tcp", cls:"flat"}},
+    {k:"CPU", v:s.resources_cpu!=null?s.resources_cpu+"%":"N/A", t:{txt:"of one core", cls:"flat"}},
+    {k:"Memory", v:(s.resources_rss!=null?(s.resources_rss/1048576).toFixed(0)+" <small>MB</small>":"N/A")},
+    {k:"Open FDs", v:s.resources_fds!=null?s.resources_fds:"N/A", t:{txt:"process handles", cls:"flat"}},
+  ];
+  $("kpis-infra").innerHTML = tilesHTML(infra);
+}
+
+/* =========================================================================
+ * Traffic (top clients / domains / question types — real counters only)
+ * ====================================================================== */
+function barRows(rows, denom){
+  if (!rows.length) return "";
+  const max = Math.max.apply(null, rows.map(r => r.value)) || 1;
+  const d = (denom && denom > 0) ? denom : rows.reduce((a,r) => a + r.value, 0) || 1;
+  return rows.map((r,i) => {
+    const pct = Math.max(r.value > 0 ? 1.5 : 0, r.value / max * 100);
+    const share = r.value / d * 100;
+    return '<div class="br">'+
+      '<span class="lab" title="'+escapeHtml(r.label)+'">'+escapeHtml(r.label)+'</span>'+
+      '<span class="val">'+r.value+'<i>'+(r.value>0 ? share.toFixed(1)+"%" : "")+'</i></span>'+
+      '<span class="track"><span class="fill" style="width:'+pct.toFixed(1)+
+        '%;background:'+PALETTE[i%PALETTE.length]+'"></span></span>'+
+      '</div>';
+  }).join("");
+}
+function metaBits(bits){
+  return bits.filter(Boolean).map(b =>
+    '<span>'+b[0]+': <b>'+escapeHtml(String(b[1]))+'</b></span>').join("");
+}
+
+function renderTraffic(){
+  const s = state.stats;
+  if (!s) return;
+  const t = s.traffic || {};
+  const priv = t.client_ip_privacy || "masked";
+  const chip = $("privacy-chip");
+  chip.textContent = "ip: " + priv;
+  chip.className = "chip " + (priv === "off" ? "stale" : "native");
+  chip.title = priv === "masked"
+    ? "Client addresses are shown with the host part hidden (IPv4 → 10.x.x.x)."
+    : priv === "full"
+      ? "Client addresses are shown in full (client_ip_privacy = full)."
+      : "Client addresses are not tracked or exposed (client_ip_privacy = off).";
+
+  const domains = t.domains || {};
+  const drows = Array.isArray(t.top_domains) ? t.top_domains : [];
+
+  // --- top queried names ---
+  if (!drows.length){
+    $("dm-list").innerHTML = '<div class="empty">No queried names recorded yet</div>';
+    $("dm-meta").innerHTML = metaBits([
+      ["tracked","0 / "+intOf(domains.cap)], ["requests","0"]]);
+  } else {
+    $("dm-list").innerHTML = barRows(
+      drows.map(r => ({label:String(r.domain), value:intOf(r.count)})),
+      intOf(domains.recorded_requests));
+    $("dm-meta").innerHTML = metaBits([
+      ["tracked", intOf(domains.tracked_keys)+" / "+intOf(domains.cap)],
+      ["requests", intOf(domains.recorded_requests)],
+      ["skipped", intOf(domains.skipped_requests)]
+    ]) + (intOf(domains.skipped_requests) > 0
+      ? '<span class="warnbit">table full — '+intOf(domains.skipped_requests)+' unattributed</span>' : "");
+  }
+
+  // --- question types ---
+  const qt = t.query_type || {};
+  const qrows = Object.keys(qt)
+    .map(k => ({label:k, value:intOf(qt[k])}))
+    .filter(r => r.value > 0)
+    .sort((a,b) => b.value - a.value || a.label.localeCompare(b.label));
+  const qsum = Object.keys(qt).reduce((a,k) => a + intOf(qt[k]), 0);
+  if (!qrows.length){
+    $("qt-list").innerHTML = '<div class="empty">No parsed queries yet — every query-type counter is 0</div>';
+    $("qt-meta").innerHTML = metaBits([["parsed queries","0"], ["counters", Object.keys(qt).length]]);
+  } else {
+    $("qt-list").innerHTML = barRows(qrows, qsum);
+    $("qt-meta").innerHTML = metaBits([
+      ["parsed queries", qsum], ["counters", Object.keys(qt).length]]);
+  }
+
+  // --- transport + response codes ---
+  const transport = [
+    {label:"UDP queries", value:intOf(s.queries_udp)},
+    {label:"TCP queries", value:intOf(s.queries_tcp)},
+    {label:"UDP packets in", value:intOf(t.udp_packets_received)},
+    {label:"UDP packets out", value:intOf(t.udp_packets_sent)},
+  ].filter(r => r.value > 0);
+  $("tr-list").innerHTML = transport.length
+    ? barRows(transport, Math.max(intOf(s.queries_udp) + intOf(s.queries_tcp),
+                                  intOf(t.udp_packets_received), 1))
+    : '<div class="empty">No packets received yet</div>';
+
+  const rc = s.rcode || {};
+  const rrows = Object.keys(rc)
+    .map(k => ({label:k, value:intOf(rc[k])}))
+    .filter(r => r.value > 0)
+    .sort((a,b) => b.value - a.value || a.label.localeCompare(b.label));
+  const rsum = intOf(s.responses_total);
+  $("rc-list").innerHTML = rrows.length
+    ? barRows(rrows, rsum)
+    : '<div class="empty">No responses sent yet</div>';
+
+  $("tr-meta").innerHTML = metaBits([
+    ["bytes in", fmtBytes(t.request_bytes)],
+    ["bytes out", fmtBytes(t.response_bytes)],
+    ["avg request", t.avg_request_bytes==null ? "N/A" : fmtBytes(t.avg_request_bytes)],
+    ["avg response", t.avg_response_bytes==null ? "N/A" : fmtBytes(t.avg_response_bytes)]
+  ]);
+  $("traffic-meta").textContent =
+    "bounded in-memory tables · " +
+    (priv === "off" ? "client addresses are not tracked" :
+      "client addresses shown as " + (priv === "masked" ? "network prefix only" : "full"));
+}
+
+/* =========================================================================
+ * Service statistics / packet statistics (key-value lists from /api/stats)
+ * ====================================================================== */
+function statRows(list){
+  return list.map(x => {
+    const na = (x.v === "N/A" || x.v == null);
+    const cls = na ? "v na" : (x.cls ? "v " + x.cls : "v");
+    return '<div class="sr"><span class="k">' + escapeHtml(x.k) +
+      '</span><span class="' + cls + '">' + x.v + '</span></div>';
+  }).join("");
+}
+function pctStr(v, digits){
+  if (v == null || !isFinite(v)) return "N/A";
+  return (v*100).toFixed(digits==null?1:digits) + "%";
+}
+
+function renderStatsBlocks(){
+  const s = state.stats;
+  if (!s) return;
+  const t = s.traffic || {}, rc = s.rcode || {}, qe = s.query_errors || {};
+
+  $("svc-stats").innerHTML = statRows([
+    {k:"Queries", v:String(intOf(s.queries_total))},
+    {k:"UDP / TCP", v:intOf(s.queries_udp)+" / "+intOf(s.queries_tcp)},
+    {k:"Responses", v:String(intOf(s.responses_total))},
+    {k:"Success", v:String(intOf(s.success_count)), cls:intOf(s.success_count)?"good":""},
+    {k:"Errors", v:String(intOf(s.error_count)), cls:intOf(s.error_count)?"bad":""},
+    {k:"SERVFAIL", v:String(intOf(rc.SERVFAIL)), cls:intOf(rc.SERVFAIL)?"bad":""},
+    {k:"NXDOMAIN", v:String(intOf(rc.NXDOMAIN))},
+    {k:"REFUSED", v:String(intOf(rc.REFUSED)), cls:intOf(rc.REFUSED)?"bad":""},
+    {k:"Deadline exceeded", v:String(intOf(qe.deadline)), cls:intOf(qe.deadline)?"bad":""},
+    {k:"No upstreams / upstream fail",
+      v:intOf(qe.no_upstreams)+" / "+intOf(qe.upstream_failure)},
+    {k:"Not-implemented", v:String(intOf(qe.notimp))},
+    {k:"Malformed", v:String(intOf(s.malformed)), cls:intOf(s.malformed)?"bad":""},
+    {k:"Rate limited", v:String(intOf(s.rate_limited)), cls:intOf(s.rate_limited)?"bad":""},
+    {k:"ACL denied", v:String(intOf(s.acl_denied))},
+    {k:"Overload drops", v:String(intOf(s.overload_dropped)), cls:intOf(s.overload_dropped)?"bad":""},
+    {k:"Cache", v: !s.cache.enabled ? "off"
+        : intOf(s.cache.hits)+" / "+intOf(s.cache.misses)+" · "+pctStr(s.cache.hit_ratio,0)},
+  ]);
+
+  $("lat-stats").innerHTML = statRows([
+    {k:"Success rate", v:pctStr(s.success_rate)},
+    {k:"Error rate", v:pctStr(s.error_rate), cls:s.error_rate>0.01?"bad":""},
+    {k:"Timeout rate (deadline)", v:pctStr(s.timeout_rate),
+      cls:(s.timeout_rate||0)>0?"bad":""},
+    {k:"Failovers per query", v:pctStr(s.failover_rate),
+      cls:(s.failover_rate||0)>0?"bad":""},
+    {k:"QPS (live)", v:fmtVal(s.qps,"qps")},
+    {k:"Latency avg", v:fmtVal(s.latency.avg_ms,"ms")},
+    {k:"Latency p50 / p95",
+      v:fmtVal(s.latency.p50_ms,"ms")+" / "+fmtVal(s.latency.p95_ms,"ms")},
+    {k:"Latency p99", v:fmtVal(s.latency.p99_ms,"ms")},
+    {k:"Latency samples", v:String(intOf(s.latency.samples))},
+    {k:"Timeouts (count)", v:String(intOf(s.timeout_count))},
+    {k:"Failovers (count)", v:String(intOf(s.failovers))},
+  ]);
+
+  const rsum = intOf(s.responses_total);
+  const rcRows = ["NOERROR","NXDOMAIN","SERVFAIL","REFUSED","FORMERR","NOTIMP","OTHER"]
+    .map(k => {
+      const n = intOf(rc[k]);
+      const share = rsum ? " · " + (n/rsum*100).toFixed(1) + "%" : "";
+      const bad = n > 0 && k !== "NOERROR" && k !== "NXDOMAIN";
+      return {k, v:String(n)+share, cls:bad?(k==="SERVFAIL"?"bad":""):""};
+    });
+  rcRows.push({k:"responses total", v:String(rsum)});
+  $("rcode-stats").innerHTML = statRows(rcRows);
+
+  const reqSeen = intOf(t.request_bytes) > 0;
+  const respSeen = intOf(t.response_bytes) > 0;
+  $("pkt-stats").innerHTML = statRows([
+    {k:"UDP packets in", v:String(intOf(t.udp_packets_received))},
+    {k:"UDP packets out", v:String(intOf(t.udp_packets_sent))},
+    {k:"Request bytes", v:fmtBytes(t.request_bytes)},
+    {k:"Response bytes", v:fmtBytes(t.response_bytes)},
+    {k:"Avg request payload",
+      v:t.avg_request_bytes==null?"N/A":fmtBytes(t.avg_request_bytes)},
+    {k:"Avg response payload",
+      v:t.avg_response_bytes==null?"N/A":fmtBytes(t.avg_response_bytes)},
+    {k:"Largest request",
+      v:reqSeen ? fmtBytes(intOf(t.max_request_bytes)) : "N/A"},
+    {k:"Largest response",
+      v:respSeen ? fmtBytes(intOf(t.max_response_bytes)) : "N/A"},
+    {k:"Oversized packets", v:String(intOf(t.oversized_packets)),
+      cls:intOf(t.oversized_packets)?"bad":""},
+    {k:"TCP connections",
+      v:intOf(s.tcp.connections)+" accepted · "+intOf(s.tcp.rejected)+" rejected"},
+    {k:"Requests counted", v:t.clients ? String(intOf(t.clients.recorded_requests)) : "N/A"},
+    {k:"Unattributed (table full)",
+      v:t.clients ? String(intOf(t.clients.skipped_requests)) : "N/A",
+      cls:t.clients && intOf(t.clients.skipped_requests)>0?"bad":""},
+  ]);
+}
+
+/* =========================================================================
+ * Top clients table (per-client outcomes from /api/clients)
+ * ====================================================================== */
+function renderClientTable(){
+  const s = state.stats;
+  if (!s) return;
+  const t = s.traffic || {};
+  const priv = t.client_ip_privacy || "masked";
+  const meta = t.clients || {};
+  const c = state.clients;
+  for (const th of document.querySelectorAll("#cl-table th.sortable")){
+    th.classList.toggle("on", th.getAttribute("data-sort") === state.clientSort);
+  }
+  if (priv === "off"){
+    $("cl-rows").innerHTML =
+      '<tr><td colspan="12" class="empty">Client-address tracking is disabled ' +
+      '(client_ip_privacy = "off")</td></tr>';
+    $("cl-table-meta").innerHTML = metaBits([["tracking","off"],["cap", intOf(meta.cap)]]);
+    return;
+  }
+  const rows = (c && Array.isArray(c.rows)) ? c.rows : [];
+  if (!rows.length){
+    $("cl-rows").innerHTML =
+      '<tr><td colspan="12" class="empty">No client addresses recorded yet — ' +
+      'every per-client counter is 0</td></tr>';
+    $("cl-table-meta").innerHTML = metaBits([
+      ["tracked","0 / "+intOf(meta.cap)], ["requests","0"], ["privacy",priv]]);
+    return;
+  }
+  $("cl-rows").innerHTML = rows.map(r => {
+    const failed = intOf(r.failed), timeouts = intOf(r.timeouts);
+    return '<tr>'+
+      '<td class="mono">'+escapeHtml(String(r.client))+'</td>'+
+      '<td class="num">'+intOf(r.requests)+'</td>'+
+      '<td class="num">'+(r.share==null?"N/A":(r.share*100).toFixed(1)+"%")+'</td>'+
+      '<td class="num">'+fmtVal(r.rps,"qps")+'</td>'+
+      '<td class="num" style="color:'+(intOf(r.ok)?"#7ee787":"inherit")+'">'+intOf(r.ok)+'</td>'+
+      '<td class="num" style="color:'+(failed?"#e3b341":"inherit")+'">'+failed+'</td>'+
+      '<td class="num" style="color:'+(timeouts?"#ff7b72":"inherit")+'">'+timeouts+'</td>'+
+      '<td class="num">'+intOf(r.rate_limited)+'</td>'+
+      '<td class="num">'+intOf(r.acl_denied)+'</td>'+
+      '<td class="num">'+fmtVal(r.avg_ms,"ms")+'</td>'+
+      '<td class="num">'+fmtVal(r.p95_ms,"ms")+'</td>'+
+      '<td class="num">'+fmtBytes(r.bytes)+'</td>'+
+    '</tr>';
+  }).join("");
+  $("cl-table-meta").innerHTML = metaBits([
+    ["privacy", priv],
+    ["sort", state.clientSort],
+    ["tracked", intOf(meta.tracked_keys)+" / "+intOf(meta.cap)],
+    ["recorded", intOf(meta.recorded_requests)],
+    ["skipped", intOf(meta.skipped_requests)]
+  ]) + (intOf(meta.skipped_requests) > 0
+    ? '<span class="warnbit">table full — '+intOf(meta.skipped_requests)+' unattributed</span>'
+    : "");
+}
+
+/* =========================================================================
+ * Current upstream state + failover monitoring
+ * ====================================================================== */
+function nameList(arr){
+  if (!arr || !arr.length) return '<div class="empty">none</div>';
+  return arr.map(n =>
+    '<div class="br"><span class="lab">'+escapeHtml(String(n))+'</span></div>').join("");
+}
+
+function renderUpState(){
+  const st = state.upState;
+  if (!st) return;
+  $("up-state").innerHTML = statRows([
+    {k:"Total upstreams", v:String(intOf(st.total))},
+    {k:"UP", v:String(intOf(st.up)), cls:intOf(st.up)?"good":"bad"},
+    {k:"Degraded", v:String(intOf(st.degraded)), cls:intOf(st.degraded)?"bad":""},
+    {k:"DOWN", v:String(intOf(st.down)), cls:intOf(st.down)?"bad":""},
+    {k:"Disabled", v:String(intOf(st.disabled))},
+    {k:"Eligible for selection", v:String((st.eligible||[]).length)},
+    {k:"Receiving traffic now", v:String((st.in_use||[]).length)},
+    {k:"Eligible but idle", v:String((st.idle||[]).length)},
+    {k:"Avoided (down, others healthy)", v:String((st.avoided||[]).length),
+      cls:intOf(st.avoided)?"bad":""},
+    {k:"Pool rate", v:fmtVal(st.total_qps,"qps")},
+    {k:"Emergency", v: st.emergency ? "YES — all SERVFAIL" : "no",
+      cls: st.emergency ? "bad" : "good"},
+  ]);
+  $("up-eligible").innerHTML = nameList(st.eligible);
+  $("up-avoided").innerHTML = nameList(st.avoided);
+  $("up-inuse").innerHTML = nameList(st.in_use);
+  $("up-idle").innerHTML = nameList(st.idle);
+}
+
+function fmtFailover(e){
+  return escapeHtml(e.upstream || "?") + " → " + escapeHtml(e.reason || "failed") +
+    " → fallback to " + escapeHtml(e.fallback || "?") +
+    (e.extra_latency_ms != null ? " → +" + e.extra_latency_ms + "ms" : "");
+}
+
+function renderFailovers(){
+  const s = state.stats;
+  if (!s) return;
+  const h = state.hist;
+  const foMin = lastVal(seriesFrom(h, "failover_per_min"));
+  const foEvents = state.events.filter(e => e.kind === "failover");
+  const attemptsFailed = state.upstreams.reduce((a,u) => a + intOf(u.failures), 0);
+  $("fo-stats").innerHTML = statRows([
+    {k:"Failovers (lifetime)", v:String(intOf(s.failovers)),
+      cls:intOf(s.failovers)?"bad":""},
+    {k:"Failover rate", v:pctStr(s.failover_rate, 2)},
+    {k:"Failovers/min (window)", v:foMin==null?"N/A":foMin.toFixed(1)},
+    {k:"Client deadlines", v:String(intOf(s.timeout_count))},
+    {k:"Failed upstream attempts", v:String(attemptsFailed), cls:attemptsFailed?"bad":""},
+    {k:"Recent failover events", v:String(foEvents.length)},
+  ]);
+  const perUp = state.upstreams
+    .map(u => ({label:u.name, value:intOf(u.failovers)}))
+    .filter(r => r.value > 0);
+  const foSum = perUp.reduce((a,r) => a + r.value, 0);
+  $("fo-ups").innerHTML = perUp.length
+    ? barRows(perUp, foSum)
+    : '<div class="empty">No failovers recorded yet</div>';
+  const recent = foEvents.slice(0, 8);
+  $("fo-recent").innerHTML = recent.length
+    ? recent.map(e =>
+        '<div class="br"><span class="lab">'+fmtFailover(e)+'</span>'+
+        '<span class="val">'+fmtClock(e.ts_ms)+'</span></div>').join("")
+    : '<div class="empty">No failover events yet</div>';
+  $("fo-meta").innerHTML = metaBits([
+    ["ring", foEvents.length + " recent"],
+    ["window", foMin==null ? "N/A" : foMin.toFixed(1) + "/min"]
+  ]);
+}
+
+
+function renderVerdict(){
+  const st = state.status, s = state.stats;
+  const pill = $("verdict"), txt = $("verdict-text");
+  if (!st || !s){ pill.className="pill warn"; txt.textContent="collecting…"; return; }
+  let level = "ok", label = "HEALTHY";
+  const cfgErr = st.config && st.config.error;
+  const emergency = st.emergency && st.emergency.no_healthy_upstreams;
+  const idle = !s.queries_total;
+  if (emergency){ level="crit"; label="CRITICAL · NO HEALTHY UPSTREAM"; }
+  else if (cfgErr){ level="warn"; label="DEGRADED · CONFIG FALLBACK"; }
+  else if (s.error_rate != null && s.error_rate > 0.10){ level="crit"; label="CRITICAL · FAILING QUERIES"; }
+  else if (s.error_rate != null && s.error_rate > 0.01){ level="warn"; label="DEGRADED · ERRORS >1%"; }
+  else if (st.upstreams.down > 0){ level="warn"; label="DEGRADED · UPSTREAM DOWN"; }
+  else if (st.upstreams.degraded > 0){ level="warn"; label="DEGRADED · UPSTREAM DEGRADED"; }
+  else if (idle){ level="idle"; label="IDLE · NO QUERIES YET"; }
+  pill.className = "pill " + level;
+  txt.textContent = label;
+
+  $("emergency").style.display = emergency ? "block" : "none";
+  // Explicit zero-traffic state: never let the tiles imply measurements that
+  // do not exist yet.
+  $("notraffic").style.display = (idle && state.apiFails < 2) ? "block" : "none";
+  $("uptime").textContent = fmtUptime(st.uptime_seconds);
+  $("version").textContent = "v" + st.version;
+}
+
+function renderSignals(){
+  const st = state.status, s = state.stats, h = state.hist;
+  if (!st || !s) return;
+  const S = [];
+  const add = (level, tag, title, detail) => S.push({level, tag, title, detail});
+
+  // 1. Is the gateway answering at all?
+  const emergency = st.emergency && st.emergency.no_healthy_upstreams;
+  if (emergency)
+    add("crit","DOWN","Every upstream is DOWN","clients receive SERVFAIL — check the upstream table and health events");
+  else if (st.config.error)
+    add("warn","CONFIG","Running on "+st.config.source+" configuration","parse error: "+st.config.error);
+  else
+    add("ok","OK","Gateway is serving","udp "+st.listeners.udp+", api "+st.listeners.api+", v"+st.version);
+
+  // 2. Latency vs baseline (nothing to compare until a query was answered).
+  const p95pts = seriesFrom(h,"p95_ms");
+  const p95vals = p95pts.filter(p=>p[1]!=null).map(p=>p[1]);
+  const base = median(p95vals.slice(0,-1));
+  const now = s.latency.p95_ms;
+  if (now == null || !s.latency.samples)
+    add("info","IDLE","No latency sample yet",
+        "p50/p95/p99 are unavailable — the gateway has not answered a query yet");
+  else if (base!=null && now > Math.max(100, base*2))
+    add("warn","SLOW","Latency elevated: p95 "+fmtVal(now,"ms")+" vs baseline "+fmtVal(base,"ms"),
+        "upstream congestion, health-check load or CPU saturation — see CPU chart and upstream p95");
+  else
+    add("ok","OK","Latency within baseline","p50 "+fmtVal(s.latency.p50_ms,"ms")+", p95 "+fmtVal(now,"ms")+", p99 "+fmtVal(s.latency.p99_ms,"ms"));
+
+  // 3. Failure rate.
+  if (!s.responses_total)
+    add("info","IDLE","No responses yet",
+        "success and failure rates are N/A — no request has been answered so far");
+  else if (s.error_rate > 0.10)
+    add("crit","FAIL", (s.error_rate*100).toFixed(1)+"% of responses are errors",
+        "check the error-breakdown chart (deadline vs upstream failure) and recent failovers");
+  else if (s.error_rate > 0.01)
+    add("warn","ERR", (s.error_rate*100).toFixed(1)+"% error rate",""+s.error_count+" error responses since start");
+  else
+    add("ok","OK","Response success "+(s.success_rate*100).toFixed(1)+"%", s.error_count+" errors since start");
+
+  // 4. Upstream health.
+  if (st.upstreams.total===0)
+    add("crit","NO UP","No upstreams configured","add at least one upstream via /api/upstreams");
+  else if (st.upstreams.down>0)
+    add("warn","FAILOVER", st.upstreams.down+" upstream DOWN"+(st.upstreams.down>1?"s":""),
+        "traffic is failing over — see upstream table and failover timeline");
+  else if (st.upstreams.degraded>0)
+    add("warn","DEGRAD", st.upstreams.degraded+" upstream DEGRADED","failing health probes but still receiving traffic");
+  else
+    add("ok","OK", st.upstreams.healthy+"/"+st.upstreams.total+" upstreams healthy","active health checking "+(st.health_check.enabled?"on":"OFF"));
+
+  // 5-7: window counters. An empty window is not evidence of "no timeouts",
+  // it is an absence of measurement — say so instead of claiming a clean run.
+  const wq = windowQueries(h);
+  const idleWin = wq != null && wq < 1;
+
+  // 5. Recent timeouts / deadlines (history window).
+  const toLast = lastN(seriesFrom(h,"timeout_pct"), 3);
+  const dlLast = lastN(seriesFrom(h,"deadline_pct"), 3);
+  const toSum = toLast.reduce((a,v)=>a+(v||0),0), dlSum = dlLast.reduce((a,v)=>a+(v||0),0);
+  if (dlSum>0)
+    add("warn","TIMEOUT","Client deadline exceeded recently ("+dlSum.toFixed(1)+"% of queries)",
+        "requests took longer than query.timeout — lower upstream timeout or investigate upstream latency");
+  else if (toSum>0.5)
+    add("warn","TIMEOUT","Upstream timeouts in window ("+toSum.toFixed(1)+"%)",
+        "network loss / slow upstream — check per-upstream timeout chart");
+  else if (idleWin)
+    add("info","IDLE","No queries in window","timeout and deadline rates are N/A — nothing to measure");
+  else
+    add("ok","OK","No timeouts in window","0% deadline + upstream timeout over the last points");
+
+  // 6. Failovers.
+  const foLast = lastN(seriesFrom(h,"failover_per_min"), 5).reduce((a,v)=>a+(v||0),0);
+  if (foLast>0)
+    add("warn","FAILOV", "Failovers active ("+foLast.toFixed(1)+" in last points)",
+        "queries are retrying on alternate upstreams — see timeline for exact transitions");
+  else if (idleWin)
+    add("info","IDLE","No queries in window","failover counter is 0 because nothing was attempted");
+  else
+    add("ok","OK","No failovers in window","single-attempt answers throughout");
+
+  // 7. Admission control (rate limit / ACL / overload).
+  const rl = lastN(seriesFrom(h,"rate_limited_per_min"),3).reduce((a,v)=>a+(v||0),0);
+  const ac = lastN(seriesFrom(h,"acl_denied_per_min"),3).reduce((a,v)=>a+(v||0),0);
+  const ov = lastN(seriesFrom(h,"overload_per_min"),3).reduce((a,v)=>a+(v||0),0);
+  if (ov>0)
+    add("crit","OVERLOAD","In-flight limit reached ("+ov.toFixed(1)+"/min drops)",
+        "gateway saturated — check CPU chart, consider lowering max_inflight or scaling out");
+  else if (rl>0)
+    add("warn","THROTTLE","Rate limiting active ("+rl.toFixed(1)+"/min drops)",
+        "clients exceed per_ip_qps "+st.rate_limit.per_ip_qps+" — see ratelimit config");
+  else if (ac>0)
+    add("info","ACL","ACL denied queries ("+ac.toFixed(1)+"/min)","clients outside allowed_cidrs receive REFUSED");
+  else if (idleWin)
+    add("info","IDLE","No queries in window","rate limit, ACL and overload counters are 0 — unexercised");
+  else
+    add("ok","OK","No admission-control drops","rate limit, ACL and overload counters are idle in window");
+
+  // 8. Resources.
+  const cpu = lastVal(seriesFrom(h,"cpu_pct"));
+  if (cpu!=null && cpu>80)
+    add("warn","CPU","CPU at "+cpu.toFixed(0)+"%","gateway-bound saturation — expect queueing at this level");
+  else if (s.resources_cpu==null && cpu==null)
+    add("info","RES","Resource gauges unavailable","CPU/RSS/FD readings are not available from this build");
+  else
+    add("info","RES","CPU "+fmtVal(s.resources_cpu!=null?s.resources_cpu:cpu,"%")+
+        ", RSS "+(s.resources_rss!=null?((s.resources_rss/1048576).toFixed(0)+"MB"):"N/A")+
+        ", FDs "+(s.resources_fds!=null?s.resources_fds:"N/A"),
+        "resident runtime gauges sampled 1/s by the gateway");
+
+  // 9. Cache.
+  if (!s.cache.enabled)
+    add("info","CACHE","Cache disabled","enable [cache] to absorb repeated queries");
+  else if (s.cache.hits + s.cache.misses === 0)
+    add("info","CACHE","Cache hit ratio unavailable","no cache read yet — hits and misses are both 0");
+  else if (s.cache.hit_ratio<0.1)
+    add("info","CACHE","Cache hit ratio "+(s.cache.hit_ratio*100).toFixed(0)+"%","working set may exceed max_entries or TTLs are short");
+  else
+    add("ok","OK","Cache "+(s.cache.entries>0?"warm":"empty")+" ("+(s.cache.hit_ratio*100).toFixed(0)+"% hits)", s.cache.entries+" / "+st.cache.max_entries+" entries");
+
+  $("signals").innerHTML = S.map(x =>
+    '<div class="sig '+x.level+'"><span class="st">'+x.tag+'</span>'+
+    '<div class="tx"><b>'+x.title+'</b><span>'+x.detail+'</span></div></div>'
+  ).join("");
+}
+
+function lastN(points, n){
+  const vals = points.filter(p=>p[1]!=null).map(p=>p[1]);
+  return vals.slice(-n);
+}
+
+/// Approximate number of queries in the loaded history window (summed qps
+/// rates × bucket width). Returns `null` when no history is loaded, so callers
+/// can distinguish "no traffic" from "not measured yet".
+function windowQueries(h){
+  if (!h || !h.series) return null;
+  const step = h.step_seconds || 1;
+  return seriesFrom(h,"qps").reduce((a,p) => a + (p[1]==null?0:p[1]*step), 0);
+}
+
+/* =========================================================================
+ * Upstream table
+ * ====================================================================== */
+function stateChip(u){
+  if (!u.enabled) return '<span class="state disabled"><span class="d"></span>off</span>';
+  return '<span class="state '+u.health+'"><span class="d"></span>'+u.health+'</span>';
+}
+function renderUpstreams(){
+  const rows = state.upstreams.map((u,i) => {
+    const color = state.upColors[u.name] || PALETTE[i%PALETTE.length];
+    const hc = u.last_health_ok==null ? '<span class="tag">no probe yet</span>'
+      : u.last_health_ok ? '<span class="tag ok">✓ ok</span>' : '<span class="tag bad">✗ fail</span>';
+    const hlat = u.health_latency!=null ? " " + u.health_latency.toFixed(1) + "ms" : "";
+    const use = u.eligible === false
+      ? (u.enabled ? '<span class="tag bad">avoided</span>' : '<span class="tag">off</span>')
+      : u.in_use ? '<span class="tag ok">in use</span>'
+                 : '<span class="tag">idle</span>';
+    return '<tr data-up="'+escapeHtml(u.name)+'" class="'+(state.focus===u.name?"focus":"")+'">'+
+      '<td>'+stateChip(u)+'</td>'+
+      '<td>'+use+'</td>'+
+      '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d" style="background:'+color+'"></span></span> '+escapeHtml(u.name)+'</td>'+
+      '<td class="mono" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
+      '<td class="num">'+fmtVal(u.qps,"qps")+'</td>'+
+      '<td class="num">'+u.queries+'</td>'+
+      '<td class="num">'+u.ok+'</td>'+
+      '<td class="num" style="color:'+(u.failures>0?"#e3b341":"inherit")+'">'+u.failures+'</td>'+
+      '<td class="num" style="color:'+(u.timeouts>0?"#ff7b72":"inherit")+'">'+u.timeouts+'</td>'+
+      '<td class="num" style="color:'+(u.success_rate==null?"inherit":u.success_rate>=0.99?"#7ee787":u.success_rate>=0.95?"#e3b341":"#ff7b72")+'">'+
+        (u.success_rate==null?"N/A":(u.success_rate*100).toFixed(1)+"%")+'</td>'+
+      '<td class="num" style="color:'+(u.failure_rate==null?"inherit":u.failure_rate>0?"#ff7b72":"#7ee787")+'">'+
+        (u.failure_rate==null?"N/A":(u.failure_rate*100).toFixed(1)+"%")+'</td>'+
+      '<td class="num" style="color:'+(u.timeout_rate==null?"inherit":u.timeout_rate>0.01?"#ff7b72":"inherit")+'">'+
+        (u.timeout_rate==null?"N/A":(u.timeout_rate*100).toFixed(1)+"%")+'</td>'+
+      '<td class="num">'+fmtVal(u.latency.avg_ms,"ms")+'</td>'+
+      '<td class="num">'+fmtVal(u.latency.p50_ms,"ms")+'</td>'+
+      '<td class="num">'+fmtVal(u.latency.p95_ms,"ms")+'</td>'+
+      '<td class="num">'+fmtVal(u.latency.p99_ms,"ms")+'</td>'+
+      '<td class="num" style="color:'+(u.failovers>0?"#e3b341":"inherit")+'">'+u.failovers+'</td>'+
+      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_success_ago_secs)+'</td>'+
+      '<td class="mono" style="color:'+(u.last_failure_ago_secs!=null&&u.last_failure_ago_secs<30?"#e3b341":"var(--dim)")+'">'+fmtAgo(u.last_failure_ago_secs)+'</td>'+
+      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_state_change_ago_secs)+'</td>'+
+      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_check_ago_secs)+'</td>'+
+      '<td>'+hc+'<span class="mono" style="color:var(--faint);font-size:11px">'+hlat+'</span></td>'+
+      '<td class="mono" style="color:var(--dim);max-width:260px;overflow:hidden;text-overflow:ellipsis">'+escapeHtml(u.last_error||"—")+'</td>'+
+    '</tr>';
+  });
+  $("up-rows").innerHTML = rows.length
+    ? rows.join("")
+    : '<tr><td colspan="24" class="empty">no upstreams configured</td></tr>';
+  for (const tr of $("up-rows").querySelectorAll("tr[data-up]")){
+    tr.addEventListener("click", () => {
+      const n = tr.getAttribute("data-up");
+      state.focus = state.focus===n ? null : n;
+      renderUpstreams(); drawAllCharts();
+    });
+  }
+}
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+/* =========================================================================
+ * Timeline
+ * ====================================================================== */
+function eventSeverity(e){
+  if (e.kind==="system") return e.action==="all_upstreams_down" ? "crit"
+    : e.action==="all_upstreams_recovered" ? "ok"
+    : e.action==="overload_dropped" ? "crit"
+    : e.action==="query_deadline" || e.action==="rate_limited" ? "warn" : "info";
+  if (e.kind==="health") return e.action==="transition" && e.to==="down" ? "crit"
+    : (e.action==="round_failed" || (e.action==="probe" && e.to==="down")) ? "warn"
+    : e.action==="transition" && e.to==="up" ? "ok" : "info";
+  if (e.kind==="failover") return "warn";
+  return "info";
+}
+function fmtEvent(e, grp){
+  const d = e.detail && typeof e.detail==="object" ? e.detail : {};
+  if (e.kind==="failover"){
+    let lat;
+    if (grp && grp.length>1){
+      const ls = grp.map(x => +x.extra_latency_ms || 0);
+      const mn = Math.min.apply(null, ls), mx = Math.max.apply(null, ls);
+      lat = mn===mx ? "+"+mn+"ms" : "+"+mn+"–"+mx+"ms";
+    } else lat = "+"+e.extra_latency_ms+"ms";
+    return escapeHtml(e.upstream)+" <b>"+escapeHtml(e.reason||"")+"</b> → fallback to "+
+      escapeHtml(e.fallback||"?")+" ("+lat+", attempt "+e.attempts+")";
+  }
+  if (e.kind==="health"){
+    if (e.action==="transition")
+      return escapeHtml(e.upstream)+": "+e.from+" → <b>"+e.to+"</b>"+(e.reason?" ("+escapeHtml(e.reason)+")":"");
+    if (e.action==="round_failed")
+      return escapeHtml(e.upstream)+": health check failed"+(e.reason?" ("+escapeHtml(e.reason)+")":"");
+    if (e.action==="probe")
+      return escapeHtml(e.upstream)+": manual probe "+(d.success?"ok":"failed")+
+        (d.latency_ms!=null?" ("+d.latency_ms+"ms)":"")+(e.reason?" ("+escapeHtml(e.reason)+")":"");
+    return escapeHtml(e.upstream||"")+": "+escapeHtml(e.action)+(e.reason?" ("+escapeHtml(e.reason)+")":"");
+  }
+  if (e.kind==="config"){
+    const bits = [];
+    if (d.name) bits.push(d.name);
+    if (d.id!=null && !d.name) bits.push("#"+d.id);
+    if (d.upstreams!=null) bits.push(d.upstreams+" upstreams");
+    if (d.persisted===false) bits.push("not persisted");
+    if (e.action==="persist_failed") bits.push(escapeHtml(d.error||""));
+    return "config <b>"+escapeHtml(e.action)+"</b> "+bits.map(escapeHtml).join(" · ");
+  }
+  if (e.kind==="system"){
+    const cnt = e.count ? '<span class="cnt">×'+e.count+(e.window_secs?" in "+e.window_secs+"s":"")+'</span>' : "";
+    switch(e.action){
+      case "all_upstreams_down": return "<b>ALL UPSTREAMS DOWN</b> — every client receives SERVFAIL"+cnt;
+      case "all_upstreams_recovered": return "upstream pool recovered ("+d.healthy+"/"+d.total+" healthy)"+cnt;
+      case "rate_limited": return "rate limiting dropped queries"+cnt+(d.client_ip?" — first <span class=\"mono\">"+escapeHtml(d.client_ip)+"</span>":"");
+      case "acl_denied": return "ACL denied queries"+cnt+(d.client_ip?" — first <span class=\"mono\">"+escapeHtml(d.client_ip)+"</span>":"");
+      case "query_deadline": return "client queries hit the total deadline"+cnt+(d.transport?" ("+d.transport+")":"");
+      case "overload_dropped": return "in-flight limit reached — queries dropped"+cnt+(d.max_inflight?" (max "+d.max_inflight+")":"");
+      default: return escapeHtml(e.action)+cnt;
+    }
+  }
+  return escapeHtml(e.action||e.kind);
+}
+/// Collapse *adjacent* rows that describe the same thing (same kind, action,
+/// upstream, transition and reason) into one row with a ×count badge, so a
+/// failover storm doesn't bury the rest of the incident timeline. Real events,
+/// display-only grouping — nothing is invented, only aggregated.
+function groupEvents(list){
+  const key = e => [e.kind, e.action||"", e.upstream||"", e.from||"", e.to||"",
+                    e.reason||"", e.fallback||""].join("\u0001");
+  const groups = [];
+  for (const e of list){
+    const g = groups[groups.length-1];
+    if (g && g.key === key(e)) g.items.push(e);
+    else groups.push({key: key(e), items: [e]});
+  }
+  return groups;
+}
+function renderEvents(){
+  const list = state.events.filter(e => state.filter==="all" || e.kind===state.filter);
+  if (!list.length){
+    $("events").innerHTML = '<div class="empty">no '+(state.filter==="all"?"":state.filter+" ")+'events recorded yet</div>';
+    return;
+  }
+  $("events").innerHTML = groupEvents(list).map(g => {
+    const e = g.items[0];
+    const sev = eventSeverity(e);
+    let meta = "";
+    if (g.items.length > 1){
+      const newest = g.items[0].ts_ms, oldest = g.items[g.items.length-1].ts_ms;
+      const span = Math.max(0, Math.round((newest - oldest)/1000));
+      meta = ' <span class="cnt">×'+g.items.length+(span>0 ? ' over '+span+'s' : '')+'</span>';
+    }
+    return '<div class="ev '+sev+'"><span class="t">'+fmtClock(e.ts_ms)+'</span>'+
+      '<span class="k">'+e.kind+'</span><span class="m">'+fmtEvent(e, g.items)+meta+'</span></div>';
+  }).join("");
+}
+
+/* =========================================================================
+ * Source chip / history fetch
+ * ====================================================================== */
+function updateSourceChip(){
+  const chip = $("src-chip");
+  const h = state.hist;
+  if (!h){ chip.className="chip"; chip.textContent="—"; return; }
+  const mon = state.monitoring && state.monitoring.prometheus;
+  if (h.source==="prometheus"){
+    const partial = (h.partial_errors||[]).length;
+    chip.className="chip prom"+(partial?" stale":"");
+    chip.textContent="prometheus · "+(h.points||0)+" pts"+(partial?" ("+partial+" err)":"");
+    chip.title = "Source: "+(h.prometheus_url||"")+" (range "+h.range+", step "+h.step_seconds+"s)"+
+      (h.queries_ok!=null?" — "+h.queries_ok+"/"+(h.queries_total||"?")+" queries ok":"")+
+      (partial?"\n"+(h.partial_errors||[]).join("\n"):"");
+  } else if (mon && mon.configured){
+    chip.className="chip stale";
+    chip.textContent="native (prom unreachable)";
+    chip.title = "Prometheus configured ("+mon.url+") but unreachable — falling back to gateway-native history. Reason: "+(h.fallback_reason||"unknown");
+  } else {
+    chip.className="chip native";
+    chip.textContent="native · "+(h.points||0)+" pts";
+    chip.title = "Gateway-native in-memory history ("+h.bucket_source+" buckets) — no external dependency.";
   }
 }
 
-async function applyConfig() {
+async function fetchHistory(){
+  try {
+    const q = "?range="+encodeURIComponent(state.range)+"&source="+encodeURIComponent(state.source);
+    state.hist = await getJSON("/api/timeseries"+q, 12000);
+    state.histAt = Date.now();
+    const h = state.hist;
+    const stepTxt = h.bucket_source ? h.bucket_source+" buckets" : "step "+h.step_seconds+"s";
+    const partial = (h.partial_errors||[]);
+    $("hist-meta").textContent =
+      "range "+h.range+" · "+(h.points||0)+" points · "+stepTxt+
+      " · source: "+h.source+(h.fallback_reason?" ("+h.fallback_reason+")":"")+
+      (partial.length?" · "+partial.length+" prometheus query error(s)":"")+
+      " · updated "+fmtClock(h.generated_ms||Date.now());
+    $("hist-meta").title = partial.length ? partial.join("\n") : "";
+    $("foot-ts").textContent = h.source + " · " + (h.points||0) + " pts";
+    drawAllCharts();
+    updateSourceChip();
+    renderKpis(); renderSignals(); renderFailovers();
+    maybeReady();
+  } catch (e) {
+    console.warn("history fetch failed", e);
+    $("hist-meta").textContent = "history fetch failed: "+e.message;
+    $("foot-ts").textContent = "error";
+  }
+}
+
+function drawAllCharts(){ for (const def of CHARTS) drawChart(def); }
+
+function historyInterval(){ return (state.range==="5m"||state.range==="15m") ? 5000 : 30000; }
+
+function scheduleHistory(){
+  if (state.histTimer) clearTimeout(state.histTimer);
+  const loop = async () => {
+    if (state.auto) await fetchHistory();
+    state.histTimer = setTimeout(loop, historyInterval());
+  };
+  state.histTimer = setTimeout(loop, 0);
+}
+
+/* =========================================================================
+ * Live section
+ * ====================================================================== */
+async function fetchCurrent(){
+  try {
+    const [status, stats, ups, ev, cl] = await Promise.all([
+      getJSON("/api/status"),
+      getJSON("/api/stats"),
+      getJSON("/api/upstreams"),
+      getJSON("/api/events?limit=160"),
+      getJSON("/api/clients?limit=25&sort="+encodeURIComponent(state.clientSort), 6000)
+        .catch(() => null),
+    ]);
+    state.status = status;
+    state.stats = stats;
+    state.upstreams = ups.upstreams || [];
+    state.upState = ups.state || null;
+    state.clients = cl;
+    state.events = ev.events || [];
+    state.upstreams.forEach((u,i) => {
+      if (!(u.name in state.upColors)) state.upColors[u.name] = PALETTE[Object.keys(state.upColors).length % PALETTE.length];
+    });
+    // Extra resource gauges surfaced via /api/diagnostics (CPU/FD history is
+    // in the timeseries payload; here we only need the latest values).
+    try {
+      const diag = await getJSON("/api/diagnostics");
+      state.stats.resources_cpu = diag.resources.cpu_percent;
+      state.stats.resources_rss = diag.resources.resident_memory_bytes;
+      state.stats.resources_fds = diag.resources.open_fds;
+    } catch (_) { /* diagnostics optional for the strip */ }
+
+    state.apiFails = 0; state.lastOk = Date.now();
+    $("apiproblem").style.display = "none";
+    $("updated").textContent = "updated "+fmtClock(state.lastOk);
+    renderVerdict(); renderKpis(); renderTraffic(); renderStatsBlocks();
+    renderClientTable(); renderUpState(); renderFailovers();
+    renderSignals(); renderUpstreams(); renderEvents();
+    $("foot-ev").textContent = state.events.length + " recent";
+    maybeReady();
+  } catch (e) {
+    state.apiFails++;
+    $("updated").textContent = "API unreachable ("+state.apiFails+")";
+    if (state.apiFails >= 2){ $("apiproblem").style.display = "block"; renderVerdict(); }
+  }
+}
+
+async function fetchMonitoring(){
+  try { state.monitoring = await getJSON("/api/monitoring", 4000); updateSourceChip(); }
+  catch (_) { /* non-fatal */ }
+}
+
+function maybeReady(){
+  if (state.status && state.hist && !document.documentElement.hasAttribute("data-ready")){
+    document.documentElement.setAttribute("data-ready","1");
+    $("foot-ready").textContent = "render: ready at "+fmtClock(Date.now());
+  }
+}
+
+/* =========================================================================
+ * Config editor
+ * ====================================================================== */
+async function loadConfig(){
+  try {
+    const c = await getJSON("/api/config");
+    $("cfg-text").value = c.toml || "";
+    $("cfg-path").textContent = c.path || "(in-memory)";
+    $("cfg-source").textContent = c.source || "—";
+    $("cfg-error").textContent = c.error || "none";
+  } catch (e){
+    $("cfg-msg").textContent = "load failed: "+e.message;
+    $("cfg-msg").className = "err";
+  }
+}
+async function applyConfig(){
   const msg = $("cfg-msg");
-  msg.innerHTML = "applying…";
+  msg.textContent = "applying…"; msg.className = "";
   try {
     const r = await fetch("/api/config", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ toml: $("cfg-text").value }),
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({toml: $("cfg-text").value, persist: true}),
     });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
-    msg.innerHTML = `<span class="ok" style="color:var(--ok)">applied` +
-      (body.persisted ? " + written atomically" : " (memory only)") + `</span>`;
-    refresh();
-  } catch (e) {
-    msg.innerHTML = `<span class="err">rejected: ${esc(e.message)} (running config unchanged)</span>`;
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(j.error || ("HTTP "+r.status));
+    msg.textContent = "applied"+(j.persisted?" + persisted":" (memory only)")+
+      (j.persist_error?" — persist error: "+j.persist_error:"");
+    msg.className = j.persist_error ? "err" : "ok";
+    await loadConfig(); await fetchCurrent();
+  } catch (e){
+    msg.textContent = "rejected: "+e.message; msg.className = "err";
   }
 }
 
-// ---- polling --------------------------------------------------------------
-let failures = 0;
-async function refresh() {
-  try {
-    const [status, stats, upstreams] = await Promise.all([
-      get("/api/status"), get("/api/stats"), get("/api/upstreams"),
-    ]);
-    renderStatus(status, stats);
-    renderUpstreams(upstreams);
-    failures = 0;
-    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
-  } catch (e) {
-    failures++;
-    $("updated").innerHTML = `<span class="err">update failed (${esc(e.message)}) — API unreachable?</span>`;
-  }
-}
-async function refreshSlow() {
-  try {
-    const [events, diag] = await Promise.all([
-      get("/api/events?limit=25"), get("/api/diagnostics"),
-    ]);
-    renderEvents(events);
-    renderDiagnostics(diag);
-  } catch (e) { /* surfaced by the fast poll when persistent */ }
+/* =========================================================================
+ * Wiring
+ * ====================================================================== */
+function wire(){
+  $("range-sel").addEventListener("change", e => {
+    state.range = e.target.value;
+    if (!RANGES.includes(state.range)) state.range = "5m";
+    scheduleHistory();
+  });
+  $("source-sel").addEventListener("change", e => {
+    const v = e.target.value;
+    state.source = ["auto","native","prometheus"].includes(v) ? v : "auto";
+    fetchHistory();
+  });
+  $("auto-chk").addEventListener("change", e => {
+    state.auto = e.target.checked;
+    $("updated").textContent = state.auto ? "resumed" : "paused";
+  });
+  $("tfilters").addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    state.filter = b.getAttribute("data-f");
+    for (const x of $("tfilters").children) x.classList.toggle("on", x===b);
+    renderEvents();
+  });
+  // Sort the per-client table by any numeric column (server-side ordering
+  // over the real counters, never over the masked labels).
+  $("cl-table").addEventListener("click", e => {
+    const th = e.target.closest("th.sortable");
+    if (!th) return;
+    state.clientSort = th.getAttribute("data-sort") || "requests";
+    fetchCurrent();
+  });
+  $("cfg-apply").addEventListener("click", applyConfig);
+  $("cfg-reload").addEventListener("click", loadConfig);
+  window.addEventListener("resize", () => drawAllCharts());
 }
 
-loadConfig();
-refresh();
-refreshSlow();
-setInterval(refresh, 2000);
-setInterval(refreshSlow, 6000);
-$("cfg-apply").addEventListener("click", applyConfig);
-$("cfg-reload").addEventListener("click", loadConfig);
+async function main(){
+  wire();
+  await Promise.all([fetchCurrent(), fetchMonitoring()]);
+  await fetchHistory();
+  await loadConfig();
+  setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
+  setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
+  scheduleHistory();
+  // Canvas axis labels use Shabnam: re-paint once the webfont has loaded.
+  if (document.fonts && document.fonts.ready){
+    document.fonts.ready.then(() => { if (state.hist) drawAllCharts(); }).catch(() => {});
+  }
+}
+main();
 </script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 //! Access control lists.
 //!
 //! Evaluation happens before any forwarding work. The rules are fail-closed:
-//! an empty allow list denies everything, so an unconfigured OutisDNS instance
+//! an empty allow list denies everything, so an unconfigured res instance
 //! can never become an open resolver.
 
 use std::net::IpAddr;

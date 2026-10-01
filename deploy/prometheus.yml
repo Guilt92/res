@@ -3,9 +3,9 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: outisdns
+  - job_name: res
     static_configs:
-      - targets: ["outisdns:8080"]
+      - targets: ["res:8080"]
 
   - job_name: prometheus
     static_configs:

@@ -17,13 +17,14 @@ use serde_json::{json, Value};
 const CONFIG_RING_CAP: usize = 256;
 const HEALTH_RING_CAP: usize = 512;
 const FAILOVER_RING_CAP: usize = 512;
+const SYSTEM_RING_CAP: usize = 512;
 
 /// One recorded event.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     /// Unix epoch milliseconds.
     pub ts_ms: u64,
-    /// `"config"`, `"health"` or `"failover"` (set by the ring).
+    /// `"config"`, `"health"`, `"failover"` or `"system"` (set by the ring).
     pub kind: String,
     /// What happened: `create` / `update` / `delete` / `import` / `startup` …
     pub action: String,
@@ -50,6 +51,13 @@ pub struct Event {
     /// Extra latency this failure added to the client query (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_latency_ms: Option<u64>,
+    /// System events: how many occurrences this event summarises (coalesced
+    /// rate-limit / ACL / deadline events are never emitted one per query).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// System events: observation window the `count` spans, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_secs: Option<u64>,
     #[serde(skip_serializing_if = "Value::is_null")]
     pub detail: Value,
 }
@@ -75,6 +83,8 @@ impl Event {
             attempts: None,
             fallback: None,
             extra_latency_ms: None,
+            count: None,
+            window_secs: None,
             detail: Value::Null,
         }
     }
@@ -117,6 +127,13 @@ impl Event {
         e.attempts = Some(attempts);
         e.fallback = Some(fallback.to_string());
         e.extra_latency_ms = Some(extra_latency_ms);
+        e
+    }
+
+    /// A system-level event (emergency, sampled admission-control activity).
+    pub fn system(action: &str, detail: Value) -> Self {
+        let mut e = Self::base(action);
+        e.detail = detail;
         e
     }
 }
@@ -176,11 +193,14 @@ impl EventLog {
     }
 }
 
-/// The three event rings owned by [`crate::shared::Shared`].
+/// The four event rings owned by [`crate::shared::Shared`].
 pub struct EventLogs {
     pub config: EventLog,
     pub health: EventLog,
     pub failover: EventLog,
+    /// Emergencies (all upstreams down / recovered) and coalesced
+    /// rate-limit / ACL / deadline activity.
+    pub system: EventLog,
 }
 
 impl EventLogs {
@@ -189,6 +209,7 @@ impl EventLogs {
             config: EventLog::new("config", CONFIG_RING_CAP),
             health: EventLog::new("health", HEALTH_RING_CAP),
             failover: EventLog::new("failover", FAILOVER_RING_CAP),
+            system: EventLog::new("system", SYSTEM_RING_CAP),
         }
     }
 
@@ -198,6 +219,7 @@ impl EventLogs {
             "config": self.config.len(),
             "health": self.health.len(),
             "failover": self.failover.len(),
+            "system": self.system.len(),
         })
     }
 }
@@ -244,6 +266,23 @@ mod tests {
         assert_eq!(e.upstream_id, Some(7));
         assert_eq!(e.from.as_deref(), Some("up"));
         assert_eq!(e.to.as_deref(), Some("down"));
+    }
+
+    #[test]
+    fn system_ring_records_emergencies_with_counts() {
+        let logs = EventLogs::new();
+        let mut e = Event::system(
+            "rate_limited",
+            json!({ "client_ip": "10.0.0.9", "transport": "udp" }),
+        );
+        e.count = Some(17);
+        e.window_secs = Some(30);
+        logs.system.push(e);
+        let e = logs.system.recent(1).pop().unwrap();
+        assert_eq!(e.kind, "system");
+        assert_eq!(e.count, Some(17));
+        assert_eq!(e.window_secs, Some(30));
+        assert_eq!(logs.counts()["system"], 1);
     }
 
     #[test]

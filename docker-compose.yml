@@ -1,4 +1,4 @@
-# OutisDNS full stack: gateway + Prometheus + Grafana. No database.
+# res full stack: gateway + Prometheus + Grafana. No database.
 #
 # Start:   docker-compose up -d --build
 # DNS:     dig @127.0.0.1 -p 15353 example.com
@@ -8,7 +8,7 @@
 # Charts:  http://localhost:3000/  (Grafana, admin/admin)
 
 services:
-  outisdns:
+  res:
     build:
       context: .
       # Host networking + proxy args let the builder reach crates.io behind a
@@ -19,10 +19,14 @@ services:
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         ALL_PROXY: ${ALL_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
+    environment:
+      # Dashboard time-series proxy: query Prometheus directly by its
+      # in-network DNS name (overrides [monitoring].prometheus_url).
+      RES_PROMETHEUS_URL: http://prometheus:9090
     volumes:
       # Whole directory (rw): the gateway rewrites the config atomically via
       # temp-file + fsync + rename and keeps a .backup next to it.
-      - ./config:/etc/outisdns:rw
+      - ./config:/etc/res:rw
       - ./dashboard:/app/dashboard:ro
     ports:
       - "15353:53/udp"
@@ -37,7 +41,7 @@ services:
     ports:
       - "9090:9090"
     depends_on:
-      - outisdns
+      - res
     restart: unless-stopped
 
   grafana:
@@ -47,6 +51,8 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro

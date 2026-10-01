@@ -164,7 +164,7 @@ pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Resu
     ));
 
     tracing::info!(
-        event = "outisdns_started",
+        event = "res_started",
         version = env!("CARGO_PKG_VERSION"),
         udp = %shared.bound.read().unwrap_or_else(|e| e.into_inner()).udp.map(|a| a.to_string()).unwrap_or_default(),
         tcp = %shared.bound.read().unwrap_or_else(|e| e.into_inner()).tcp.map(|a| a.to_string()).unwrap_or_default(),
@@ -180,11 +180,14 @@ pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Resu
     })
 }
 
-/// Once-per-second sampler: QPS derivation plus operational gauges
-/// (in-flight counts, RSS). Deliberately off the query hot path.
+/// Once-per-second sampler: QPS derivation, operational gauges (in-flight
+/// counts, RSS, CPU, FDs), coalesced system-event flush and the dashboard
+/// history recording. Deliberately off the query hot path.
 async fn sampler(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_cpu_ticks: Option<u64> = crate::sysinfo::cpu_ticks();
+    let mut last_cpu_at = std::time::Instant::now();
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -195,32 +198,33 @@ async fn sampler(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                 shared.qps.sample(total);
                 m.udp_inflight.set(shared.udp_inflight.current() as i64);
                 m.tcp_connections.set(shared.tcp_connections.current() as i64);
-                m.resident_memory_bytes.set(resident_memory_bytes() as i64);
-            }
-        }
-    }
-}
+                m.resident_memory_bytes.set(crate::sysinfo::resident_memory_bytes() as i64);
+                m.open_fds.set(crate::sysinfo::open_fd_count() as i64);
 
-/// Resident set size of this process in bytes (0 when unavailable).
-fn resident_memory_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let kb: u64 = rest
-                        .split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    return kb * 1024;
+                // CPU percent: delta of process CPU ticks over wall time.
+                if let Some(ticks) = crate::sysinfo::cpu_ticks() {
+                    let dt = last_cpu_at.elapsed().as_secs_f64();
+                    if let Some(prev) = last_cpu_ticks {
+                        if dt > 0.5 {
+                            let pct = (ticks.saturating_sub(prev)) as f64 / 100.0 / dt * 100.0;
+                            m.cpu_percent.set(pct.round() as i64);
+                            last_cpu_at = std::time::Instant::now();
+                            last_cpu_ticks = Some(ticks);
+                        }
+                    } else {
+                        last_cpu_ticks = Some(ticks);
+                        last_cpu_at = std::time::Instant::now();
+                    }
                 }
+
+                // Honest per-client / per-upstream rates: measured over the
+                // elapsed interval, refreshed once per second.
+                shared.traffic.sample_rates();
+                shared.registry.sample_rates();
+
+                shared.flush_system_events();
+                shared.history.record(&shared.metrics);
             }
         }
-        0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0
     }
 }

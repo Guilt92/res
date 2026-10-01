@@ -1,8 +1,8 @@
-# OutisDNS production configuration.
+# res production configuration.
 #
 # Single source of truth: a human-readable TOML file, written atomically by
 # the API (temp file + fsync + rename). The previous valid version is kept
-# next to it as `outisdns.toml.backup` and used automatically when the primary
+# next to it as `res.toml.backup` and used automatically when the primary
 # file fails to load. There is no database anywhere in the stack.
 
 [server]
@@ -82,6 +82,29 @@ max_ttl_secs = 3600
 format = "json"
 filter = "info"
 servfail_sample_every = 0
+
+[monitoring]
+# Prometheus base URL used by the dashboard time-series proxy
+# (GET /api/timeseries?source=prometheus|auto). Empty = gateway-native
+# history only. The RES_PROMETHEUS_URL environment variable overrides
+# this value.
+prometheus_url = ""
+
+# Client-address exposure in events, logs, API and dashboard:
+#   "masked" (default) -> network prefix only (10.x.x.x / 2001:db8:1::x)
+#   "full"             -> complete address
+#   "off"              -> client addresses are not tracked or exposed at all
+client_ip_privacy = "masked"
+
+# Bounded top-N traffic tables (hard memory cap; tables prune their tail
+# instead of growing). 0 disables a table. Values > 1000000 are rejected.
+top_clients_max = 4096
+top_domains_max = 8192
+
+# How many top clients are exported as Prometheus series
+# (res_client_*; labels follow client_ip_privacy — masked by default).
+# 0 disables the per-client metrics export. Values > 10000 are rejected.
+client_metrics_max = 100
 
 # Upstream pool. `priority` defines strict tiers (selection never crosses a
 # tier boundary); `weight` splits traffic inside a tier.

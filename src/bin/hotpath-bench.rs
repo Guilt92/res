@@ -9,7 +9,7 @@
 //! 4. `selector`   – upstream selection over an 8-candidate pool
 //! 5. `admission`  – parse + acl + ratelimit combined (pre-cache precheck)
 //!
-//! Usage: `cargo run --release --bin outisdns-hotpath-bench -- --iters 200000`
+//! Usage: `cargo run --release --bin res-hotpath-bench -- --iters 200000`
 //! The system block in the output records the machine the numbers came from.
 
 use std::hint::black_box;
@@ -17,17 +17,17 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use clap::Parser;
-use outisdns::acl::{AclConfig, AclRules};
-use outisdns::config::{SelectionConfig, SelectionStrategy};
-use outisdns::dns::msg;
-use outisdns::ratelimit::{RateLimitConfig, RateLimiter};
-use outisdns::selection::{build_selector, StateView, UpstreamSelector};
-use outisdns::sysinfo::SystemInfo;
-use outisdns::upstream::HealthStatus;
+use res::acl::{AclConfig, AclRules};
+use res::config::{SelectionConfig, SelectionStrategy};
+use res::dns::msg;
+use res::ratelimit::{RateLimitConfig, RateLimiter};
+use res::selection::{build_selector, StateView, UpstreamSelector};
+use res::sysinfo::SystemInfo;
+use res::upstream::HealthStatus;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "outisdns-hotpath-bench",
+    name = "res-hotpath-bench",
     about = "In-process micro-benchmark of the DNS hot path (no I/O)"
 )]
 struct Args {

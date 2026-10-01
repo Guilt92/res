@@ -120,6 +120,47 @@ fn read_mem_total() -> Option<u64> {
     None
 }
 
+/// Resident set size of this process in bytes (0 when unavailable).
+pub fn resident_memory_bytes() -> u64 {
+    let text = match std::fs::read_to_string("/proc/self/status") {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return kb * 1024;
+        }
+    }
+    0
+}
+
+/// Open file descriptors of this process (0 when unavailable).
+pub fn open_fd_count() -> u64 {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.count() as u64)
+        .unwrap_or(0)
+}
+
+/// Cumulative user+system CPU time of this process in clock ticks
+/// (`USER_HZ`, 100 on every mainstream Linux), from `/proc/self/stat`.
+pub fn cpu_ticks() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields 14 (utime) and 15 (stime); the comm field (2) may contain
+    // spaces/parens, so parse after the closing paren.
+    let rest = text.rsplit(')').next()?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After `)` the first field is state (field 3); utime/stime are fields
+    // 14/15 => indices 11/12 in this slice.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +171,15 @@ mod tests {
         assert!(info.cpus >= 1);
         assert!(!info.render().is_empty());
         assert!(info.json()["cpus"].as_u64().is_some());
+    }
+
+    #[test]
+    fn runtime_gauges_are_readable_on_linux() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(cpu_ticks().is_some(), "expected /proc/self/stat");
+            assert!(open_fd_count() > 0, "expected open fds");
+            assert!(resident_memory_bytes() > 0, "expected VmRSS");
+        }
     }
 }

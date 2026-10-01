@@ -1,26 +1,26 @@
 [package]
-name = "outisdns"
+name = "res"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "OutisDNS - lightweight, health-aware DNS gateway/proxy"
+description = "res - lightweight, health-aware DNS gateway/proxy"
 license = "MIT"
 publish = false
 
 [lib]
-name = "outisdns"
+name = "res"
 path = "src/lib.rs"
 
 [[bin]]
-name = "outisdns"
+name = "res"
 path = "src/main.rs"
 
 [[bin]]
-name = "outisdns-loadtest"
+name = "res-loadtest"
 path = "src/bin/loadtest.rs"
 
 [[bin]]
-name = "outisdns-hotpath-bench"
+name = "res-hotpath-bench"
 path = "src/bin/hotpath-bench.rs"
 
 [dependencies]

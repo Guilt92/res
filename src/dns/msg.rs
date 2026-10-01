@@ -1,6 +1,6 @@
 //! DNS message parsing, validation and local error-response construction.
 //!
-//! Wire format handling is delegated to `hickory-proto`; OutisDNS owns the
+//! Wire format handling is delegated to `hickory-proto`; res owns the
 //! validation policy and the gateway-level responses (REFUSED, SERVFAIL, ...).
 
 use std::str::FromStr;
@@ -245,6 +245,25 @@ pub fn question_key(q: &Query) -> (String, u16, u16) {
         u16::from(q.query_type()),
         u16::from(q.query_class()),
     )
+}
+
+/// Bounded metric label for a question type: common types keep their name,
+/// everything else collapses into `OTHER` (cardinality stays fixed).
+pub fn qtype_label(t: RecordType) -> &'static str {
+    match t {
+        RecordType::A => "A",
+        RecordType::AAAA => "AAAA",
+        RecordType::NS => "NS",
+        RecordType::CNAME => "CNAME",
+        RecordType::SOA => "SOA",
+        RecordType::PTR => "PTR",
+        RecordType::MX => "MX",
+        RecordType::TXT => "TXT",
+        RecordType::SRV => "SRV",
+        RecordType::CAA => "CAA",
+        RecordType::ANY => "ANY",
+        _ => "OTHER",
+    }
 }
 
 /// Compute the effective TTL for caching: the minimum TTL across answers,

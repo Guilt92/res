@@ -1,8 +1,8 @@
-//! # OutisDNS
+//! # res
 //!
 //! A lightweight, health-aware **DNS gateway/proxy** written in Rust.
 //!
-//! OutisDNS owns the complete DNS data plane: UDP/TCP listeners on port 53,
+//! res owns the complete DNS data plane: UDP/TCP listeners on port 53,
 //! packet parsing (via `hickory-proto`), validation, ACLs, rate limiting,
 //! upstream selection, forwarding, retries/failover, active health checking
 //! and latency measurement. It is **not** a recursive resolver, an
@@ -17,7 +17,8 @@
 //! * `failover` – bounded retry engine
 //! * `acl`, `ratelimit`, `cache` – request admission and optional caching
 //! * `api` – Axum control plane (never on the DNS request path)
-//! * `events` – bounded in-memory event rings (config / health / failover)
+//! * `events` – bounded in-memory event rings (config / health / failover / system)
+//! * `history` – multi-resolution in-memory time series (dashboard graphs)
 //! * `persist` – atomic file-based configuration persistence
 //! * `shared` – atomically swappable configuration + shared state
 //! * `runtime` – orchestration and graceful shutdown
@@ -29,6 +30,7 @@ pub mod config;
 pub mod dns;
 pub mod events;
 pub mod failover;
+pub mod history;
 pub mod logging;
 pub mod metrics;
 pub mod persist;
@@ -37,4 +39,5 @@ pub mod runtime;
 pub mod selection;
 pub mod shared;
 pub mod sysinfo;
+pub mod traffic;
 pub mod upstream;

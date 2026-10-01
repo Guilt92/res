@@ -1,9 +1,9 @@
 apiVersion: 1
 
 providers:
-  - name: outisdns
+  - name: res
     orgId: 1
-    folder: OutisDNS
+    folder: res
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30

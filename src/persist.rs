@@ -95,7 +95,7 @@ mod tests {
     use crate::config::{Protocol, UpstreamConfig};
 
     fn tmp_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("outisdns-persist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("res-persist-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn save_creates_missing_parent_dirs() {
         let path = std::env::temp_dir().join(format!(
-            "outisdns-persist-{}-nested/nested.toml",
+            "res-persist-{}-nested/nested.toml",
             std::process::id()
         ));
         save_atomic(&path, &cfg_with(53)).unwrap();

@@ -212,6 +212,7 @@ async fn check_upstream(
     };
 
     let transition = up.record_health_round(ok, latency, error.clone(), hyst);
+    record_check_metrics(shared, &cfg.name, ok, latency, transition.is_some());
 
     if let Some(t) = &transition {
         log_transition(&cfg.name, *t, &error);
@@ -253,6 +254,40 @@ fn state_str(s: HealthStatus) -> &'static str {
     }
 }
 
+/// Export the result of one health-check round (or on-demand probe) to
+/// Prometheus: round result, probe latency (when measured), last-success
+/// timestamp and state transitions. Called from the checker loop and from
+/// the API-triggered probe, never from the query hot path.
+fn record_check_metrics(
+    shared: &Arc<Shared>,
+    name: &str,
+    ok: bool,
+    latency: Option<Duration>,
+    transitioned: bool,
+) {
+    let m = &shared.metrics;
+    m.healthcheck_total
+        .with_label_values(&[name, if ok { "success" } else { "failure" }])
+        .inc();
+    if ok {
+        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            m.healthcheck_last_success_timestamp_seconds
+                .with_label_values(&[name])
+                .set(elapsed.as_secs() as i64);
+        }
+    }
+    if let Some(l) = latency {
+        m.healthcheck_duration_seconds
+            .with_label_values(&[name])
+            .observe(l.as_secs_f64());
+    }
+    if transitioned {
+        m.upstream_state_changes_total
+            .with_label_values(&[name])
+            .inc();
+    }
+}
+
 fn log_transition(name: &str, t: HealthTransition, error: &Option<String>) {
     let from = state_str(t.from);
     let to = state_str(t.to);
@@ -280,11 +315,13 @@ fn log_transition(name: &str, t: HealthTransition, error: &Option<String>) {
     }
 }
 
-/// Refresh the derived gauges (active / healthy counts + per-upstream state).
+/// Refresh the derived gauges (active / healthy counts + per-upstream state)
+/// and emit a system event when the pool enters/leaves total failure.
 pub fn refresh_gauges(shared: &Arc<Shared>, metrics: &Arc<Metrics>) {
     let snapshot = shared.registry.snapshot();
     let mut active = 0i64;
     let mut healthy = 0i64;
+    let total = snapshot.len() as i64;
     for up in &snapshot {
         let cfg = up.config();
         if cfg.enabled {
@@ -298,6 +335,38 @@ pub fn refresh_gauges(shared: &Arc<Shared>, metrics: &Arc<Metrics>) {
     }
     metrics.active_upstreams.set(active);
     metrics.healthy_upstreams.set(healthy);
+
+    // Emergency: every upstream is DOWN while at least one exists — clients
+    // are receiving SERVFAIL. Emit exactly once per transition (the sampler
+    // calls this every second, so no cooldown is needed).
+    let emergency = total > 0 && healthy == 0;
+    let was = shared.emergency.load(std::sync::atomic::Ordering::Relaxed);
+    if emergency != was {
+        shared
+            .emergency
+            .store(emergency, std::sync::atomic::Ordering::Relaxed);
+        if emergency {
+            shared.push_system_event(
+                "all_upstreams_down",
+                serde_json::json!({
+                    "active": active,
+                    "total": total,
+                    "detail": "no healthy upstream remains - clients are getting SERVFAIL",
+                }),
+                None,
+                None,
+            );
+            tracing::error!(event = "emergency_no_healthy_upstreams", active, total);
+        } else {
+            shared.push_system_event(
+                "all_upstreams_recovered",
+                serde_json::json!({ "active": active, "healthy": healthy }),
+                None,
+                None,
+            );
+            tracing::info!(event = "emergency_cleared", healthy, total);
+        }
+    }
 }
 
 /// Run a single on-demand health check (API `POST /upstreams/:id/test`).
@@ -362,6 +431,13 @@ pub async fn probe_once(
         out.latency_ms.map(|ms| Duration::from_millis(ms as u64)),
         out.error.clone(),
         &hyst,
+    );
+    record_check_metrics(
+        shared,
+        &cfg.name,
+        out.success,
+        out.latency_ms.map(|ms| Duration::from_millis(ms as u64)),
+        transition.is_some(),
     );
     if let Some(t) = &transition {
         log_transition(&cfg.name, *t, &out.error);

@@ -39,7 +39,7 @@ impl HealthStatus {
         matches!(self, HealthStatus::Up | HealthStatus::Degraded)
     }
 
-    /// Numeric encoding for Prometheus (`outisdns_upstream_state`).
+    /// Numeric encoding for Prometheus (`res_upstream_state`).
     pub fn state_value(self) -> i64 {
         match self {
             HealthStatus::Down => 0,
@@ -86,12 +86,17 @@ impl OutcomeWindow {
         self.samples.push_back(kind);
     }
 
-    fn success_rate(&self) -> f64 {
+    /// Rolling success rate over the recent outcome window.
+    ///
+    /// `None` while no client query has been forwarded yet — an idle upstream
+    /// has no success rate, and reporting one (e.g. `1.0`) would be a
+    /// fabricated measurement on the dashboard.
+    fn success_rate(&self) -> Option<f64> {
         if self.samples.is_empty() {
-            return 1.0;
+            return None;
         }
         let ok = self.samples.iter().filter(|k| k.is_success()).count();
-        ok as f64 / self.samples.len() as f64
+        Some(ok as f64 / self.samples.len() as f64)
     }
 
     /// Laplace-smoothed success rate used by the selector: an upstream with a
@@ -106,12 +111,13 @@ impl OutcomeWindow {
         (ok + 1.0) / (n + 2.0)
     }
 
-    fn rate(&self, pred: impl Fn(&OutcomeKind) -> bool) -> f64 {
+    /// Share of windowed outcomes matching `pred`; `None` with no outcomes.
+    fn rate(&self, pred: impl Fn(&OutcomeKind) -> bool) -> Option<f64> {
         if self.samples.is_empty() {
-            return 0.0;
+            return None;
         }
         let n = self.samples.iter().filter(|k| pred(k)).count();
-        n as f64 / self.samples.len() as f64
+        Some(n as f64 / self.samples.len() as f64)
     }
 }
 
@@ -134,9 +140,18 @@ struct Inner {
     refused: u64,
     health_rounds: u64,
     health_failures: u64,
+    /// Attempts that failed and caused a retry on another upstream.
+    failovers: u64,
+    /// Result of the most recent health check (None before the first one).
+    last_health_ok: Option<bool>,
     outcomes: OutcomeWindow,
     forward_latency: LatencyWindow,
     health_latency: LatencyWindow,
+    // Sampled once per second by the runtime sampler (honest rates: measured
+    // over the previous interval, never derived from config).
+    prev_queries: u64,
+    prev_sample: Option<Instant>,
+    qps: f64,
 }
 
 impl Inner {
@@ -158,9 +173,14 @@ impl Inner {
             refused: 0,
             health_rounds: 0,
             health_failures: 0,
+            failovers: 0,
+            last_health_ok: None,
             outcomes: OutcomeWindow::default(),
             forward_latency: LatencyWindow::new(FORWARD_LATENCY_WINDOW),
             health_latency: LatencyWindow::new(HEALTH_LATENCY_WINDOW),
+            prev_queries: 0,
+            prev_sample: None,
+            qps: 0.0,
         }
     }
 }
@@ -229,9 +249,21 @@ impl UpstreamRuntime {
         self.lock_inner().status
     }
 
+    /// Record that a failed attempt on this upstream triggered a retry on
+    /// another one (incremented from the failover loop).
+    pub fn record_failover(&self) {
+        self.lock_inner().failovers += 1;
+    }
+
     /// Record the result of a forwarded client query attempt.
     pub fn record_forward(&self, kind: OutcomeKind, latency: Duration) {
         let mut inner = self.lock_inner();
+        // Start the rate window at the first attempt (not at process start),
+        // so the first measured interval already covers real traffic.
+        if inner.prev_sample.is_none() {
+            inner.prev_sample = Some(Instant::now());
+            inner.prev_queries = inner.queries;
+        }
         inner.queries += 1;
         match kind {
             OutcomeKind::Ok => {
@@ -275,6 +307,7 @@ impl UpstreamRuntime {
         let mut inner = self.lock_inner();
         inner.health_rounds += 1;
         inner.last_check = Some(Instant::now());
+        inner.last_health_ok = Some(ok);
         if let Some(l) = latency {
             inner.health_latency.push(l);
         }
@@ -326,6 +359,26 @@ impl UpstreamRuntime {
         }
     }
 
+    /// Refresh the measured requests/second over the last sample interval
+    /// (called from the runtime sampler once per second).
+    pub fn sample_rate(&self) {
+        let mut inner = self.lock_inner();
+        let now = Instant::now();
+        let Some(prev) = inner.prev_sample else {
+            // No attempt yet: rate is not measured, never guessed.
+            inner.qps = 0.0;
+            return;
+        };
+        let delta = inner.queries.saturating_sub(inner.prev_queries);
+        let dt = now
+            .saturating_duration_since(prev)
+            .as_secs_f64()
+            .max(f64::MIN_POSITIVE);
+        inner.qps = delta as f64 / dt;
+        inner.prev_queries = inner.queries;
+        inner.prev_sample = Some(now);
+    }
+
     /// Snapshot for the API / dashboard.
     pub fn stats(&self) -> UpstreamStats {
         let cfg = self.config();
@@ -351,6 +404,15 @@ impl UpstreamRuntime {
             success_rate: inner.outcomes.success_rate(),
             timeout_rate: inner.outcomes.rate(|k| matches!(k, OutcomeKind::Timeout)),
             servfail_rate: inner.outcomes.rate(|k| matches!(k, OutcomeKind::ServFail)),
+            // Lifetime failure share of attempts (`None` before the first
+            // attempt — a denominator of zero must not read as 0%).
+            failure_rate: if inner.queries == 0 {
+                None
+            } else {
+                Some(inner.failures as f64 / inner.queries as f64)
+            },
+            qps: round3(inner.qps),
+            in_use: inner.qps > 0.0,
             queries: inner.queries,
             ok: inner.ok,
             failures: inner.failures,
@@ -359,6 +421,8 @@ impl UpstreamRuntime {
             refused: inner.refused,
             health_rounds: inner.health_rounds,
             health_failures: inner.health_failures,
+            failovers: inner.failovers,
+            last_health_ok: inner.last_health_ok,
             consecutive_failures: inner.consec_failures,
             consecutive_successes: inner.consec_successes,
             last_check_ago_secs: ago_secs(inner.last_check),
@@ -374,28 +438,35 @@ fn ago_secs(at: Option<Instant>) -> Option<u64> {
     at.map(|t| t.elapsed().as_secs())
 }
 
+/// Point-in-time latency view exposed by the API.
+///
+/// Every field is `null` until the upstream has actually answered at least one
+/// client query — an unmeasured percentile must never look like a measurement
+/// of `0 ms`.
 #[derive(Debug, Clone, Serialize)]
 pub struct LatencySnapshot {
-    pub last_ms: f64,
-    pub avg_ms: f64,
-    pub min_ms: f64,
-    pub max_ms: f64,
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
+    pub last_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub min_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
     pub samples: u64,
 }
 
 impl From<LatencyStats> for LatencySnapshot {
     fn from(s: LatencyStats) -> Self {
+        let measured = s.count > 0;
+        let f = |v: f64| if measured { Some(round3(v)) } else { None };
         Self {
-            last_ms: round3(s.last_ms),
-            avg_ms: round3(s.avg_ms),
-            min_ms: round3(s.min_ms),
-            max_ms: round3(s.max_ms),
-            p50_ms: round3(s.p50_ms),
-            p95_ms: round3(s.p95_ms),
-            p99_ms: round3(s.p99_ms),
+            last_ms: f(s.last_ms),
+            avg_ms: f(s.avg_ms),
+            min_ms: f(s.min_ms),
+            max_ms: f(s.max_ms),
+            p50_ms: f(s.p50_ms),
+            p95_ms: f(s.p95_ms),
+            p99_ms: f(s.p99_ms),
             samples: s.count,
         }
     }
@@ -419,9 +490,16 @@ pub struct UpstreamStats {
     pub health: HealthStatus,
     pub latency: LatencySnapshot,
     pub health_latency: Option<f64>,
-    pub success_rate: f64,
-    pub timeout_rate: f64,
-    pub servfail_rate: f64,
+    /// `null` until the outcome window holds at least one client query.
+    pub success_rate: Option<f64>,
+    pub timeout_rate: Option<f64>,
+    pub servfail_rate: Option<f64>,
+    /// Lifetime share of attempts that failed (`null` before any attempt).
+    pub failure_rate: Option<f64>,
+    /// Measured queries/second over the last sampler interval.
+    pub qps: f64,
+    /// `true` when traffic was seen in the last sampler interval.
+    pub in_use: bool,
     pub queries: u64,
     pub ok: u64,
     pub failures: u64,
@@ -430,6 +508,10 @@ pub struct UpstreamStats {
     pub refused: u64,
     pub health_rounds: u64,
     pub health_failures: u64,
+    /// Attempts on this upstream that failed and forced a retry elsewhere.
+    pub failovers: u64,
+    /// Result of the most recent health check (`null` before the first one).
+    pub last_health_ok: Option<bool>,
     pub consecutive_failures: u32,
     pub consecutive_successes: u32,
     pub last_check_ago_secs: Option<u64>,
@@ -507,6 +589,13 @@ impl Registry {
             .cloned()
     }
 
+    /// Refresh the measured qps of every upstream (runtime sampler, 1 Hz).
+    pub fn sample_rates(&self) {
+        for r in self.snapshot() {
+            r.sample_rate();
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.map.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -572,9 +661,37 @@ mod tests {
         assert_eq!(s.queries, 3);
         assert_eq!(s.ok, 2);
         assert_eq!(s.timeouts, 1);
-        assert!((s.success_rate - 2.0 / 3.0).abs() < 1e-9);
-        assert!((s.timeout_rate - 1.0 / 3.0).abs() < 1e-9);
-        assert_eq!(s.latency.p50_ms, 15.0);
+        assert!((s.success_rate.expect("measured") - 2.0 / 3.0).abs() < 1e-9);
+        assert!((s.timeout_rate.expect("measured") - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(s.latency.p50_ms, Some(15.0));
+    }
+
+    #[test]
+    fn idle_upstream_reports_no_rates_instead_of_defaults() {
+        let rt = UpstreamRuntime::new(cfg(1, "a"));
+        let s = rt.stats();
+        assert_eq!(s.queries, 0);
+        // No client query has been forwarded: nothing may be reported as a
+        // measurement (the old behaviour invented 100% success / 0 ms).
+        assert_eq!(s.success_rate, None);
+        assert_eq!(s.timeout_rate, None);
+        assert_eq!(s.servfail_rate, None);
+        assert_eq!(s.latency.samples, 0);
+        assert_eq!(s.latency.p50_ms, None);
+        assert_eq!(s.latency.p95_ms, None);
+        assert_eq!(s.latency.p99_ms, None);
+        assert_eq!(s.latency.avg_ms, None);
+        assert_eq!(s.latency.last_ms, None);
+        // Health probes are not client traffic and must not create a sample.
+        let hyst = health::Hysteresis {
+            failure_threshold: 3,
+            recovery_threshold: 3,
+        };
+        rt.record_health_round(true, Some(Duration::from_millis(2)), None, &hyst);
+        let s = rt.stats();
+        assert_eq!(s.success_rate, None);
+        assert_eq!(s.latency.p50_ms, None);
+        assert!(s.health_latency.is_some(), "probe latency is measured");
     }
 
     #[test]

@@ -72,8 +72,9 @@ pub async fn forward(
     let mut tried: Vec<i64> = Vec::with_capacity(query_cfg.max_attempts as usize);
     let mut attempts: u32 = 0;
     let mut failover_counted = false;
-    // Why the previous attempt gave up: (upstream name, reason, elapsed ms).
-    let mut last_failure: Option<(String, &'static str, u64)> = None;
+    // Why the previous attempt gave up:
+    // (upstream id, upstream name, reason, elapsed ms).
+    let mut last_failure: Option<(i64, String, &'static str, u64)> = None;
 
     loop {
         if attempts >= query_cfg.max_attempts {
@@ -110,11 +111,18 @@ pub async fn forward(
                 tried = tried.len(),
             );
         }
-        if let Some((failed_up, reason, extra_ms)) = last_failure.take() {
+        if let Some((failed_id, failed_up, reason, extra_ms)) = last_failure.take() {
             // Bounded ring; only written when a retry actually happens.
             events.failover.push(crate::events::Event::failover(
                 &failed_up, reason, attempts, &name, extra_ms,
             ));
+            metrics
+                .upstream_failovers_total
+                .with_label_values(&[&failed_up])
+                .inc();
+            if let Some(failed) = pool.iter().find(|u| u.id() == failed_id) {
+                failed.record_failover();
+            }
         }
 
         let budget = up
@@ -153,6 +161,7 @@ pub async fn forward(
                         attempt = attempts,
                     );
                     last_failure = Some((
+                        up.id,
                         name.clone(),
                         "servfail",
                         started_attempt.elapsed().as_millis() as u64,
@@ -208,6 +217,7 @@ pub async fn forward(
                     ExchangeError::Invalid(_) => "invalid",
                 };
                 last_failure = Some((
+                    up.id,
                     name.clone(),
                     reason,
                     started_attempt.elapsed().as_millis() as u64,

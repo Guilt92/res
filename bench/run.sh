@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Reproducible end-to-end benchmark for OutisDNS.
+# Reproducible end-to-end benchmark for res.
 #
 # Starts two local mock DNS upstreams (no external resolvers involved), starts
 # the gateway in front of them, verifies it answers, then drives it with
-# outisdns-loadtest at several target rates. Results (with system info) are
+# res-loadtest at several target rates. Results (with system info) are
 # written to bench/results/.
 #
 # Usage: bench/run.sh [qps ...]        default: 1000 5000 10000
@@ -27,7 +27,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -x "$BIN/outisdns" ] || [ ! -x "$BIN/mock-upstream" ] || [ ! -x "$BIN/outisdns-loadtest" ]; then
+if [ ! -x "$BIN/res" ] || [ ! -x "$BIN/mock-upstream" ] || [ ! -x "$BIN/res-loadtest" ]; then
   echo "missing release binaries; run: cargo build --release" >&2
   exit 1
 fi
@@ -38,21 +38,21 @@ echo "== starting mock upstreams =="
 sleep 0.3
 
 echo "== starting gateway =="
-"$BIN/outisdns" --config bench/bench.toml serve >"$OUT/gateway.log" 2>&1 &
+"$BIN/res" --config bench/bench.toml serve >"$OUT/gateway.log" 2>&1 &
 GATEWAY_PID=$!
 sleep 0.7
 
-if ! "$BIN/outisdns" --config bench/bench.toml probe --server 127.0.0.1:15353 --require-ok; then
+if ! "$BIN/res" --config bench/bench.toml probe --server 127.0.0.1:15353 --require-ok; then
   echo "gateway probe failed; see $OUT/gateway.log" >&2
   exit 1
 fi
 
 echo "== hot-path microbenchmark =="
-"$BIN/outisdns-hotpath-bench" --iters 300000 | tee "$OUT/hotpath.txt"
+"$BIN/res-hotpath-bench" --iters 300000 | tee "$OUT/hotpath.txt"
 
 for QPS in "${QPS_LEVELS[@]}"; do
   echo "== loadtest qps=$QPS duration=${DURATION}s =="
-  "$BIN/outisdns-loadtest" --server 127.0.0.1:15353 --qps "$QPS" --duration "$DURATION" \
+  "$BIN/res-loadtest" --server 127.0.0.1:15353 --qps "$QPS" --duration "$DURATION" \
     | tee "$OUT/loadtest-${QPS}.txt"
 done
 

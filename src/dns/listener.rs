@@ -78,9 +78,11 @@ pub async fn run_udp(
             received = sock.recv_from(&mut buf) => {
                 match received {
                     Ok((n, peer)) => {
+                        shared.metrics.udp_packets_received_total.inc();
+                        shared.metrics.observe_request_bytes(n);
                         let rt = shared.rt.load();
                         if n > rt.max_udp_packet_size {
-                            shared.metrics.malformed_total.inc();
+                            shared.metrics.oversized_packets_total.inc();
                             tracing::debug!(event = "oversized_packet", transport = "udp", len = n, max = rt.max_udp_packet_size);
                             continue;
                         }
@@ -89,6 +91,10 @@ pub async fn run_udp(
 
                         let Some(guard) = inflight.try_acquire(max_inflight) else {
                             shared.metrics.overload_dropped_total.inc();
+                            shared.note_system_event(
+                                "overload_dropped",
+                                serde_json::json!({ "transport": "udp", "max_inflight": max_inflight }),
+                            );
                             tracing::debug!(event = "overload_dropped", transport = "udp");
                             continue;
                         };
@@ -99,7 +105,13 @@ pub async fn run_udp(
                         set.spawn(async move {
                             let _guard = guard;
                             if let Some(resp) = pipeline.handle(peer, Transport::Udp, data).await {
-                                let _ = sock.send_to(&resp, peer).await;
+                                if sock.send_to(&resp, peer).await.is_ok() {
+                                    pipeline.shared.metrics.udp_packets_sent_total.inc();
+                                    pipeline
+                                        .shared
+                                        .metrics
+                                        .observe_response_bytes(resp.len());
+                                }
                             }
                         });
                     }
@@ -142,7 +154,10 @@ pub async fn run_tcp(
                         let max_conn = shared.rt.load().max_tcp_connections;
                         let Some(guard) = connections.try_acquire(max_conn) else {
                             shared.metrics.tcp_connections_rejected_total.inc();
-                            tracing::warn!(event = "tcp_connection_rejected", client = %peer);
+                            tracing::warn!(
+                                event = "tcp_connection_rejected",
+                                client = %shared.client_label(peer.ip()),
+                            );
                             drop(stream);
                             continue;
                         };
@@ -199,7 +214,11 @@ async fn handle_conn(
         let len = usize::from(u16::from_be_bytes(len_buf));
         if len < 12 {
             shared.metrics.malformed_total.inc();
-            tracing::debug!(event = "tcp_malformed_frame", client = %peer, len);
+            tracing::debug!(
+                event = "tcp_malformed_frame",
+                client = %shared.client_label(peer.ip()),
+                len
+            );
             break;
         }
 
@@ -212,6 +231,7 @@ async fn handle_conn(
                 break;
             }
         }
+        shared.metrics.observe_request_bytes(len);
 
         if let Some(resp) = pipeline.handle(peer, Transport::Tcp, frame).await {
             if resp.len() > u16::MAX as usize {
@@ -233,11 +253,16 @@ async fn handle_conn(
                 log_conn_end(write, &shared, peer, served);
                 break;
             }
+            shared.metrics.observe_response_bytes(resp.len());
         }
         served += 1;
     }
 
-    tracing::debug!(event = "tcp_connection_closed", client = %peer, served);
+    tracing::debug!(
+        event = "tcp_connection_closed",
+        client = %shared.client_label(peer.ip()),
+        served
+    );
 }
 
 #[derive(PartialEq, Eq)]
@@ -270,19 +295,19 @@ fn log_conn_end(
     peer: SocketAddr,
     served: u32,
 ) {
+    let client = shared.client_label(peer.ip());
     match outcome {
         ReadOutcome::Timeout => {
-            tracing::debug!(event = "tcp_connection_idle_timeout", client = %peer, served);
+            tracing::debug!(event = "tcp_connection_idle_timeout", client = %client, served);
         }
         ReadOutcome::Io => {
-            tracing::debug!(event = "tcp_connection_closed_early", client = %peer, served);
+            tracing::debug!(event = "tcp_connection_closed_early", client = %client, served);
         }
         ReadOutcome::Shutdown => {
-            tracing::debug!(event = "tcp_connection_drained", client = %peer, served);
+            tracing::debug!(event = "tcp_connection_drained", client = %client, served);
         }
         ReadOutcome::Done => {}
     }
-    let _ = shared;
 }
 
 /// Wait for in-flight tasks up to the configured grace period, then abort.

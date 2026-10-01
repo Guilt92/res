@@ -1,4 +1,4 @@
-//! Reproducible DNS load generator for OutisDNS.
+//! Reproducible DNS load generator for res.
 //!
 //! Measures achieved QPS, latency percentiles (P50/P95/P99) and failure rate
 //! against a running gateway. Synthetic query names are used; no real
@@ -6,7 +6,7 @@
 //!
 //! Example:
 //! ```text
-//! outisdns-loadtest --server 127.0.0.1:53 --qps 5000 --duration 15 --window 32
+//! res-loadtest --server 127.0.0.1:53 --qps 5000 --duration 15 --window 32
 //! ```
 
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use tokio::time::timeout;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "outisdns-loadtest",
+    name = "res-loadtest",
     about = "DNS load tester (UDP pipelined, optional TCP fraction)"
 )]
 struct Args {
@@ -79,7 +79,7 @@ async fn run(args: Args) -> Result<(), String> {
         args.server, args.qps, args.duration, args.workers, args.window, args.prefix
     );
     println!("--- system (recorded for reproducibility) ---");
-    print!("{}", outisdns::sysinfo::SystemInfo::collect().render());
+    print!("{}", res::sysinfo::SystemInfo::collect().render());
 
     let per_udp_qps = args.qps as f64 / udp_workers as f64;
     let args = std::sync::Arc::new(args);

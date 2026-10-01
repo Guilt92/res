@@ -1,4 +1,4 @@
-//! OutisDNS binary: `serve` (default) and `probe` subcommands.
+//! res binary: `serve` (default) and `probe` subcommands.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -6,24 +6,24 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use outisdns::config::{AppConfig, Protocol, UpstreamConfig};
-use outisdns::dns::forward::Forwarder;
-use outisdns::dns::msg::{self, Rcode};
-use outisdns::runtime;
+use res::config::{AppConfig, Protocol, UpstreamConfig};
+use res::dns::forward::Forwarder;
+use res::dns::msg::{self, Rcode};
+use res::runtime;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "outisdns",
+    name = "res",
     version,
-    about = "OutisDNS - health-aware DNS gateway/proxy",
-    long_about = "OutisDNS is a from-scratch DNS gateway: it listens for DNS over UDP/TCP, \
+    about = "res - health-aware DNS gateway/proxy",
+    long_about = "res is a from-scratch DNS gateway: it listens for DNS over UDP/TCP, \
 validates requests, applies ACLs and rate limits, selects a healthy upstream, forwards the \
 query with bounded failover, and exposes metrics/API. It is not a recursive resolver and does \
 not use any external DNS server as its gateway."
 )]
 struct Cli {
     /// Path to the TOML configuration file
-    #[arg(long, global = true, default_value = "config/outisdns.toml")]
+    #[arg(long, global = true, default_value = "config/res.toml")]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -83,14 +83,14 @@ async fn serve(path: PathBuf) -> anyhow::Result<()> {
     let loaded = AppConfig::load_with_fallback(&path);
     if let Some(err) = &loaded.error {
         eprintln!(
-            "outisdns: config {} rejected ({}), using {}",
+            "res: config {} rejected ({}), using {}",
             path.display(),
             err,
             loaded.source
         );
     }
 
-    outisdns::logging::init(&loaded.config.logging);
+    res::logging::init(&loaded.config.logging);
     tracing::info!(
         event = "starting",
         version = env!("CARGO_PKG_VERSION"),

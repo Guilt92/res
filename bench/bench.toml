@@ -1,4 +1,4 @@
-# OutisDNS benchmark configuration.
+# res benchmark configuration.
 #
 # Talks only to local mock upstreams (bench/run.sh starts them), so results
 # are reproducible without depending on external resolvers or network policy.

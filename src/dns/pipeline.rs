@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
+use serde_json::json;
 
 use crate::acl::AclDecision;
 use crate::cache::CacheKey;
@@ -71,6 +72,11 @@ impl Pipeline {
             .queries_total
             .with_label_values(&[transport.as_str()])
             .inc();
+        // Traffic introspection: every received request is attributed to its
+        // client (masked on output unless the operator opted out of privacy).
+        self.shared
+            .traffic
+            .record_request(client.ip(), transport == Transport::Tcp, raw.len());
 
         let prepared = match self.precheck(client, transport, &raw, started) {
             Precheck::Reply(resp) => return Some(resp),
@@ -112,6 +118,17 @@ impl Pipeline {
 
                 if success.rcode == Rcode::ServFail {
                     self.maybe_log_servfail(&success.upstream_name, success.attempts, elapsed);
+                    self.shared.traffic.record_outcome(
+                        client.ip(),
+                        crate::traffic::Outcome::Failed,
+                        Some(elapsed),
+                    );
+                } else {
+                    self.shared.traffic.record_outcome(
+                        client.ip(),
+                        crate::traffic::Outcome::Ok,
+                        Some(elapsed),
+                    );
                 }
 
                 let response = enforce_client_udp_limit(
@@ -148,6 +165,20 @@ impl Pipeline {
                     .client_rcode_total
                     .with_label_values(&["SERVFAIL"])
                     .inc();
+                let client_outcome = if e.reason() == "deadline" {
+                    crate::traffic::Outcome::Timeout
+                } else {
+                    crate::traffic::Outcome::Failed
+                };
+                self.shared
+                    .traffic
+                    .record_outcome(client.ip(), client_outcome, Some(elapsed));
+                if e.reason() == "deadline" {
+                    self.shared.note_system_event(
+                        "query_deadline",
+                        json!({ "transport": transport.as_str(), "attempts": attempts_of(&e) }),
+                    );
+                }
                 tracing::warn!(
                     event = "dns_query_failed",
                     transport = transport.as_str(),
@@ -200,19 +231,31 @@ impl Pipeline {
                             .client_rcode_total
                             .with_label_values(&["NOTIMP"])
                             .inc();
-                        metrics
-                            .query_duration
-                            .observe(started.elapsed().as_secs_f64());
+                        let elapsed = started.elapsed();
+                        metrics.query_duration.observe(elapsed.as_secs_f64());
+                        shared.traffic.record_outcome(
+                            client.ip(),
+                            crate::traffic::Outcome::Failed,
+                            Some(elapsed),
+                        );
                         return Precheck::Reply(resp);
                     }
                     None => {
                         metrics.malformed_total.inc();
+                        shared.traffic.record_outcome(
+                            client.ip(),
+                            crate::traffic::Outcome::Failed,
+                            None,
+                        );
                         return Precheck::Drop;
                     }
                 }
             }
             Err(_) => {
                 metrics.malformed_total.inc();
+                shared
+                    .traffic
+                    .record_outcome(client.ip(), crate::traffic::Outcome::Failed, None);
                 tracing::debug!(
                     event = "malformed_packet",
                     transport = transport.as_str(),
@@ -222,32 +265,62 @@ impl Pipeline {
             }
         };
 
+        // ---- Question-type + domain accounting (before any rejection so
+        // traffic reflects what clients actually asked for) ----
+        let cache_key = msg::question_key(parsed.question());
+        metrics
+            .query_type_total
+            .with_label_values(&[msg::qtype_label(parsed.qtype())])
+            .inc();
+        shared.traffic.record_domain(&cache_key.0);
+
         // ---- ACL (before any forwarding work) ----
         if rt.acl.decide(client.ip()) == AclDecision::Deny {
             metrics.acl_denied_total.inc();
+            shared.note_system_event(
+                "acl_denied",
+                json!({
+                    "client_ip": shared.client_label(client.ip()),
+                    "transport": transport.as_str(),
+                }),
+            );
             tracing::debug!(
                 event = "acl_denied",
                 transport = transport.as_str(),
-                client = %client,
+                client = %shared.client_label(client.ip()),
             );
-            metrics
-                .query_duration
-                .observe(started.elapsed().as_secs_f64());
+            let elapsed = started.elapsed();
+            metrics.query_duration.observe(elapsed.as_secs_f64());
+            shared.traffic.record_outcome(
+                client.ip(),
+                crate::traffic::Outcome::AclDenied,
+                Some(elapsed),
+            );
             return Precheck::Reply(msg::error_response(&parsed, Rcode::Refused));
         }
 
         // ---- Rate limiting ----
         if !shared.ratelimit.check(client.ip(), &rt.ratelimit) {
             metrics.rate_limit_dropped_total.inc();
+            shared.note_system_event(
+                "rate_limited",
+                json!({
+                    "client_ip": shared.client_label(client.ip()),
+                    "transport": transport.as_str(),
+                }),
+            );
             tracing::debug!(
                 event = "rate_limit_triggered",
-                transport = transport.as_str()
+                transport = transport.as_str(),
+                client = %shared.client_label(client.ip()),
             );
+            shared
+                .traffic
+                .record_outcome(client.ip(), crate::traffic::Outcome::RateLimited, None);
             return Precheck::Drop;
         }
 
         // ---- Cache (optional, off by default) ----
-        let cache_key = msg::question_key(parsed.question());
         let use_cache = rt.cache.enabled && !parsed.dnssec_ok;
         if use_cache {
             if let Some(resp) = shared.cache.get(&cache_key, parsed.id, &rt.cache) {
@@ -263,6 +336,11 @@ impl Pipeline {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(elapsed);
+                shared.traffic.record_outcome(
+                    client.ip(),
+                    crate::traffic::Outcome::Ok,
+                    Some(elapsed),
+                );
                 return Precheck::Reply(resp);
             }
             metrics.cache_misses_total.inc();

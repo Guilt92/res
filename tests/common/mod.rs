@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::{Name, RData, Record};
-use outisdns::config::{AppConfig, Protocol, UpstreamConfig};
-use outisdns::runtime::Gateway;
+use res::config::{AppConfig, Protocol, UpstreamConfig};
+use res::runtime::Gateway;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
@@ -203,14 +203,14 @@ pub fn base_config() -> AppConfig {
 }
 
 pub async fn start_gateway(cfg: AppConfig) -> Gateway {
-    outisdns::runtime::start(cfg, None)
+    res::runtime::start(cfg, None)
         .await
         .expect("gateway should start")
 }
 
 /// Start a gateway that persists configuration mutations to `path`.
 pub async fn start_gateway_with_path(cfg: AppConfig, path: std::path::PathBuf) -> Gateway {
-    outisdns::runtime::start(cfg, Some(path))
+    res::runtime::start(cfg, Some(path))
         .await
         .expect("gateway should start")
 }
@@ -223,7 +223,7 @@ pub async fn udp_query(server: SocketAddr, name: &str) -> Option<Message> {
 pub async fn udp_query_timeout(server: SocketAddr, name: &str, wait: Duration) -> Option<Message> {
     let sock = UdpSocket::bind("127.0.0.1:0").await.ok()?;
     sock.connect(server).await.ok()?;
-    let query = outisdns::dns::msg::build_query(name, "A").ok()?;
+    let query = res::dns::msg::build_query(name, "A").ok()?;
     sock.send(&query).await.ok()?;
     let mut buf = vec![0u8; 65_535];
     match tokio::time::timeout(wait, sock.recv(&mut buf)).await {
@@ -250,7 +250,7 @@ pub async fn tcp_query(server: SocketAddr, name: &str) -> Option<Message> {
         .await
         .ok()
         .and_then(|r| r.ok())?;
-    let query = outisdns::dns::msg::build_query(name, "A").ok()?;
+    let query = res::dns::msg::build_query(name, "A").ok()?;
     let mut frame = Vec::with_capacity(2 + query.len());
     frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
     frame.extend_from_slice(&query);

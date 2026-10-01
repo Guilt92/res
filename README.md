@@ -32,12 +32,12 @@ implemented.
 
 ## Quick start
 
-Docker stack — DNS `:15353` (UDP+TCP), dashboard/API `:8080`,
+Docker stack — DNS `:53` (UDP+TCP), dashboard/API `:8080`,
 Prometheus `:9090`, Grafana `:3000`:
 
 ```console
 $ docker-compose up -d --build
-$ dig @127.0.0.1 -p 15353 example.com
+$ dig @127.0.0.1 -p 53 example.com
 ```
 
 Local binary (the default config binds `:53`, so root or

@@ -94,5 +94,3 @@ $ cargo fmt --check
 $ cargo clippy --all-targets --all-features -- -D warnings
 $ cargo test
 ```
-
-Requires rustc 1.88+; Docker only for the full stack. MIT licensed.

@@ -2,9 +2,8 @@
 //!
 //! # Scoring
 //!
-//! Selection never crosses priority tiers: candidates are grouped by
-//! `priority` (lower is better) and only the best non-empty tier is
-//! considered. Inside a tier each candidate gets a score:
+//! Candidates are filtered by health and the configured policies, then each
+//! remaining candidate gets a score:
 //!
 //! ```text
 //! health_factor   = 1.0 if UP, 0.4 if DEGRADED
@@ -19,10 +18,23 @@
 //! Latency only breaks ties between similarly reliable upstreams, and `weight`
 //! sets the long-run traffic share inside a tier.
 //!
+//! # Tier / degraded policies (`[selection]`)
+//!
+//! * `tier_policy = "strict"` (default): only the best (lowest) priority tier
+//!   with usable upstreams receives traffic — classic active/standby.
+//! * `tier_policy = "shared"`: lower tiers receive about `lower_tier_share`
+//!   of selections (score-weighted), keeping their latency/reliability
+//!   measurements warm for instant failover.
+//! * `degraded_policy = "usable"` (default): DEGRADED upstreams are scored at
+//!   0.4x and selectable at any time.
+//! * `degraded_policy = "last_resort"`: DEGRADED upstreams are used only when
+//!   no UP upstream is available.
+//!
 //! Strategies are replaceable behind [`UpstreamSelector`].
 
 use std::sync::Arc;
 
+use crate::config::{DegradedPolicy, TierPolicy};
 use crate::upstream::{HealthStatus, UpstreamRuntime, ViewInputs};
 
 /// Immutable per-candidate view handed to selectors (allocation free, easy to
@@ -99,34 +111,86 @@ impl std::ops::Deref for SelectorHandle {
     }
 }
 
-/// Keep only usable candidates (UP / DEGRADED) and restrict them to the best
-/// (lowest) priority tier present.
-fn usable_tier(candidates: &[StateView]) -> Vec<StateView> {
+/// Filter + tier policy shared by every strategy.
+#[derive(Debug, Clone, Copy)]
+pub struct Policies {
+    pub tier_policy: TierPolicy,
+    /// Approximate share of selections given to non-best tiers
+    /// ([`TierPolicy::Shared`] only).
+    pub lower_tier_share: f64,
+    pub degraded_policy: DegradedPolicy,
+}
+
+impl From<&crate::config::SelectionConfig> for Policies {
+    fn from(cfg: &crate::config::SelectionConfig) -> Self {
+        Self {
+            tier_policy: cfg.tier_policy,
+            lower_tier_share: cfg.lower_tier_share,
+            degraded_policy: cfg.degraded_policy,
+        }
+    }
+}
+
+/// Keep only usable candidates (UP / DEGRADED, honouring the degraded
+/// policy) and apply the tier policy.
+fn eligible(candidates: &[StateView], p: &Policies) -> Vec<StateView> {
     let usable: Vec<StateView> = candidates
         .iter()
         .copied()
         .filter(|c| c.health.is_usable())
         .collect();
+    // `last_resort`: degraded only when nothing is UP.
+    let usable = match p.degraded_policy {
+        DegradedPolicy::Usable => usable,
+        DegradedPolicy::LastResort => {
+            if usable.iter().any(|c| c.health == HealthStatus::Up) {
+                usable
+                    .into_iter()
+                    .filter(|c| c.health == HealthStatus::Up)
+                    .collect()
+            } else {
+                usable
+            }
+        }
+    };
     let Some(best) = usable.iter().map(|c| c.priority).min() else {
         return Vec::new();
     };
-    usable.into_iter().filter(|c| c.priority == best).collect()
+    match p.tier_policy {
+        TierPolicy::Strict => usable.into_iter().filter(|c| c.priority == best).collect(),
+        TierPolicy::Shared => usable,
+    }
+}
+
+/// Score multiplier for one candidate under the tier policy.
+fn tier_weight(c: &StateView, best: u32, p: &Policies) -> f64 {
+    match p.tier_policy {
+        TierPolicy::Strict => 1.0,
+        TierPolicy::Shared if c.priority == best => 1.0,
+        TierPolicy::Shared => p.lower_tier_share,
+    }
+}
+
+fn best_priority(tier: &[StateView]) -> u32 {
+    tier.iter().map(|c| c.priority).min().unwrap_or(0)
 }
 
 /// Default strategy: weighted roulette over the composite score.
 pub struct WeightedReliabilitySelector {
     pub latency_reference_ms: f64,
+    pub policies: Policies,
 }
 
 impl UpstreamSelector for WeightedReliabilitySelector {
     fn select(&self, candidates: &[StateView]) -> Option<i64> {
-        let tier = usable_tier(candidates);
+        let tier = eligible(candidates, &self.policies);
         if tier.is_empty() {
             return None;
         }
+        let best = best_priority(&tier);
         let scores: Vec<f64> = tier
             .iter()
-            .map(|c| c.score(self.latency_reference_ms))
+            .map(|c| c.score(self.latency_reference_ms) * tier_weight(c, best, &self.policies))
             .collect();
         let total: f64 = scores.iter().sum();
         if total <= 0.0 {
@@ -150,23 +214,25 @@ impl UpstreamSelector for WeightedReliabilitySelector {
 /// Deterministic strategy: always the highest scoring candidate.
 pub struct BestScoreSelector {
     pub latency_reference_ms: f64,
+    pub policies: Policies,
 }
 
 impl UpstreamSelector for BestScoreSelector {
     fn select(&self, candidates: &[StateView]) -> Option<i64> {
-        let tier = usable_tier(candidates);
+        let tier = eligible(candidates, &self.policies);
         if tier.is_empty() {
             return None;
         }
-        let mut best: Option<(i64, f64)> = None;
+        let best = best_priority(&tier);
+        let mut best_pick: Option<(i64, f64)> = None;
         for c in &tier {
-            let s = c.score(self.latency_reference_ms);
-            match best {
+            let s = c.score(self.latency_reference_ms) * tier_weight(c, best, &self.policies);
+            match best_pick {
                 Some((id, bs)) if !(s > bs || (s == bs && c.id < id)) => {}
-                _ => best = Some((c.id, s)),
+                _ => best_pick = Some((c.id, s)),
             }
         }
-        best.map(|(id, _)| id)
+        best_pick.map(|(id, _)| id)
     }
 
     fn describe(&self) -> &'static str {
@@ -174,12 +240,15 @@ impl UpstreamSelector for BestScoreSelector {
     }
 }
 
-/// Uniform random choice among the best-priority usable candidates.
-pub struct RandomHealthySelector;
+/// Uniform random choice among the eligible candidates (honours policies
+/// for filtering; ignores scores).
+pub struct RandomHealthySelector {
+    pub policies: Policies,
+}
 
 impl UpstreamSelector for RandomHealthySelector {
     fn select(&self, candidates: &[StateView]) -> Option<i64> {
-        let tier = usable_tier(candidates);
+        let tier = eligible(candidates, &self.policies);
         if tier.is_empty() {
             return None;
         }
@@ -195,14 +264,17 @@ impl UpstreamSelector for RandomHealthySelector {
 /// Build the configured selector.
 pub fn build_selector(cfg: &crate::config::SelectionConfig) -> Box<dyn UpstreamSelector> {
     use crate::config::SelectionStrategy;
+    let policies = Policies::from(cfg);
     match cfg.strategy {
         SelectionStrategy::WeightedReliability => Box::new(WeightedReliabilitySelector {
             latency_reference_ms: cfg.latency_reference_ms,
+            policies,
         }),
         SelectionStrategy::BestScore => Box::new(BestScoreSelector {
             latency_reference_ms: cfg.latency_reference_ms,
+            policies,
         }),
-        SelectionStrategy::RandomHealthy => Box::new(RandomHealthySelector),
+        SelectionStrategy::RandomHealthy => Box::new(RandomHealthySelector { policies }),
     }
 }
 
@@ -230,11 +302,31 @@ mod tests {
         }
     }
 
+    fn strict() -> Policies {
+        Policies {
+            tier_policy: TierPolicy::Strict,
+            lower_tier_share: 0.0,
+            degraded_policy: DegradedPolicy::Usable,
+        }
+    }
+
+    fn weighted(p: Policies) -> WeightedReliabilitySelector {
+        WeightedReliabilitySelector {
+            latency_reference_ms: 50.0,
+            policies: p,
+        }
+    }
+
+    fn best(p: Policies) -> BestScoreSelector {
+        BestScoreSelector {
+            latency_reference_ms: 50.0,
+            policies: p,
+        }
+    }
+
     #[test]
     fn down_upstreams_are_never_selected() {
-        let sel = WeightedReliabilitySelector {
-            latency_reference_ms: 50.0,
-        };
+        let sel = weighted(strict());
         let cands = vec![
             view(1, HealthStatus::Down, 1, 1, 0.9, 5.0),
             view(2, HealthStatus::Up, 1, 1, 0.9, 5.0),
@@ -248,9 +340,7 @@ mod tests {
 
     #[test]
     fn priority_tier_wins_over_score() {
-        let sel = BestScoreSelector {
-            latency_reference_ms: 50.0,
-        };
+        let sel = best(strict());
         // Tier 1 is degraded and slow; tier 2 is perfect. Tier 1 must win.
         let cands = vec![
             view(1, HealthStatus::Degraded, 2, 1, 1.0, 1.0),
@@ -273,19 +363,92 @@ mod tests {
         let up = view(1, HealthStatus::Up, 1, 1, 0.9, 10.0);
         let deg = view(2, HealthStatus::Degraded, 1, 1, 0.9, 10.0);
         assert!(up.score(50.0) > deg.score(50.0));
-        let sel = WeightedReliabilitySelector {
-            latency_reference_ms: 50.0,
-        };
         // Degraded is still a valid fallback when it is alone.
-        assert_eq!(sel.select(&[deg]), Some(2));
+        assert_eq!(weighted(strict()).select(&[deg]), Some(2));
+    }
+
+    #[test]
+    fn degraded_last_resort_never_used_while_up_exists() {
+        let p = Policies {
+            tier_policy: TierPolicy::Strict,
+            lower_tier_share: 0.0,
+            degraded_policy: DegradedPolicy::LastResort,
+        };
+        let sel = weighted(p);
+        let mixed = vec![
+            view(1, HealthStatus::Degraded, 1, 1, 1.0, 1.0),
+            view(2, HealthStatus::Up, 1, 1, 0.5, 100.0),
+        ];
+        for _ in 0..100 {
+            assert_eq!(sel.select(&mixed), Some(2), "degraded must not be used");
+        }
+        // All degraded: now they become the last resort.
+        let all_deg = vec![
+            view(1, HealthStatus::Degraded, 1, 1, 1.0, 1.0),
+            view(3, HealthStatus::Degraded, 1, 1, 1.0, 1.0),
+        ];
+        assert!(sel.select(&all_deg).is_some());
+        // Tier isolation still applies to the last-resort set: a degraded
+        // tier-2 upstream is not used while a degraded tier-1 exists.
+        let tiers = vec![
+            view(1, HealthStatus::Degraded, 1, 1, 1.0, 1.0),
+            view(2, HealthStatus::Degraded, 2, 1, 1.0, 1.0),
+        ];
+        for _ in 0..50 {
+            assert_eq!(sel.select(&tiers), Some(1));
+        }
+    }
+
+    #[test]
+    fn shared_tier_policy_gives_lower_tiers_a_share() {
+        fastrand::seed(11);
+        let p = Policies {
+            tier_policy: TierPolicy::Shared,
+            lower_tier_share: 0.10,
+            degraded_policy: DegradedPolicy::Usable,
+        };
+        let sel = weighted(p);
+        // Identical scores, different tiers: ~10% of picks land on tier 2.
+        let cands = vec![
+            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Up, 2, 1, 1.0, 10.0),
+        ];
+        let mut lower = 0u32;
+        let n = 3000u32;
+        for _ in 0..n {
+            if sel.select(&cands) == Some(2) {
+                lower += 1;
+            }
+        }
+        // Expected 10% (share/(1+share) ≈ 9.1%); allow a wide band.
+        assert!(
+            lower > 100 && lower < 550,
+            "lower-tier share out of band: {lower}/{n}"
+        );
+    }
+
+    #[test]
+    fn shared_tier_share_zero_keeps_strict_traffic_split() {
+        fastrand::seed(3);
+        let p = Policies {
+            tier_policy: TierPolicy::Shared,
+            lower_tier_share: 0.0,
+            degraded_policy: DegradedPolicy::Usable,
+        };
+        let sel = weighted(p);
+        let cands = vec![
+            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Up, 2, 1, 1.0, 10.0),
+        ];
+        for _ in 0..200 {
+            assert_eq!(sel.select(&cands), Some(1));
+        }
     }
 
     #[test]
     fn weight_influences_distribution() {
         fastrand::seed(42);
-        let sel = WeightedReliabilitySelector {
-            latency_reference_ms: 50.0,
-        };
+        let sel = weighted(strict());
         let cands = vec![
             view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
             view(2, HealthStatus::Up, 1, 9, 1.0, 10.0),
@@ -303,9 +466,7 @@ mod tests {
     #[test]
     fn weighted_distribution_is_stochastic_not_just_argmax() {
         fastrand::seed(7);
-        let sel = WeightedReliabilitySelector {
-            latency_reference_ms: 50.0,
-        };
+        let sel = weighted(strict());
         let cands = vec![
             view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
             view(2, HealthStatus::Up, 1, 1, 1.0, 10.0),
@@ -329,17 +490,11 @@ mod tests {
 
     #[test]
     fn empty_candidates_select_nothing() {
-        let sel = WeightedReliabilitySelector {
-            latency_reference_ms: 50.0,
-        };
-        assert_eq!(sel.select(&[]), None);
+        assert_eq!(weighted(strict()).select(&[]), None);
+        assert_eq!(best(strict()).select(&[]), None);
         assert_eq!(
-            BestScoreSelector {
-                latency_reference_ms: 50.0
-            }
-            .select(&[]),
+            RandomHealthySelector { policies: strict() }.select(&[]),
             None
         );
-        assert_eq!(RandomHealthySelector.select(&[]), None);
     }
 }

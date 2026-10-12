@@ -394,6 +394,7 @@ impl UpstreamRuntime {
             enabled: cfg.enabled,
             priority: cfg.priority,
             weight: cfg.weight,
+            timeout_ms: cfg.timeout_ms,
             health: inner.status,
             latency: LatencySnapshot::from(fwd),
             health_latency: if hea.count > 0 {
@@ -487,6 +488,9 @@ pub struct UpstreamStats {
     pub enabled: bool,
     pub priority: u32,
     pub weight: u32,
+    /// Per-upstream attempt timeout override (`null` = inherit from
+    /// `[query].upstream_timeout`).
+    pub timeout_ms: Option<u64>,
     pub health: HealthStatus,
     pub latency: LatencySnapshot,
     pub health_latency: Option<f64>,

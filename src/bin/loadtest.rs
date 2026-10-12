@@ -50,6 +50,11 @@ struct Args {
     /// Also set the EDNS OPT record (advertise 4096 byte payloads).
     #[arg(long)]
     edns: bool,
+    /// Cycle through this many distinct query names (0 = unique name per
+    /// query). A small working set exercises the response cache; 0 models a
+    /// never-repeating stream.
+    #[arg(long, default_value_t = 0)]
+    working_set: u64,
 }
 
 #[derive(Default)]
@@ -75,8 +80,8 @@ async fn run(args: Args) -> Result<(), String> {
     let udp_workers = args.workers.saturating_sub(tcp_workers).max(1);
 
     println!(
-        "loadtest target={} qps={} duration={}s workers={} (udp={udp_workers}, tcp={tcp_workers}) window={} prefix={}",
-        args.server, args.qps, args.duration, args.workers, args.window, args.prefix
+        "loadtest target={} qps={} duration={}s workers={} (udp={udp_workers}, tcp={tcp_workers}) window={} prefix={} working_set={}",
+        args.server, args.qps, args.duration, args.workers, args.window, args.prefix, args.working_set
     );
     println!("--- system (recorded for reproducibility) ---");
     print!("{}", res::sysinfo::SystemInfo::collect().render());
@@ -140,6 +145,7 @@ async fn run(args: Args) -> Result<(), String> {
     println!("p50_ms:      {:.3}", pct(&total.latencies_ms, 50.0));
     println!("p95_ms:      {:.3}", pct(&total.latencies_ms, 95.0));
     println!("p99_ms:      {:.3}", pct(&total.latencies_ms, 99.0));
+    println!("p999_ms:     {:.3}", pct(&total.latencies_ms, 99.9));
     println!(
         "max_ms:      {:.3}",
         total.latencies_ms.last().copied().unwrap_or(0.0)
@@ -229,7 +235,11 @@ async fn udp_worker(
         {
             seq = seq.wrapping_add(1);
             name_seq += 1;
-            let name = format!("w{worker}-{name_seq}.{}", args.prefix);
+            let name = if args.working_set > 0 {
+                format!("ws{}.{}", name_seq % args.working_set, args.prefix)
+            } else {
+                format!("w{worker}-{name_seq}.{}", args.prefix)
+            };
             let q = build_query(seq, &name, args.edns);
             match sock.send(&q).await {
                 Ok(_) => {
@@ -333,7 +343,11 @@ async fn one_tcp_query(
     *seq = seq.wrapping_add(1);
     *name_seq += 1;
     let id = *seq;
-    let name = format!("tcpw{worker}-{name_seq}.{}", args.prefix);
+    let name = if args.working_set > 0 {
+        format!("ws{}.{}", *name_seq % args.working_set, args.prefix)
+    } else {
+        format!("tcpw{worker}-{name_seq}.{}", args.prefix)
+    };
     let q = build_query(id, &name, args.edns);
 
     let mut frame = Vec::with_capacity(2 + q.len());

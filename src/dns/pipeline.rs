@@ -138,20 +138,37 @@ impl Pipeline {
                 );
 
                 if let Some(key) = &prepared.cache_key {
-                    if success.rcode == Rcode::NoError && !success.truncated {
-                        if let Some(ttl) = msg::cacheable_ttl(
+                    // Positive caching (NOERROR with answers) and RFC 2308
+                    // negative caching (NXDOMAIN / NODATA with an SOA).
+                    let entry = if success.rcode == Rcode::NoError && !success.truncated {
+                        msg::cacheable_ttl(
                             &response,
                             prepared.cache_cfg.min_ttl_secs,
                             prepared.cache_cfg.max_ttl_secs,
-                        ) {
-                            self.shared.cache.put(
-                                key.clone(),
-                                response.clone(),
-                                Duration::from_secs(ttl),
-                                &prepared.cache_cfg,
-                            );
-                            metrics.cache_entries.set(self.shared.cache.len() as i64);
+                        )
+                        .map(|t| (t, Rcode::NoError))
+                        .or_else(|| {
+                            msg::negative_ttl(&response, prepared.cache_cfg.negative_max_ttl_secs)
+                                .map(|t| (t, success.rcode))
+                        })
+                    } else if success.rcode == Rcode::NXDomain && !success.truncated {
+                        msg::negative_ttl(&response, prepared.cache_cfg.negative_max_ttl_secs)
+                            .map(|t| (t, Rcode::NXDomain))
+                    } else {
+                        None
+                    };
+                    if let Some((ttl, rcode)) = entry {
+                        let evicted = self.shared.cache.put(
+                            key.clone(),
+                            response.clone(),
+                            Duration::from_secs(ttl),
+                            rcode,
+                            &prepared.cache_cfg,
+                        );
+                        if evicted > 0 {
+                            metrics.cache_evictions_total.inc_by(u64::from(evicted));
                         }
+                        metrics.cache_entries.set(self.shared.cache.len() as i64);
                     }
                 }
                 Some(response)
@@ -267,12 +284,12 @@ impl Pipeline {
 
         // ---- Question-type + domain accounting (before any rejection so
         // traffic reflects what clients actually asked for) ----
-        let cache_key = msg::question_key(parsed.question());
+        let cache_key = msg::question_key(parsed.question(), parsed.checking_disabled);
         metrics
             .query_type_total
             .with_label_values(&[msg::qtype_label(parsed.qtype())])
             .inc();
-        shared.traffic.record_domain(&cache_key.0);
+        shared.traffic.record_domain(&cache_key.name);
 
         // ---- ACL (before any forwarding work) ----
         if rt.acl.decide(client.ip()) == AclDecision::Deny {
@@ -320,30 +337,44 @@ impl Pipeline {
             return Precheck::Drop;
         }
 
-        // ---- Cache (optional, off by default) ----
+        // ---- Cache (enabled by default; DO-bit queries always miss) ----
         let use_cache = rt.cache.enabled && !parsed.dnssec_ok;
         if use_cache {
-            if let Some(resp) = shared.cache.get(&cache_key, parsed.id, &rt.cache) {
-                metrics.cache_hits_total.inc();
-                metrics
-                    .client_rcode_total
-                    .with_label_values(&["NOERROR"])
-                    .inc();
-                let elapsed = started.elapsed();
-                metrics.query_duration.observe(elapsed.as_secs_f64());
-                shared
-                    .global_latency
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(elapsed);
-                shared.traffic.record_outcome(
-                    client.ip(),
-                    crate::traffic::Outcome::Ok,
-                    Some(elapsed),
-                );
-                return Precheck::Reply(resp);
+            match shared.cache.get(&cache_key, parsed.id, &rt.cache) {
+                crate::cache::CacheLookup::Hit { bytes, rcode } => {
+                    metrics.cache_hits_total.inc();
+                    metrics
+                        .client_rcode_total
+                        .with_label_values(&[rcode.as_str()])
+                        .inc();
+                    let elapsed = started.elapsed();
+                    metrics.query_duration.observe(elapsed.as_secs_f64());
+                    shared
+                        .global_latency
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(elapsed);
+                    shared.traffic.record_outcome(
+                        client.ip(),
+                        crate::traffic::Outcome::Ok,
+                        Some(elapsed),
+                    );
+                    // Same transport limits as the forward path.
+                    let resp = enforce_client_udp_limit(
+                        bytes,
+                        transport == Transport::Udp,
+                        parsed.has_edns,
+                    );
+                    return Precheck::Reply(resp);
+                }
+                crate::cache::CacheLookup::Miss => {
+                    metrics.cache_misses_total.inc();
+                }
+                crate::cache::CacheLookup::Expired => {
+                    metrics.cache_misses_total.inc();
+                    metrics.cache_expirations_total.inc();
+                }
             }
-            metrics.cache_misses_total.inc();
         }
 
         Precheck::Proceed(Prepared {

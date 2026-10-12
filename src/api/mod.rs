@@ -4,6 +4,13 @@
 //! into it, never touches the file system or the network on its own, and
 //! keeps working when this HTTP server is down. Configuration persistence is
 //! a single atomic file write per mutation — there is no database anywhere.
+//!
+//! Configuration updates swap an immutable `ArcSwap` snapshot: in-flight DNS
+//! queries keep the snapshot they started with and finish safely; queries
+//! accepted after the swap observe the new configuration immediately.
+//!
+//! When `server.api_token` is set, every configuration-changing endpoint
+//! requires `Authorization: Bearer <token>`; read-only endpoints stay open.
 
 mod prom;
 
@@ -13,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -49,21 +56,148 @@ struct ProbeState {
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
+    Unauthorized(String),
     NotFound(String),
     Conflict(String),
+    /// 409: the operation is only allowed with an explicit confirmation
+    /// (e.g. disabling the last enabled upstream).
+    NeedsConfirm(String),
     Internal(String),
+}
+
+impl ApiError {
+    fn code(&self) -> &'static str {
+        match self {
+            ApiError::BadRequest(_) => "bad_request",
+            ApiError::Unauthorized(_) => "unauthorized",
+            ApiError::NotFound(_) => "not_found",
+            ApiError::Conflict(_) => "conflict",
+            ApiError::NeedsConfirm(_) => "confirm_required",
+            ApiError::Internal(_) => "internal",
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            ApiError::BadRequest(m)
+            | ApiError::Unauthorized(m)
+            | ApiError::NotFound(m)
+            | ApiError::Conflict(m)
+            | ApiError::NeedsConfirm(m)
+            | ApiError::Internal(m) => m,
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, msg) = match &self {
-            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
-            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
-            ApiError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
-            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+        let status = match &self {
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) | ApiError::NeedsConfirm(_) => StatusCode::CONFLICT,
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(json!({ "error": msg }))).into_response()
+        let body = json!({ "error": self.message(), "code": self.code() });
+        (status, Json(body)).into_response()
     }
+}
+
+/// Bearer-token check for configuration-changing endpoints. An empty
+/// configured token keeps the control plane open (development default; a
+/// startup warning is emitted). Failures are audited (op only — never the
+/// presented token).
+fn require_admin(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), ApiError> {
+    let token = st.shared.app.load().server.api_token.clone();
+    if token.is_empty() {
+        return Ok(());
+    }
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if ct_eq(provided.as_bytes(), token.as_bytes()) {
+        Ok(())
+    } else {
+        st.shared
+            .record_config_event("unauthorized", json!({ "op": op, "outcome": "denied" }));
+        Err(ApiError::Unauthorized(
+            "admin token required (Authorization: Bearer <token>)".into(),
+        ))
+    }
+}
+
+/// Length-independent byte-wise equality (avoids early-out on first diff).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Optimistic concurrency: reject mutations prepared against an outdated
+/// configuration snapshot. `expected == None` skips the check (API
+/// compatibility for clients that do not opt in).
+fn check_generation(st: &ApiState, expected: Option<u64>, op: &str) -> Result<(), ApiError> {
+    if let Some(g) = expected {
+        let cur = st.shared.config_generation();
+        if g != cur {
+            st.shared.record_config_event(
+                "stale_update_rejected",
+                json!({ "op": op, "expected": g, "actual": cur, "outcome": "rejected" }),
+            );
+            return Err(ApiError::Conflict(format!(
+                "stale configuration: request has generation {g}, active generation is {cur}; \
+                 reload the upstream list and retry"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse operations that would leave zero enabled upstreams unless the
+/// caller explicitly confirms. "Enabled" is checked against the *configuration*
+/// (health can be temporarily down for all upstreams without blocking admin
+/// recovery actions).
+fn check_last_usable(
+    st: &ApiState,
+    next: &[UpstreamConfig],
+    confirm: bool,
+    op: &str,
+    name: &str,
+) -> Result<(), ApiError> {
+    let currently_enabled = st
+        .shared
+        .app
+        .load()
+        .upstreams
+        .iter()
+        .filter(|u| u.enabled)
+        .count();
+    let next_enabled = next.iter().filter(|u| u.enabled).count();
+    if currently_enabled > 0 && next_enabled == 0 && !confirm {
+        st.shared.record_config_event(
+            "confirm_required",
+            json!({ "op": op, "upstream": name, "outcome": "rejected" }),
+        );
+        return Err(ApiError::NeedsConfirm(format!(
+            "this {op} would leave zero enabled upstreams (the gateway would answer \
+             SERVFAIL for all queries); retry with confirm=true to proceed"
+        )));
+    }
+    Ok(())
+}
+
+/// Audit a rejected configuration change, then hand the error back to the
+/// caller. Detail never contains secrets.
+fn reject(st: &ApiState, action: &str, mut detail: Value, err: ApiError) -> ApiError {
+    if let Value::Object(ref mut m) = detail {
+        m.insert("outcome".into(), "rejected".into());
+        m.insert("reason".into(), Value::String(err.message().to_string()));
+    }
+    st.shared.record_config_event(action, detail);
+    err
 }
 
 pub fn router(shared: Arc<Shared>, forwarder: Forwarder) -> Router {
@@ -157,10 +291,23 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "source": cfg_state.source,
             "error": cfg_state.error,
             "warnings": app.warnings(),
+            "generation": st.shared.config_generation(),
+        },
+        "auth": {
+            "required": !app.server.api_token.is_empty(),
         },
         "selector": {
             "strategy": st.shared.current_selector().describe(),
             "latency_reference_ms": rt.selection.latency_reference_ms,
+            "tier_policy": match rt.selection.tier_policy {
+                crate::config::TierPolicy::Strict => "strict",
+                crate::config::TierPolicy::Shared => "shared",
+            },
+            "lower_tier_share": rt.selection.lower_tier_share,
+            "degraded_policy": match rt.selection.degraded_policy {
+                crate::config::DegradedPolicy::Usable => "usable",
+                crate::config::DegradedPolicy::LastResort => "last_resort",
+            },
         },
         "acl": {
             "allowed_networks": rt.acl.allowed_count(),
@@ -188,6 +335,7 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "enabled": rt.cache.enabled,
             "entries": st.shared.cache.len(),
             "max_entries": rt.cache.max_entries,
+            "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
         },
         "upstreams": {
             "total": total,
@@ -304,6 +452,8 @@ fn build_stats(st: &ApiState) -> Value {
             "hits": hits,
             "misses": misses,
             "hit_ratio": ratio(hits, cache_reads),
+            "evictions": metrics.cache_evictions_total.get(),
+            "expirations": metrics.cache_expirations_total.get(),
         },
         "upstreams": {
             "total": total,
@@ -435,6 +585,7 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "enabled": rt.cache.enabled,
             "entries": st.shared.cache.len(),
             "max_entries": rt.cache.max_entries,
+            "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
         },
         "inflight": {
             "udp": st.shared.udp_inflight.current(),
@@ -524,17 +675,41 @@ fn default_true() -> bool {
 
 async fn import_config(
     State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<ImportConfigQuery>,
     Json(req): Json<ImportConfigRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "import")?;
     let _guard = st.mutation.lock().await;
+    check_generation(&st, q.generation, "import")?;
 
     // Parse + validate BEFORE touching runtime state: an invalid import must
     // leave the running configuration completely unchanged.
-    let next = AppConfig::parse(&req.toml).map_err(ApiError::BadRequest)?;
+    let next = AppConfig::parse(&req.toml).map_err(|e| {
+        reject(
+            &st,
+            "import_rejected",
+            json!({ "op": "import" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
 
-    st.shared
-        .replace_config(next)
-        .map_err(ApiError::BadRequest)?;
+    check_last_usable(
+        &st,
+        &next.upstreams,
+        q.confirm.unwrap_or(false),
+        "import",
+        "(all)",
+    )?;
+
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "import_rejected",
+            json!({ "op": "import" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
 
     let (persisted, persist_error) = if req.persist {
         persist_or_report(&st)
@@ -548,6 +723,7 @@ async fn import_config(
             "upstreams": st.shared.app.load().upstreams.len(),
             "persisted": persisted,
             "persist_error": persist_error,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
         }),
     );
 
@@ -556,6 +732,7 @@ async fn import_config(
         "persisted": persisted,
         "persist_error": persist_error,
         "upstreams": st.shared.app.load().upstreams.len(),
+        "generation": st.shared.config_generation(),
     })))
 }
 
@@ -986,6 +1163,9 @@ pub struct CreateUpstreamRequest {
     pub priority: Option<u32>,
     pub weight: Option<u32>,
     pub timeout_ms: Option<u64>,
+    /// Optional optimistic-concurrency guard: reject if the active
+    /// configuration generation no longer matches.
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1001,6 +1181,24 @@ pub struct UpdateUpstreamRequest {
     pub timeout_ms: Option<u64>,
     /// Explicitly clear the timeout override.
     pub clear_timeout: Option<bool>,
+    /// Required when the update would disable the last enabled upstream.
+    pub confirm: Option<bool>,
+    /// Optional optimistic-concurrency guard (see `CreateUpstreamRequest`).
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteUpstreamQuery {
+    pub confirm: Option<bool>,
+    pub generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportConfigQuery {
+    pub confirm: Option<bool>,
+    pub generation: Option<u64>,
 }
 
 fn parse_address(s: &str) -> Result<IpAddr, ApiError> {
@@ -1022,7 +1220,11 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
 
     // Selection semantics (mirrors `selection.rs`): a DOWN upstream is scored
     // 0 while any upstream is UP, so it is *kept* as a fallback but not used.
+    // With `degraded_policy = "last_resort"`, DEGRADED behaves like DOWN while
+    // any UP upstream exists.
     let any_up = rows.iter().any(|r| r.health == HealthStatus::Up);
+    let degraded_last_resort =
+        st.shared.rt.load().selection.degraded_policy == crate::config::DegradedPolicy::LastResort;
     let mut eligible = Vec::new();
     let mut in_use = Vec::new();
     let mut idle = Vec::new();
@@ -1045,7 +1247,11 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
                 HealthStatus::Degraded => degraded += 1,
                 HealthStatus::Down => down += 1,
             }
-            let is_eligible = !(r.health == HealthStatus::Down && any_up);
+            let is_eligible = match r.health {
+                HealthStatus::Up => true,
+                HealthStatus::Down => !any_up,
+                HealthStatus::Degraded => !(any_up && degraded_last_resort),
+            };
             v["eligible"] = Value::Bool(is_eligible);
             sum_qps += r.qps;
             if is_eligible {
@@ -1064,6 +1270,7 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
 
     Json(json!({
         "upstreams": upstreams,
+        "generation": st.shared.config_generation(),
         "state": {
             "total": rows.len(),
             "up": up,
@@ -1095,15 +1302,20 @@ async fn get_upstream(
 
 async fn create_upstream(
     State(st): State<ApiState>,
+    headers: HeaderMap,
     Json(req): Json<CreateUpstreamRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_admin(&st, &headers, "create")?;
     let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation, "create")?;
     let current: AppConfig = (**st.shared.app.load()).clone();
 
+    let name_hint: String = req.name.trim().chars().take(64).collect();
     let mut candidate = UpstreamConfig {
         id: 0,
         name: req.name.trim().to_string(),
-        address: parse_address(&req.address)?,
+        address: parse_address(&req.address)
+            .map_err(|e| reject(&st, "create_rejected", json!({ "name": name_hint }), e))?,
         port: req.port.unwrap_or(53),
         protocol: req.protocol.unwrap_or(Protocol::Udp),
         enabled: req.enabled.unwrap_or(true),
@@ -1111,12 +1323,21 @@ async fn create_upstream(
         weight: req.weight.unwrap_or(1),
         timeout_ms: req.timeout_ms,
     };
-    candidate.validate().map_err(ApiError::BadRequest)?;
+    candidate.validate().map_err(|e| {
+        reject(
+            &st,
+            "create_rejected",
+            json!({ "name": candidate.name }),
+            ApiError::BadRequest(e),
+        )
+    })?;
     if current.upstreams.iter().any(|u| u.name == candidate.name) {
-        return Err(ApiError::Conflict(format!(
-            "upstream name '{}' already exists",
-            candidate.name
-        )));
+        return Err(reject(
+            &st,
+            "create_rejected",
+            json!({ "name": candidate.name }),
+            ApiError::Conflict(format!("upstream name '{}' already exists", candidate.name)),
+        ));
     }
 
     let mut list = current.upstreams.clone();
@@ -1124,14 +1345,24 @@ async fn create_upstream(
     candidate.id = next_id;
     list.push(candidate.clone());
 
-    st.shared
-        .apply_upstreams(list)
-        .map_err(ApiError::Internal)?;
+    st.shared.apply_upstreams(list).map_err(|e| {
+        reject(
+            &st,
+            "create_rejected",
+            json!({ "name": candidate.name }),
+            ApiError::Internal(e),
+        )
+    })?;
 
     let (persisted, persist_error) = persist_or_report(&st);
     st.shared.record_config_event(
         "create",
-        json!({ "id": next_id, "name": candidate.name, "persisted": persisted }),
+        json!({
+            "id": next_id,
+            "name": candidate.name,
+            "persisted": persisted,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+        }),
     );
 
     let stats = st
@@ -1142,16 +1373,24 @@ async fn create_upstream(
         .unwrap_or(Value::Null);
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "upstream": stats, "persisted": persisted, "persist_error": persist_error })),
+        Json(json!({
+            "upstream": stats,
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "generation": st.shared.config_generation(),
+        })),
     ))
 }
 
 async fn patch_upstream(
     State(st): State<ApiState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Json(req): Json<UpdateUpstreamRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "update")?;
     let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation, "update")?;
     let current: AppConfig = (**st.shared.app.load()).clone();
 
     let existing = current
@@ -1180,21 +1419,33 @@ async fn patch_upstream(
     if let Some(priority) = req.priority {
         updated.priority = priority;
     }
+    if let Some(weight) = req.weight {
+        updated.weight = weight;
+    }
     if Some(true) == req.clear_timeout {
         updated.timeout_ms = None;
     } else if let Some(t) = req.timeout_ms {
         updated.timeout_ms = Some(t);
     }
-    updated.validate().map_err(ApiError::BadRequest)?;
+    updated.validate().map_err(|e| {
+        reject(
+            &st,
+            "update_rejected",
+            json!({ "id": id, "name": updated.name }),
+            ApiError::BadRequest(e),
+        )
+    })?;
     if current
         .upstreams
         .iter()
         .any(|u| u.id != id && u.name == updated.name)
     {
-        return Err(ApiError::Conflict(format!(
-            "upstream name '{}' already exists",
-            updated.name
-        )));
+        return Err(reject(
+            &st,
+            "update_rejected",
+            json!({ "id": id, "name": updated.name }),
+            ApiError::Conflict(format!("upstream name '{}' already exists", updated.name)),
+        ));
     }
 
     let list: Vec<UpstreamConfig> = current
@@ -1208,14 +1459,31 @@ async fn patch_upstream(
             }
         })
         .collect();
-    st.shared
-        .apply_upstreams(list)
-        .map_err(ApiError::Internal)?;
+    check_last_usable(
+        &st,
+        &list,
+        req.confirm.unwrap_or(false),
+        "update",
+        &updated.name,
+    )?;
+    st.shared.apply_upstreams(list).map_err(|e| {
+        reject(
+            &st,
+            "update_rejected",
+            json!({ "id": id, "name": updated.name }),
+            ApiError::Internal(e),
+        )
+    })?;
 
     let (persisted, persist_error) = persist_or_report(&st);
     st.shared.record_config_event(
         "update",
-        json!({ "id": id, "name": updated.name, "persisted": persisted }),
+        json!({
+            "id": id,
+            "name": updated.name,
+            "persisted": persisted,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+        }),
     );
 
     let stats = st
@@ -1228,14 +1496,19 @@ async fn patch_upstream(
         "upstream": stats,
         "persisted": persisted,
         "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
     })))
 }
 
 async fn delete_upstream(
     State(st): State<ApiState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
+    Query(q): Query<DeleteUpstreamQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "delete")?;
     let _guard = st.mutation.lock().await;
+    check_generation(&st, q.generation, "delete")?;
     let current: AppConfig = (**st.shared.app.load()).clone();
 
     let existing = current
@@ -1250,20 +1523,38 @@ async fn delete_upstream(
         .into_iter()
         .filter(|u| u.id != id)
         .collect();
-    st.shared
-        .apply_upstreams(list)
-        .map_err(ApiError::Internal)?;
+    check_last_usable(
+        &st,
+        &list,
+        q.confirm.unwrap_or(false),
+        "delete",
+        &existing.name,
+    )?;
+    st.shared.apply_upstreams(list).map_err(|e| {
+        reject(
+            &st,
+            "delete_rejected",
+            json!({ "id": id, "name": existing.name }),
+            ApiError::Internal(e),
+        )
+    })?;
 
     let (persisted, persist_error) = persist_or_report(&st);
     st.shared.record_config_event(
         "delete",
-        json!({ "id": id, "name": existing.name, "persisted": persisted }),
+        json!({
+            "id": id,
+            "name": existing.name,
+            "persisted": persisted,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+        }),
     );
 
     Ok(Json(json!({
         "deleted": id,
         "persisted": persisted,
         "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
     })))
 }
 
@@ -1283,8 +1574,10 @@ fn persist_or_report(st: &ApiState) -> (bool, Option<String>) {
 
 async fn test_upstream(
     State(st): State<ApiState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "test")?;
     let runtime = st
         .shared
         .registry

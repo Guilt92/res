@@ -224,6 +224,12 @@ pub struct ServerConfig {
     pub upstream_tcp_fallback: bool,
     /// Grace period for draining in-flight work on shutdown.
     pub shutdown_grace_ms: u64,
+    /// Bearer token required for configuration-changing API operations
+    /// (upstream create/update/delete/test, config import). Empty string
+    /// keeps the control plane open (development default; a warning is
+    /// emitted at startup). May be supplied via `RES_API_TOKEN`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_token: String,
 }
 
 impl Default for ServerConfig {
@@ -240,6 +246,7 @@ impl Default for ServerConfig {
             tcp_idle_timeout_ms: 10_000,
             upstream_tcp_fallback: true,
             shutdown_grace_ms: 5_000,
+            api_token: String::new(),
         }
     }
 }
@@ -370,6 +377,32 @@ pub enum SelectionStrategy {
     RandomHealthy,
 }
 
+/// How priority tiers interact during selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierPolicy {
+    /// Classic strict tiers: only the best (lowest) priority tier that has
+    /// usable upstreams receives traffic. Lower tiers stay cold.
+    #[default]
+    Strict,
+    /// Share traffic across all usable tiers: the best tier keeps almost all
+    /// traffic, while lower tiers receive approximately `lower_tier_share`
+    /// of selections (weighted by their scores). Keeps lower tiers measured
+    /// and warm for failover.
+    Shared,
+}
+
+/// When DEGRADED upstreams may receive traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedPolicy {
+    /// Degraded upstreams are selectable at any time (scored 0.4x).
+    #[default]
+    Usable,
+    /// Degraded upstreams are used only when no UP upstream is available.
+    LastResort,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SelectionConfig {
@@ -377,6 +410,13 @@ pub struct SelectionConfig {
     /// Latency score reference in milliseconds: a candidate at exactly this
     /// latency scores 0.5 on the latency term.
     pub latency_reference_ms: f64,
+    /// Strict tiers (default) or shared traffic across tiers.
+    pub tier_policy: TierPolicy,
+    /// Approximate traffic share for lower tiers when `tier_policy` is
+    /// `shared` (0.0–1.0; 0.05 = ~5% of selections keep lower tiers warm).
+    pub lower_tier_share: f64,
+    /// Degraded upstreams are always usable, or only a last resort.
+    pub degraded_policy: DegradedPolicy,
 }
 
 impl Default for SelectionConfig {
@@ -384,6 +424,9 @@ impl Default for SelectionConfig {
         Self {
             strategy: SelectionStrategy::WeightedReliability,
             latency_reference_ms: 50.0,
+            tier_policy: TierPolicy::Strict,
+            lower_tier_share: 0.0,
+            degraded_policy: DegradedPolicy::Usable,
         }
     }
 }
@@ -391,22 +434,27 @@ impl Default for SelectionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
+    /// Response cache on/off (on by default).
     pub enabled: bool,
     /// Hard cap on cached entries (bounded memory).
     pub max_entries: usize,
-    /// Lower TTL bound applied to cached responses (seconds).
+    /// Cacheability threshold: responses whose minimum TTL is *below* this
+    /// value are not cached at all (TTLs are never extended upwards).
     pub min_ttl_secs: u64,
-    /// Upper TTL bound applied to cached responses (seconds).
+    /// Upper cap: cached TTLs longer than this are clamped down.
     pub max_ttl_secs: u64,
+    /// Cap for RFC 2308 negative caching (NXDOMAIN / NODATA), seconds.
+    pub negative_max_ttl_secs: u64,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_entries: 4096,
             min_ttl_secs: 0,
             max_ttl_secs: 3600,
+            negative_max_ttl_secs: 30,
         }
     }
 }
@@ -592,6 +640,13 @@ impl AppConfig {
                 self.monitoring.prometheus_url = v.trim().to_string();
             }
         }
+        if let Ok(v) = std::env::var("RES_API_TOKEN") {
+            // Explicit empty value is ignored so an unset variable cannot
+            // silently open a token-protected control plane.
+            if !v.is_empty() {
+                self.server.api_token = v;
+            }
+        }
     }
 
     /// Startup loader with a last-known-good fallback chain:
@@ -725,6 +780,11 @@ impl AppConfig {
         if self.selection.latency_reference_ms <= 0.0 {
             return Err("selection.latency_reference_ms must be > 0".into());
         }
+        if !self.selection.lower_tier_share.is_finite()
+            || !(0.0..=1.0).contains(&self.selection.lower_tier_share)
+        {
+            return Err("selection.lower_tier_share must be within 0.0..=1.0".into());
+        }
 
         if self.cache.enabled {
             if self.cache.max_entries == 0 {
@@ -732,6 +792,9 @@ impl AppConfig {
             }
             if self.cache.max_ttl_secs < self.cache.min_ttl_secs {
                 return Err("cache.max_ttl_secs must be >= min_ttl_secs".into());
+            }
+            if self.cache.negative_max_ttl_secs > 86_400 {
+                return Err("cache.negative_max_ttl_secs must be <= 86400".into());
             }
         }
 
@@ -782,6 +845,13 @@ impl AppConfig {
         if !self.server.upstream_tcp_fallback {
             out.push(
                 "server.upstream_tcp_fallback is off: truncated (TC=1) answers are passed through"
+                    .into(),
+            );
+        }
+        if self.server.api_token.is_empty() {
+            out.push(
+                "server.api_token is empty: configuration-changing API endpoints \
+                 (upstream create/update/delete/test, config import) are unauthenticated"
                     .into(),
             );
         }
@@ -873,13 +943,43 @@ mod tests {
 
     #[test]
     fn default_config_is_valid() {
-        base().validate().unwrap();
-        assert!(base().warnings().is_empty(), "{:?}", base().warnings());
+        let mut cfg = base();
+        cfg.server.api_token = "test-token".into();
+        cfg.validate().unwrap();
+        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+    }
+
+    #[test]
+    fn api_token_is_optional_and_never_serialized_when_empty() {
+        let mut cfg = base();
+        cfg.server.api_token = String::new();
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(
+            !toml_text.contains("api_token"),
+            "empty token must not appear in exports: {toml_text}"
+        );
+        let reloaded: AppConfig = toml::from_str(&toml_text).expect("parse");
+        assert_eq!(reloaded.server.api_token, "");
+        assert!(reloaded
+            .warnings()
+            .iter()
+            .any(|w| w.contains("api_token is empty")));
+
+        cfg.server.api_token = "sekrit".into();
+        let toml_text = cfg.to_toml().expect("serialize");
+        assert!(toml_text.contains("api_token"));
+        let reloaded: AppConfig = toml::from_str(&toml_text).expect("parse");
+        assert_eq!(reloaded.server.api_token, "sekrit");
+        assert!(!reloaded
+            .warnings()
+            .iter()
+            .any(|w| w.contains("api_token is empty")));
     }
 
     #[test]
     fn warns_when_attempt_budget_exceeds_deadline() {
         let mut cfg = base();
+        cfg.server.api_token = "test-token".into();
         cfg.query.timeout_ms = 1_000;
         cfg.query.upstream_timeout_ms = 800;
         cfg.query.max_attempts = 3;
@@ -932,6 +1032,58 @@ mod tests {
         cfg.upstreams[0].priority = 1;
         cfg.upstreams[0].weight = 0;
         assert!(cfg.validate().unwrap_err().contains("weight"));
+    }
+
+    #[test]
+    fn lower_tier_share_must_be_a_probability() {
+        let mut cfg = base();
+        cfg.selection.lower_tier_share = 0.05;
+        cfg.validate().unwrap();
+        cfg.selection.lower_tier_share = 0.0;
+        cfg.validate().unwrap();
+        cfg.selection.lower_tier_share = 1.0;
+        cfg.validate().unwrap();
+        cfg.selection.lower_tier_share = 1.5;
+        assert!(cfg.validate().unwrap_err().contains("lower_tier_share"));
+        cfg.selection.lower_tier_share = -0.1;
+        assert!(cfg.validate().unwrap_err().contains("lower_tier_share"));
+        cfg.selection.lower_tier_share = f64::NAN;
+        assert!(cfg.validate().unwrap_err().contains("lower_tier_share"));
+    }
+
+    #[test]
+    fn cache_defaults_are_enabled_with_negative_caching() {
+        let cache = CacheConfig::default();
+        assert!(cache.enabled, "cache is on by default");
+        assert_eq!(cache.negative_max_ttl_secs, 30);
+        // Config files without the new key still parse (serde default).
+        let toml = r#"
+            [server]
+            udp_addr = "127.0.0.1:0"
+            tcp_addr = "127.0.0.1:0"
+            api_addr = "127.0.0.1:0"
+            [cache]
+            enabled = true
+            max_entries = 100
+            min_ttl_secs = 0
+            max_ttl_secs = 60
+        "#;
+        let cfg = AppConfig::parse(toml).expect("legacy cache section parses");
+        assert_eq!(cfg.cache.negative_max_ttl_secs, 30);
+        assert_eq!(cfg.cache.max_ttl_secs, 60);
+        // Selection keys are also optional.
+        let toml = r#"
+            [server]
+            udp_addr = "127.0.0.1:0"
+            tcp_addr = "127.0.0.1:0"
+            api_addr = "127.0.0.1:0"
+            [selection]
+            strategy = "best_score"
+        "#;
+        let cfg = AppConfig::parse(toml).expect("legacy selection section parses");
+        assert_eq!(cfg.selection.tier_policy, TierPolicy::Strict);
+        assert_eq!(cfg.selection.degraded_policy, DegradedPolicy::Usable);
+        assert_eq!(cfg.selection.lower_tier_share, 0.0);
     }
 
     #[test]

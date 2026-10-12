@@ -72,6 +72,9 @@ pub async fn forward(
     let mut tried: Vec<i64> = Vec::with_capacity(query_cfg.max_attempts as usize);
     let mut attempts: u32 = 0;
     let mut failover_counted = false;
+    // Cumulative time burned in *failed* attempts (the extra latency the
+    // client paid because of failover).
+    let mut failed_attempt_time = Duration::ZERO;
     // Why the previous attempt gave up:
     // (upstream id, upstream name, reason, elapsed ms).
     let mut last_failure: Option<(i64, String, &'static str, u64)> = None;
@@ -151,6 +154,7 @@ pub async fn forward(
                 let retryable_servfail =
                     kind == OutcomeKind::ServFail && failover.retry_on_servfail;
                 if retryable_servfail {
+                    failed_attempt_time += started_attempt.elapsed();
                     metrics
                         .upstream_failures_total
                         .with_label_values(&[&name])
@@ -177,6 +181,13 @@ pub async fn forward(
                         .inc();
                 }
 
+                if attempts > 1 {
+                    // Client-visible extra latency caused by earlier failed
+                    // attempts (bounded, histogram).
+                    metrics
+                        .failover_latency
+                        .observe(failed_attempt_time.as_secs_f64());
+                }
                 return Ok(ForwardSuccess {
                     upstream_id: up.id,
                     upstream_name: name,
@@ -216,6 +227,7 @@ pub async fn forward(
                     ExchangeError::Network(_) => "network",
                     ExchangeError::Invalid(_) => "invalid",
                 };
+                failed_attempt_time += started_attempt.elapsed();
                 last_failure = Some((
                     up.id,
                     name.clone(),

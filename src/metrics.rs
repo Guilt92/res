@@ -77,11 +77,18 @@ pub struct Metrics {
     pub active_upstreams: IntGauge,
     pub healthy_upstreams: IntGauge,
     pub failovers_total: IntCounter,
+    /// Extra latency paid by clients because earlier upstream attempts failed
+    /// (observed only when failover eventually succeeded).
+    pub failover_latency: Histogram,
 
     // Cache.
     pub cache_hits_total: IntCounter,
     pub cache_misses_total: IntCounter,
     pub cache_entries: IntGauge,
+    /// Entries removed because the cache was full (capacity pressure).
+    pub cache_evictions_total: IntCounter,
+    /// Entries removed because their TTL expired (observed lazily on lookup).
+    pub cache_expirations_total: IntCounter,
 
     // TCP / operational.
     pub tcp_connections_total: IntCounter,
@@ -288,6 +295,14 @@ impl Metrics {
             "res_failovers_total",
             "Client queries that needed more than one upstream attempt",
         );
+        let failover_latency = Histogram::with_opts(
+            HistogramOpts::new(
+                "res_failover_latency_seconds",
+                "Extra time a client waited because earlier upstream attempts failed (successful failovers only)",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+        )
+        .expect("metric");
 
         let cache_hits_total = mk("res_cache_hits_total", "Cache hits");
         let cache_misses_total = mk("res_cache_misses_total", "Cache misses");
@@ -296,6 +311,14 @@ impl Metrics {
             "Current number of cached responses",
         ))
         .expect("metric");
+        let cache_evictions_total = mk(
+            "res_cache_evictions_total",
+            "Cache entries removed because the cache was full",
+        );
+        let cache_expirations_total = mk(
+            "res_cache_expirations_total",
+            "Cache entries removed because their TTL expired",
+        );
 
         let tcp_connections_total = mk("res_tcp_connections_total", "Accepted TCP DNS connections");
         let tcp_connections_rejected_total = mk(
@@ -359,6 +382,8 @@ impl Metrics {
             &failovers_total,
             &cache_hits_total,
             &cache_misses_total,
+            &cache_evictions_total,
+            &cache_expirations_total,
             &tcp_connections_total,
             &tcp_connections_rejected_total,
             &config_reloads_total,
@@ -373,6 +398,10 @@ impl Metrics {
         }
         {
             let h = &query_duration;
+            registry.register(Box::new(h.clone())).expect("register");
+        }
+        {
+            let h = &failover_latency;
             registry.register(Box::new(h.clone())).expect("register");
         }
         {
@@ -449,9 +478,12 @@ impl Metrics {
             active_upstreams,
             healthy_upstreams,
             failovers_total,
+            failover_latency,
             cache_hits_total,
             cache_misses_total,
             cache_entries,
+            cache_evictions_total,
+            cache_expirations_total,
             tcp_connections_total,
             tcp_connections_rejected_total,
             config_reloads_total,
@@ -720,8 +752,11 @@ mod tests {
             "res_upstream_health",
             "res_cache_hits_total",
             "res_cache_misses_total",
+            "res_cache_evictions_total",
+            "res_cache_expirations_total",
             "res_active_upstreams",
             "res_failovers_total",
+            "res_failover_latency_seconds",
             "res_acl_denied_total",
             "res_rate_limit_dropped_total",
             "res_udp_inflight",

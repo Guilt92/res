@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -67,6 +67,10 @@ pub struct Shared {
     /// True while every enabled upstream is DOWN (SERVFAIL for all clients).
     /// Toggled by the health checker's gauge refresh.
     pub emergency: AtomicBool,
+    /// Monotonic counter bumped on every successful `replace_config`; the
+    /// API returns it so clients can detect stale updates (optimistic
+    /// concurrency).
+    config_generation: AtomicU64,
     /// Coalesced admission-control samples waiting for their 30 s summary.
     system_samples: std::sync::Mutex<HashMap<&'static str, PendingSystem>>,
 }
@@ -154,6 +158,7 @@ impl Shared {
             tcp_connections: Arc::new(Counter::default()),
             bound: std::sync::RwLock::new(BoundAddrs::default()),
             emergency: AtomicBool::new(false),
+            config_generation: AtomicU64::new(0),
             system_samples: std::sync::Mutex::new(HashMap::new()),
         }))
     }
@@ -213,9 +218,15 @@ impl Shared {
         self.selector.store(Arc::new(SelectorHandle::new(selector)));
         self.rt.store(Arc::new(rt));
         self.app.store(Arc::new(next));
+        self.config_generation.fetch_add(1, Ordering::Release);
         self.metrics.config_reloads_total.inc();
         tracing::info!(event = "configuration_reloaded");
         Ok(())
+    }
+
+    /// Monotonic configuration generation (bumped on every successful swap).
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Acquire)
     }
 
     /// Replace the upstream list (keeping the rest of the configuration).

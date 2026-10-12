@@ -88,7 +88,7 @@ impl Forwarder {
         raw: &[u8],
         budget: Duration,
     ) -> Result<ExchangeOk, ExchangeError> {
-        if raw.len() > MAX_UDP_PLAIN && !query_has_edns(raw) {
+        if raw.len() > MAX_UDP_PLAIN && !query.has_edns {
             // A UDP payload beyond 512 without EDNS would be non-compliant.
             return Err(ExchangeError::Invalid(
                 "query too large for plain UDP".into(),
@@ -114,7 +114,11 @@ impl Forwarder {
             .await
             .map_err(|e| ExchangeError::Network(format!("send: {e}")))?;
 
-        let mut buf = vec![0u8; 65_535];
+        // Receive buffer sized from the client's advertised EDNS payload
+        // (RFC 6891: a server must not exceed it). Plain-UDP queries get the
+        // DNS flag-day 1232 floor, which also survives servers that ignore
+        // the 512-byte RFC 1035 limit. Bounded, far below the old fixed 64 KiB.
+        let mut buf = vec![0u8; recv_buf_size(query)];
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -224,10 +228,20 @@ impl Forwarder {
     }
 }
 
-fn query_has_edns(raw: &[u8]) -> bool {
-    Message::from_vec(raw)
-        .map(|m| m.edns.is_some())
-        .unwrap_or(false)
+/// DNS flag day 2020 minimum safe UDP payload (also the receive floor for
+/// plain-UDP exchanges: some servers exceed RFC 1035's 512 without EDNS).
+const MIN_RECV_BUF: usize = 1232;
+
+/// Receive buffer size for one upstream UDP exchange: the client's advertised
+/// EDNS payload clamped to a sane window, or the 1232-byte floor for
+/// plain-UDP queries. Never larger than needed, never smaller than a
+/// conformant response.
+fn recv_buf_size(query: &ParsedQuery) -> usize {
+    let advertised = query
+        .edns_payload
+        .map(|p| usize::from(p).max(MIN_RECV_BUF))
+        .unwrap_or(MIN_RECV_BUF);
+    advertised.min(MAX_TCP_MESSAGE)
 }
 
 /// Enforce the RFC 1035 512-byte limit for clients that did not advertise
@@ -251,6 +265,35 @@ pub fn enforce_client_udp_limit(
 mod tests {
     use super::*;
     use crate::dns::msg;
+
+    #[test]
+    fn recv_buf_follows_edns_payload() {
+        let plain = msg::parse_query(&msg::build_query("example.com", "A").unwrap()).unwrap();
+        assert_eq!(recv_buf_size(&plain), MIN_RECV_BUF);
+
+        let mut edns_q = msg::build_query("example.com", "A").unwrap();
+        // Append a minimal OPT record (root name, type 41, payload 4096).
+        // header(12) + question + OPT: name 0x00, type 41, class 4096, ttl 0,
+        // rdlen 0.
+        edns_q[10] = 0; // arcount high byte
+        edns_q[11] = 1; // arcount = 1
+        edns_q.extend_from_slice(&[
+            0x00, // root name
+            0x00, 0x29, // type OPT (41)
+            0x10, 0x00, // class = payload 4096
+            0x00, 0x00, 0x00, 0x00, // extended rcode + flags
+            0x00, 0x00, // rdlen 0
+        ]);
+        let q = msg::parse_query(&edns_q).unwrap();
+        assert!(q.has_edns);
+        assert_eq!(q.edns_payload, Some(4096));
+        assert_eq!(recv_buf_size(&q), 4096);
+
+        // Tiny advertised payload is lifted to the flag-day floor.
+        let mut tiny = msg::parse_query(&msg::build_query("example.com", "A").unwrap()).unwrap();
+        tiny.edns_payload = Some(256);
+        assert_eq!(recv_buf_size(&tiny), MIN_RECV_BUF);
+    }
 
     #[test]
     fn truncates_oversized_response_for_plain_udp_client() {

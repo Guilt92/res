@@ -980,6 +980,102 @@
      "range": false
     }
    ]
+  },
+  {
+   "type": "timeseries",
+   "title": "Cache evictions & expirations (rate)",
+   "fieldConfig": {
+    "defaults": {
+     "noValue": "No data",
+     "mappings": [],
+     "unit": "ops",
+     "custom": {
+      "drawStyle": "line",
+      "lineInterpolation": "linear",
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "gradientMode": "none",
+      "showPoints": "never",
+      "pointSize": 5,
+      "spanNulls": false,
+      "insertNulls": false,
+      "axisPlacement": "auto",
+      "axisLabel": "",
+      "axisColorMode": "text",
+      "axisBorderShow": false,
+      "axisCenteredZero": false,
+      "scaleDistribution": {
+       "type": "linear"
+      },
+      "hideFrom": {
+       "legend": false,
+       "tooltip": false,
+       "viz": false
+      },
+      "thresholdsStyle": {
+       "mode": "off"
+      },
+      "barAlignment": 0,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "calcs": [],
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "tooltipOptions": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   },
+   "description": "Evictions: live entries dropped to stay under max_entries. Expirations: lookups that found an expired entry. Both stay flat while caching is disabled.",
+   "id": 13,
+   "gridPos": {
+    "x": 0,
+    "y": 38,
+    "w": 24,
+    "h": 7
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "A",
+     "editorMode": "code",
+     "expr": "sum(rate(res_cache_evictions_total[$__rate_interval]))",
+     "legendFormat": "evictions",
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "B",
+     "editorMode": "code",
+     "expr": "sum(rate(res_cache_expirations_total[$__rate_interval]))",
+     "legendFormat": "expirations",
+     "range": true
+    }
+   ]
   }
  ],
  "refresh": "30s",

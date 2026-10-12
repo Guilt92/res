@@ -320,6 +320,10 @@ UP_LAT_P = (
     "histogram_quantile({q}, sum by (upstream, le) "
     "(rate(res_upstream_latency_seconds_bucket{ri})))"
 )
+FO_P = (
+    "histogram_quantile({q}, sum by (le) "
+    "(rate(res_failover_latency_seconds_bucket{ri})))"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +805,22 @@ def failures():
         renames={"reason": "Reason", "Value": "Count"},
         sort_field="Count", sort_desc=True,
     )
+
+    d.timeseries(
+        "Failover latency percentiles",
+        [target(FO_P.format(q=q, ri=RI), legend=f"P{p}", ref=r)
+         for q, p, r in [("0.5", "50", "A"), ("0.95", "95", "B"), ("0.99", "99", "C")]],
+        0, 31, 12, 7, unit="s",
+        description="Duration of the failed attempt that led to a successful "
+                    "failover. No data while no failovers occur.",
+    )
+    d.stat(
+        "Failover latency samples (range)",
+        f"increase(res_failover_latency_seconds_count{RG})",
+        12, 31, 12, 7, unit="short", thresholds=GREEN, instant=True,
+        description="Successful failovers that had a failed attempt "
+                    "contributing latency (0 when none).",
+    )
     return d
 
 
@@ -1045,6 +1065,20 @@ def analytics():
         12, 31, 12, 7,
         renames={"kind": "Kind", "Value": "Count"},
         sort_field="Count", sort_desc=True,
+    )
+
+    d.timeseries(
+        "Cache evictions & expirations (rate)",
+        [
+            target(f"sum(rate(res_cache_evictions_total{RI}))",
+                   legend="evictions", ref="A"),
+            target(f"sum(rate(res_cache_expirations_total{RI}))",
+                   legend="expirations", ref="B"),
+        ],
+        0, 38, 24, 7, unit="ops",
+        description="Evictions: live entries dropped to stay under "
+                    "max_entries. Expirations: lookups that found an expired "
+                    "entry. Both stay flat while caching is disabled.",
     )
     return d
 

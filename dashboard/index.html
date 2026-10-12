@@ -220,6 +220,31 @@ button.ghost{background:var(--panel2);border:1px solid var(--line2);color:var(--
 #cfg-msg{font-size:12px}
 #cfg-msg.err{color:#ff7b72}#cfg-msg.ok{color:#7ee787}
 
+/* ---------- upstream management ---------- */
+.umg-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;padding:12px}
+.umg-form label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--dim)}
+.umg-form input,.umg-form select{background:var(--panel2);color:var(--fg);border:1px solid var(--line2);
+  border-radius:6px;padding:5px 8px;font-size:12.5px;font-family:var(--mono);outline:none;width:100%}
+.umg-form input:focus,.umg-form select:focus{border-color:#3b4a61}
+.umg-form label.chk{flex-direction:row;align-items:center;gap:7px;align-self:end;padding-bottom:6px}
+.umg-form .umg-actions{grid-column:1/-1;display:flex;gap:8px}
+.umg-token{display:flex;gap:8px;align-items:center}
+.umg-token input{flex:1;background:var(--panel2);color:var(--fg);border:1px solid var(--line2);
+  border-radius:6px;padding:5px 8px;font-size:12px;font-family:var(--mono);outline:none;min-width:0}
+#umg-msg{margin:10px 0;font-size:12.5px;min-height:16px;white-space:normal}
+#umg-msg.err{color:#ff7b72}#umg-msg.ok{color:#7ee787}#umg-msg.warn{color:#e3b341}
+#umg-table td{font-size:11.5px}
+#umg-table .uact{display:flex;gap:5px;align-items:center}
+#umg-table .uact button{background:var(--panel2);border:1px solid var(--line2);color:var(--fg);
+  border-radius:5px;padding:2px 8px;font-size:11px;cursor:pointer;white-space:nowrap;font-family:var(--sans)}
+#umg-table .uact button:hover{border-color:#3b4a61}
+#umg-table .uact button.danger{color:#ff7b72;border-color:#f8514955}
+#umg-table .uact button.warnbtn{color:#e3b341;border-color:#9e6a0355}
+#umg-table .uact button.okbtn{color:#7ee787;border-color:#23863655}
+#umg-cfgview pre{margin:0;padding:12px;background:var(--panel2);border:0;overflow:auto;
+  font-family:var(--code);font-size:11.5px;color:var(--fg);max-height:420px;white-space:pre}
+#umg-cfgmeta{font-family:var(--mono);font-size:11px;color:var(--dim);padding:8px 12px 0}
+
 /* ---------- tooltip ---------- */
 #tip{position:fixed;z-index:50;pointer-events:none;display:none;background:#0a0e13ee;
   border:1px solid var(--line2);border-radius:6px;padding:6px 9px;font-family:var(--mono);
@@ -456,6 +481,61 @@ window.addEventListener('unhandledrejection', function(e){
   </table>
   </div>
 
+  <!-- ============ UPSTREAM DNS MANAGEMENT ============ -->
+  <h2>Upstream DNS management <span class="sub">add · edit · enable/disable · test · remove — applied at runtime, no restart</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Admin token</div>
+      <div class="umg-token" style="padding:8px 12px 0">
+        <input type="password" id="umg-token" placeholder="Bearer token (only if server.api_token is set)" autocomplete="off">
+        <button class="ghost" id="umg-token-save">Save</button>
+      </div>
+      <div class="tpsub" style="padding:0 12px 10px">Stored in this browser (localStorage), sent as <span class="mono">Authorization: Bearer …</span> on every change. <span id="umg-auth" class="mono"></span></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Active configuration</div>
+      <div class="stats" id="umg-meta" style="padding:8px 12px 0"><div class="empty" style="padding:6px 0">loading…</div></div>
+      <div style="padding:4px 12px 10px"><button class="ghost" id="umg-viewcfg">View active upstream TOML</button></div>
+    </div>
+  </div>
+  <div id="umg-msg"></div>
+
+  <details class="cfg" id="umg-form-d">
+    <summary id="umg-form-title">Add upstream</summary>
+    <div class="umg-form">
+      <label>Name <input id="umg-name" maxlength="64" placeholder="cloudflare-1"></label>
+      <label>Address <input id="umg-address" placeholder="1.1.1.1 (IP only, no hostname)"></label>
+      <label>Port <input id="umg-port" type="number" min="1" max="65535" value="53"></label>
+      <label>Protocol <select id="umg-protocol"><option value="udp">udp</option><option value="tcp">tcp</option></select></label>
+      <label>Priority <input id="umg-priority" type="number" min="1" value="1"></label>
+      <label>Weight <input id="umg-weight" type="number" min="1" value="1"></label>
+      <label>Timeout ms <input id="umg-timeout" type="number" min="1" max="60000" placeholder="inherit"></label>
+      <label class="chk"><input type="checkbox" id="umg-enabled" checked> enabled</label>
+      <label class="chk" title="Required by the gateway when the change would leave zero enabled upstreams"><input type="checkbox" id="umg-confirm"> confirm if last enabled upstream</label>
+      <div class="umg-actions">
+        <button class="primary" id="umg-submit">Add upstream</button>
+        <button class="ghost" id="umg-cancel">Cancel</button>
+      </div>
+    </div>
+  </details>
+
+  <div style="overflow-x:auto;margin-top:10px">
+  <table id="umg-table">
+    <thead><tr>
+      <th>Name</th><th>Address</th><th class="num">Pri/Wt</th><th>State</th>
+      <th class="num">Latency</th><th class="num">Success</th><th class="num">Failures</th><th class="num">Timeouts</th>
+      <th>Last check</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="umg-rows"><tr><td colspan="10" class="empty">loading…</td></tr></tbody>
+  </table>
+  </div>
+
+  <details class="cfg" id="umg-cfgview" style="margin-top:10px">
+    <summary>Active upstream configuration (TOML)</summary>
+    <div id="umg-cfgmeta"></div>
+    <pre id="umg-cfgtext">loading…</pre>
+  </details>
+
   <!-- ============ TIMELINE ============ -->
   <h2>Incident timeline <span class="sub">health transitions, failovers, config changes and system events (bounded in-memory rings)</span></h2>
   <div class="tfilters" id="tfilters">
@@ -515,6 +595,7 @@ const state = {
   hist: null,          // last /api/timeseries payload
   histAt: 0,
   status: null, stats: null, upstreams: [], upState: null,
+  generation: null,
   clients: null, clientSort: "requests",
   events: [], monitoring: null,
   focus: null,         // focused upstream name
@@ -1538,6 +1619,8 @@ function fmtEvent(e, grp){
     if (d.id!=null && !d.name) bits.push("#"+d.id);
     if (d.upstreams!=null) bits.push(d.upstreams+" upstreams");
     if (d.persisted===false) bits.push("not persisted");
+    if (d.outcome) bits.push(String(d.outcome));
+    if (d.reason) bits.push(String(d.reason).slice(0,120));
     if (e.action==="persist_failed") bits.push(escapeHtml(d.error||""));
     return "config <b>"+escapeHtml(e.action)+"</b> "+bits.map(escapeHtml).join(" · ");
   }
@@ -1672,6 +1755,7 @@ async function fetchCurrent(){
     state.stats = stats;
     state.upstreams = ups.upstreams || [];
     state.upState = ups.state || null;
+    state.generation = (ups.generation != null) ? ups.generation : null;
     state.clients = cl;
     state.events = ev.events || [];
     state.upstreams.forEach((u,i) => {
@@ -1691,7 +1775,7 @@ async function fetchCurrent(){
     $("updated").textContent = "updated "+fmtClock(state.lastOk);
     renderVerdict(); renderKpis(); renderTraffic(); renderStatsBlocks();
     renderClientTable(); renderUpState(); renderFailovers();
-    renderSignals(); renderUpstreams(); renderEvents();
+    renderSignals(); renderUpstreams(); renderEvents(); renderUpstreamMgr();
     $("foot-ev").textContent = state.events.length + " recent";
     maybeReady();
   } catch (e) {
@@ -1719,7 +1803,7 @@ function maybeReady(){
 async function loadConfig(){
   try {
     const c = await getJSON("/api/config");
-    $("cfg-text").value = c.toml || "";
+    $("cfg-text").value = maskTokenLine(c.toml || "");
     $("cfg-path").textContent = c.path || "(in-memory)";
     $("cfg-source").textContent = c.source || "—";
     $("cfg-error").textContent = c.error || "none";
@@ -1727,6 +1811,9 @@ async function loadConfig(){
     $("cfg-msg").textContent = "load failed: "+e.message;
     $("cfg-msg").className = "err";
   }
+}
+function maskTokenLine(toml){
+  return toml.replace(/^(\s*api_token\s*=\s*).*$/gm, '$1"•••"');
 }
 async function applyConfig(){
   const msg = $("cfg-msg");
@@ -1745,6 +1832,227 @@ async function applyConfig(){
     await loadConfig(); await fetchCurrent();
   } catch (e){
     msg.textContent = "rejected: "+e.message; msg.className = "err";
+  }
+}
+
+/* =========================================================================
+ * Upstream DNS management (live add/edit/enable/disable/test/remove)
+ * ====================================================================== */
+const umg = { editId: null, pendingConfirm: null };
+function umgToken(){ try { return localStorage.getItem("res-admin-token") || ""; } catch(_){ return ""; } }
+function umgSetToken(t){
+  try { if (t) localStorage.setItem("res-admin-token", t); else localStorage.removeItem("res-admin-token"); } catch(_){}
+}
+function umgMsg(text, cls){ const m = $("umg-msg"); m.textContent = text || ""; m.className = cls || ""; }
+async function umgApi(method, path, body){
+  const h = {};
+  if (body != null) h["Content-Type"] = "application/json";
+  const tok = umgToken();
+  if (tok) h["Authorization"] = "Bearer " + tok;
+  const r = await fetch(path, {method, headers: h, body: body != null ? JSON.stringify(body) : undefined});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok){
+    const err = new Error(j.error || ("HTTP " + r.status));
+    err.code = j.code || ""; err.status = r.status;
+    throw err;
+  }
+  return j;
+}
+function umgHandleError(e, what){
+  if (e.status === 401){
+    umgMsg(what+" rejected: admin token required or invalid — set it in the Admin token box above.", "err");
+  } else if (e.code === "confirm_required"){
+    umgMsg(what+" rejected: "+e.message, "warn");
+  } else if (e.code === "conflict" && /stale configuration/.test(e.message)){
+    umgMsg("Configuration changed elsewhere; reloading… ("+e.message+")", "warn");
+    fetchCurrent();
+  } else {
+    umgMsg(what+" rejected: "+e.message, "err");
+  }
+}
+function umgRenderMeta(){
+  const st = state.status;
+  const el = $("umg-meta");
+  if (!st){ el.innerHTML = '<div class="empty" style="padding:6px 0">loading…</div>'; return; }
+  const a = st.auth || {}, c = st.config || {}, u = st.upstreams || {};
+  $("umg-auth").textContent = a.required ? "gateway requires a token" : "gateway: no token configured";
+  el.innerHTML =
+    '<div class="cfgmeta" style="padding-bottom:4px">'+
+      '<span>generation <b style="color:var(--fg)">'+(state.generation != null ? state.generation : "—")+'</b></span>'+
+      '<span>upstreams <b style="color:var(--fg)">'+(u.enabled!=null?u.enabled+"/"+u.total:(u.total!=null?u.total:"?"))+'</b> enabled</span>'+
+      '<span>source '+(c.source||"—")+'</span>'+
+      '<span>path '+(c.path ? escapeHtml(c.path) : "(in-memory)")+'</span>'+
+    '</div>';
+}
+function renderUpstreamMgr(){
+  umgRenderMeta();
+  const rows = state.upstreams.map(u => {
+    const hc = u.last_health_ok == null ? '<span class="tag">no probe yet</span>'
+      : u.last_health_ok ? '<span class="tag ok">✓ '+(u.health_latency!=null?u.health_latency.toFixed(1)+"ms":"ok")+'</span>'
+      : '<span class="tag bad">✗ fail</span>';
+    const lat = u.latency && u.latency.avg_ms != null
+      ? u.latency.avg_ms.toFixed(1)+"ms p95 "+(u.latency.p95_ms!=null?u.latency.p95_ms.toFixed(1):"—")+"ms" : "—";
+    const sr = u.success_rate == null ? "N/A" : (u.success_rate*100).toFixed(1)+"%";
+    const confirming = umg.pendingConfirm && umg.pendingConfirm.id === u.id;
+    const acts = umg.editId === u.id
+      ? '<button class="okbtn" data-act="canceledit">editing ↑</button>'
+      : '<button data-act="edit">Edit</button>';
+    const toggle = confirming
+      ? '<button class="warnbtn" data-act="toggle-yes">'+(u.enabled?"Disable? Yes":"Enable? Yes")+'</button>'+
+        '<button data-act="toggle-no">Cancel</button>'
+      : '<button class="'+(u.enabled?"warnbtn":"okbtn")+'" data-act="toggle">'+(u.enabled?"Disable":"Enable")+'</button>';
+    const rm = umg.removeId === u.id
+      ? '<button class="danger" data-act="remove-yes">Confirm remove</button>'+
+        '<button data-act="remove-no">Cancel</button>'
+      : '<button class="danger" data-act="remove">Remove</button>';
+    return '<tr data-id="'+u.id+'">'+
+      '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d"></span></span> '+escapeHtml(u.name)+'</td>'+
+      '<td class="mono" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
+      '<td>'+(u.enabled?stateChip(u):'<span class="state disabled"><span class="d"></span>off</span>')+'</td>'+
+      '<td class="num mono">'+lat+'</td>'+
+      '<td class="num" style="color:'+(u.success_rate==null?"inherit":u.success_rate>=0.99?"#7ee787":u.success_rate>=0.95?"#e3b341":"#ff7b72")+'">'+sr+'</td>'+
+      '<td class="num">'+u.failures+'</td>'+
+      '<td class="num">'+u.timeouts+'</td>'+
+      '<td>'+hc+' <span class="mono" style="color:var(--faint);font-size:11px">'+fmtAgo(u.last_check_ago_secs)+'</span></td>'+
+      '<td><div class="uact">'+acts+'<button data-act="test">Test</button>'+toggle+rm+'</div></td>'+
+    '</tr>';
+  });
+  $("umg-rows").innerHTML = rows.length
+    ? rows.join("")
+    : '<tr><td colspan="10" class="empty">no upstreams configured — add one below</td></tr>';
+}
+function umgOpenForm(id){
+  umg.editId = id || null;
+  const u = id != null ? state.upstreams.find(x => x.id === id) : null;
+  $("umg-form-title").textContent = u ? ("Edit upstream: "+u.name) : "Add upstream";
+  $("umg-submit").textContent = u ? "Save changes" : "Add upstream";
+  $("umg-name").value = u ? u.name : "";
+  $("umg-address").value = u ? u.address : "";
+  $("umg-port").value = u ? u.port : 53;
+  $("umg-protocol").value = u ? (u.protocol || "udp") : "udp";
+  $("umg-priority").value = u ? u.priority : 1;
+  $("umg-weight").value = u ? u.weight : 1;
+  $("umg-timeout").value = (u && u.timeout_ms != null) ? u.timeout_ms : "";
+  $("umg-enabled").checked = u ? !!u.enabled : true;
+  $("umg-confirm").checked = false;
+  $("umg-form-d").open = true;
+  $("umg-name").focus();
+  renderUpstreamMgr();
+}
+function umgCloseForm(){
+  umg.editId = null;
+  $("umg-form-d").open = false;
+  renderUpstreamMgr();
+}
+async function umgSubmit(){
+  const name = $("umg-name").value.trim();
+  const address = $("umg-address").value.trim();
+  if (!name || !address){ umgMsg("name and address are required", "err"); return; }
+  const body = {
+    name, address,
+    port: parseInt($("umg-port").value, 10) || 53,
+    protocol: $("umg-protocol").value,
+    priority: parseInt($("umg-priority").value, 10) || 1,
+    weight: parseInt($("umg-weight").value, 10) || 1,
+    enabled: $("umg-enabled").checked,
+    confirm: $("umg-confirm").checked,
+  };
+  const t = $("umg-timeout").value.trim();
+  if (t) body.timeout_ms = parseInt(t, 10);
+  if (state.generation != null) body.generation = state.generation;
+  const what = umg.editId != null ? "update" : "create";
+  try {
+    const j = umg.editId != null
+      ? await umgApi("PATCH", "/api/upstreams/"+umg.editId, body)
+      : await umgApi("POST", "/api/upstreams", body);
+    umgMsg(what+" of '"+name+"' applied"+(j.persisted?" + persisted":" (memory only)")+
+      (j.persist_error?" — persist error: "+j.persist_error:"")+
+      " — effective immediately (generation "+j.generation+")", j.persist_error ? "err" : "ok");
+    if (j.persist_error)
+      umgMsg(what+" of '"+name+"' applied in memory but persist failed: "+j.persist_error+
+        " — runtime and file now diverge until fixed (see timeline /logs)", "err");
+    umgCloseForm();
+    await fetchCurrent();
+  } catch (e){ umgHandleError(e, what+" '"+name+"'"); }
+}
+async function umgRowAction(id, act){
+  const u = state.upstreams.find(x => x.id === id);
+  if (!u) return;
+  if (act === "edit"){ umgOpenForm(id); return; }
+  if (act === "canceledit"){ umgCloseForm(); return; }
+  if (act === "test"){
+    umgMsg("probing "+u.name+" ("+u.address+":"+u.port+" "+u.protocol+")…", "");
+    try {
+      const j = await umgApi("POST", "/api/upstreams/"+id+"/test");
+      const r = j.result || {};
+      const ok = r.success;
+      umgMsg("probe "+u.name+": "+(ok?"OK":"FAILED")+
+        (r.latency_ms!=null?" in "+r.latency_ms.toFixed(1)+"ms":"")+
+        (r.rcode!=null?" · rcode "+r.rcode:"")+
+        (r.error?" · "+r.error:""), ok ? "ok" : "err");
+      await fetchCurrent();
+    } catch (e){ umgHandleError(e, "probe "+u.name); }
+    return;
+  }
+  if (act === "toggle"){
+    umg.pendingConfirm = {id, enabled: u.enabled};
+    renderUpstreamMgr();
+    return;
+  }
+  if (act === "toggle-no"){ umg.pendingConfirm = null; renderUpstreamMgr(); return; }
+  if (act === "toggle-yes"){
+    const next = !u.enabled;
+    const body = {enabled: next, confirm: true};
+    if (state.generation != null) body.generation = state.generation;
+    umg.pendingConfirm = null;
+    try {
+      const j = await umgApi("PATCH", "/api/upstreams/"+id, body);
+      umgMsg(u.name+(next?" enabled":" disabled")+" — effective immediately"+
+        (j.persisted?" (persisted)":" (memory only)")+
+        (j.persist_error?" — persist error: "+j.persist_error:""),
+        j.persist_error ? "err" : "ok");
+      await fetchCurrent();
+    } catch (e){ umgHandleError(e, (next?"enable ":"disable ")+u.name); renderUpstreamMgr(); }
+    return;
+  }
+  if (act === "remove"){ umg.removeId = id; renderUpstreamMgr(); return; }
+  if (act === "remove-no"){ umg.removeId = null; renderUpstreamMgr(); return; }
+  if (act === "remove-yes"){
+    let path = "/api/upstreams/"+id+"?confirm=true";
+    if (state.generation != null) path += "&generation="+state.generation;
+    umg.removeId = null;
+    try {
+      const j = await umgApi("DELETE", path);
+      umgMsg(u.name+" removed — effective immediately"+
+        (j.persisted?" (persisted)":" (memory only)")+
+        (j.persist_error?" — persist error: "+j.persist_error:""),
+        j.persist_error ? "err" : "ok");
+      await fetchCurrent();
+    } catch (e){ umgHandleError(e, "remove "+u.name); renderUpstreamMgr(); }
+  }
+}
+async function umgViewConfig(){
+  try {
+    const c = await getJSON("/api/config");
+    const toml = c.toml || "";
+    const lines = toml.split("\n");
+    const out = [];
+    let inUp = false;
+    for (const line of lines){
+      if (/^\s*\[\[upstreams\]\]/.test(line)) inUp = true;
+      else if (/^\s*\[/.test(line)) inUp = false;
+      if (inUp) out.push(line);
+      else if (/^\s*(udp_addr|tcp_addr|api_addr)\s*=/.test(line)) out.push(line);
+    }
+    $("umg-cfgtext").textContent = out.length
+      ? maskTokenLine(out.join("\n"))
+      : maskTokenLine(toml);
+    $("umg-cfgmeta").textContent = "from GET /api/config · source "+(c.source||"—")+
+      " · path "+(c.path||"(in-memory)")+" · token value masked";
+    $("umg-cfgview").open = true;
+  } catch (e){
+    umgMsg("failed to load active configuration: "+e.message, "err");
   }
 }
 
@@ -1783,6 +2091,22 @@ function wire(){
   });
   $("cfg-apply").addEventListener("click", applyConfig);
   $("cfg-reload").addEventListener("click", loadConfig);
+  // Upstream management
+  $("umg-token").value = umgToken();
+  $("umg-token-save").addEventListener("click", () => {
+    umgSetToken($("umg-token").value.trim());
+    umgMsg(umgToken() ? "admin token saved in this browser" : "admin token cleared", "ok");
+  });
+  $("umg-submit").addEventListener("click", umgSubmit);
+  $("umg-cancel").addEventListener("click", umgCloseForm);
+  $("umg-viewcfg").addEventListener("click", umgViewConfig);
+  $("umg-rows").addEventListener("click", e => {
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const tr = b.closest("tr[data-id]");
+    if (!tr) return;
+    umgRowAction(parseInt(tr.getAttribute("data-id"), 10), b.getAttribute("data-act"));
+  });
   window.addEventListener("resize", () => drawAllCharts());
 }
 

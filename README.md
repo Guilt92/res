@@ -16,12 +16,18 @@ implemented.
 
 * UDP + TCP DNS listeners (RFC 1035 via `hickory-proto`), EDNS-aware size
   limits, TC=1 → TCP retry
-* Fail-closed ACL, per-IP/global token-bucket rate limiting, optional
-  TTL-clamped response cache
-* Upstream pools with strict priority tiers and weighted sharing, three
-  selection strategies, active health checks with hysteresis
+* Fail-closed ACL (IPv4, IPv6 and IPv4-mapped clients), per-IP/global
+  token-bucket rate limiting
+* Response cache, enabled by default: TTLs are never extended beyond what the
+  upstream advertised (they also decrement on every hit), RFC 2308 negative
+  caching for NXDOMAIN/NODATA, bounded by entry count and TTL caps
+* Upstream pools with priority tiers (strict by default, optional shared
+  traffic to keep lower tiers warm), weighted sharing, three selection
+  strategies, active health checks with hysteresis, selectable
+  DEGRADED policy (always usable, or last resort)
 * Bounded failover: total per-query deadline, per-attempt timeout, attempt
-  budget, one try per upstream
+  budget, one try per upstream; failover latency is measured
+  (`res_failover_latency_seconds`)
 * Load shedding (max in-flight UDP, max TCP connections), packet counters
   with running maxima
 * Prometheus metrics, structured logs, bounded event/history rings
@@ -29,6 +35,21 @@ implemented.
   client/domain tables, timeseries
 * Six Grafana dashboards (traffic, clients, upstreams, failures, packets,
   analytics) provisioned from `deploy/grafana/`
+
+## Client ACLs
+
+`[acl]` is fail-closed: an empty `allowed_cidrs` denies everyone, so an
+unconfigured instance can never become an open resolver. Add your customer
+networks explicitly — public CIDRs are fine:
+
+```toml
+[acl]
+allowed_cidrs = ["127.0.0.0/8", "::1/128", "203.0.113.0/24", "2001:db8::/32"]
+denied_cidrs  = []          # evaluated first, wins over allowed_cidrs
+```
+
+IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`, as seen on dual-stack sockets)
+are matched against both the IPv6 rules and the embedded IPv4 address.
 
 ## Quick start
 
@@ -74,9 +95,38 @@ Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
 | `GET /metrics` | Prometheus exposition |
 | `GET /api/health`, `/api/status`, `/api/stats`, `/api/diagnostics` | liveness, runtime state, counters, host/config diagnostics |
 | `GET/POST /api/upstreams`, `PATCH/DELETE /api/upstreams/{id}` | upstream CRUD, state, manual probes |
+| `POST /api/upstreams/{id}/test` | on-demand connectivity/DNS probe of one upstream |
 | `GET /api/config`, `PUT /api/config` | config export / validated hot import |
 | `GET /api/events`, `/api/history`, `/api/timeseries` | event rings, bounded history, chart data |
 | `GET /api/clients`, `/api/domains` | top client addresses, top queried names |
+
+### Upstream management at runtime
+
+Upstream DNS servers can be added, edited, enabled/disabled, probed and
+removed **without restarting the service** — from the dashboard section
+"Upstream DNS management" (`http://localhost:8080/`) or directly via the
+API. Every change is validated as a complete configuration, applied
+atomically via an `ArcSwap` snapshot (in-flight queries finish on the old
+snapshot; new queries see the new pool immediately), then persisted with a
+temp-file + fsync + rename write that keeps `res.toml.backup`.
+
+Safety properties:
+
+* **Admin token** — set `[server].api_token` (or `RES_API_TOKEN`) to require
+  `Authorization: Bearer <token>` on every configuration-changing endpoint.
+  Empty token keeps the open development posture (a startup warning is
+  emitted). The dashboard stores the token in the browser only.
+* **Optimistic concurrency** — mutations accept an optional `generation`
+  (from `GET /api/upstreams`); a stale generation is rejected with `409`.
+* **Last-upstream guard** — disabling or removing the last enabled upstream
+  requires an explicit `confirm=true`, otherwise `409 confirm_required`.
+* **Atomic persistence** — invalid changes never touch the running config
+  or the file; a persist failure is reported in the response, audited
+  (`persist_failed` / `applied_persist_failed` events) and visible in
+  `/api/diagnostics`.
+* **Audit trail** — every accepted and rejected change is recorded in the
+  config event ring (`GET /api/config/events`) with action, timestamp and
+  outcome.
 
 Prometheus scrapes `res:8080/metrics` every 5 s (`deploy/prometheus.yml`).
 Grafana (`:3000`, admin/admin; compose also enables anonymous Viewer)

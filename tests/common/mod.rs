@@ -5,11 +5,11 @@
 //! an outage, and can answer with TC=1 over UDP to exercise TCP fallback.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record};
 use res::config::{AppConfig, Protocol, UpstreamConfig};
 use res::runtime::Gateway;
@@ -26,6 +26,11 @@ pub struct FakeUpstream {
     pub hits: Arc<AtomicU64>,
     answering: Arc<AtomicBool>,
     truncate_udp: Arc<AtomicBool>,
+    /// Answer NXDOMAIN (with an SOA in the authority section) instead of an
+    /// A record — exercises RFC 2308 negative caching.
+    nxdomain: Arc<AtomicBool>,
+    /// Artificial response delay in milliseconds (simulates a slow upstream).
+    delay_ms: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -44,6 +49,8 @@ impl FakeUpstream {
         let hits = Arc::new(AtomicU64::new(0));
         let answering = Arc::new(AtomicBool::new(true));
         let truncate_udp = Arc::new(AtomicBool::new(false));
+        let nxdomain = Arc::new(AtomicBool::new(false));
+        let delay_ms = Arc::new(AtomicUsize::new(0));
 
         let mut tasks = Vec::new();
 
@@ -51,6 +58,8 @@ impl FakeUpstream {
             let hits = Arc::clone(&hits);
             let answering = Arc::clone(&answering);
             let truncate_udp = Arc::clone(&truncate_udp);
+            let nxdomain = Arc::clone(&nxdomain);
+            let delay_ms = Arc::clone(&delay_ms);
             tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 65_535];
                 loop {
@@ -67,8 +76,13 @@ impl FakeUpstream {
                     if !answering.load(Ordering::SeqCst) {
                         continue; // simulate a dead upstream: stay silent
                     }
+                    let delay = delay_ms.load(Ordering::SeqCst);
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+                    }
                     let truncate = truncate_udp.load(Ordering::SeqCst);
-                    if let Some(resp) = build_response(&query, truncate, ip) {
+                    let nx = nxdomain.load(Ordering::SeqCst);
+                    if let Some(resp) = build_response(&query, truncate, ip, nx) {
                         let _ = udp.send_to(&resp, peer).await;
                     }
                 }
@@ -78,6 +92,8 @@ impl FakeUpstream {
         {
             let hits = Arc::clone(&hits);
             let answering = Arc::clone(&answering);
+            let nxdomain = Arc::clone(&nxdomain);
+            let delay_ms = Arc::clone(&delay_ms);
             tasks.push(tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = tcp.accept().await else {
@@ -85,8 +101,12 @@ impl FakeUpstream {
                     };
                     let hits = Arc::clone(&hits);
                     let answering = Arc::clone(&answering);
+                    let nxdomain = Arc::clone(&nxdomain);
+                    let delay_ms = Arc::clone(&delay_ms);
                     tokio::spawn(async move {
-                        let _ = handle_tcp_conn(stream, &hits, &answering, ip).await;
+                        let _ =
+                            handle_tcp_conn(stream, &hits, &answering, &nxdomain, &delay_ms, ip)
+                                .await;
                     });
                 }
             }));
@@ -97,6 +117,8 @@ impl FakeUpstream {
             hits,
             answering,
             truncate_udp,
+            nxdomain,
+            delay_ms,
             tasks,
         }
     }
@@ -129,6 +151,14 @@ impl FakeUpstream {
         self.truncate_udp.store(on, Ordering::SeqCst);
     }
 
+    pub fn set_nxdomain(&self, on: bool) {
+        self.nxdomain.store(on, Ordering::SeqCst);
+    }
+
+    pub fn set_delay_ms(&self, ms: u64) {
+        self.delay_ms.store(ms as usize, Ordering::SeqCst);
+    }
+
     pub async fn stop(self) {
         for t in self.tasks {
             t.abort();
@@ -140,6 +170,8 @@ async fn handle_tcp_conn(
     mut stream: TcpStream,
     hits: &AtomicU64,
     answering: &AtomicBool,
+    nxdomain: &AtomicBool,
+    delay_ms: &AtomicUsize,
     ip: Ipv4Addr,
 ) -> std::io::Result<()> {
     let mut len_buf = [0u8; 2];
@@ -157,7 +189,11 @@ async fn handle_tcp_conn(
     if !answering.load(Ordering::SeqCst) {
         return Ok(()); // dead upstream: close without answering
     }
-    let Some(resp) = build_response(&query, false, ip) else {
+    let delay = delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+    }
+    let Some(resp) = build_response(&query, false, ip, nxdomain.load(Ordering::SeqCst)) else {
         return Ok(());
     };
     let mut frame = Vec::with_capacity(2 + resp.len());
@@ -167,13 +203,36 @@ async fn handle_tcp_conn(
     stream.flush().await
 }
 
-fn build_response(query: &Message, truncate: bool, ip: Ipv4Addr) -> Option<Vec<u8>> {
+fn build_response(
+    query: &Message,
+    truncate: bool,
+    ip: Ipv4Addr,
+    nxdomain: bool,
+) -> Option<Vec<u8>> {
     let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
     resp.metadata.recursion_desired = query.metadata.recursion_desired;
     resp.metadata.recursion_available = true;
     resp.metadata.truncation = truncate;
     resp.queries = query.queries.clone();
-    if !truncate {
+    if nxdomain {
+        resp.metadata.response_code = ResponseCode::NXDomain;
+        // RFC 2308: NXDOMAIN carries the zone SOA in the authority section;
+        // its MINIMUM field is the negative-caching TTL.
+        let q = query.queries.first()?;
+        resp.authorities.push(Record::from_rdata(
+            q.name().clone(),
+            300,
+            RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns.fake.test.").unwrap(),
+                Name::from_ascii("admin.fake.test.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                30, // MINIMUM → negative TTL 30s
+            )),
+        ));
+    } else if !truncate {
         let q = query.queries.first()?;
         let name: Name = q.name().clone();
         resp.answers.push(Record::from_rdata(
@@ -275,8 +334,22 @@ pub async fn tcp_query(server: SocketAddr, name: &str) -> Option<Message> {
 
 /// Minimal HTTP/1.1 client for the control-plane API tests.
 pub async fn http(method: &str, addr: SocketAddr, path: &str, body: Option<&str>) -> (u16, String) {
+    http_auth(method, addr, path, body, None).await
+}
+
+/// Like [`http`], with an optional `Authorization: Bearer <token>` header.
+pub async fn http_auth(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("api connect");
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(t) = token {
+        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    }
     if let Some(b) = body {
         req.push_str("Content-Type: application/json\r\n");
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));

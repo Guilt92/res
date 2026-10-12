@@ -71,12 +71,26 @@ probes = [
 [selection]
 strategy = "weighted_reliability" # weighted_reliability | best_score | random_healthy
 latency_reference_ms = 50.0
+# "strict" (default): only the best priority tier with usable upstreams
+# receives traffic. "shared": lower tiers also receive ~lower_tier_share of
+# selections, keeping their measurements warm for instant failover.
+tier_policy = "strict"
+lower_tier_share = 0.0
+# "usable" (default): DEGRADED upstreams are scored 0.4x and selectable at
+# any time. "last_resort": they are used only when no UP upstream exists.
+degraded_policy = "usable"
 
 [cache]
-enabled = false
+# Response cache (enabled by default). TTLs are never extended beyond what
+# the upstream advertised; min_ttl_secs is a cacheability *threshold*
+# (responses below it are not cached at all), max_ttl_secs caps longer TTLs.
+# NXDOMAIN / NODATA are cached per RFC 2308 using the SOA MINIMUM field,
+# capped by negative_max_ttl_secs.
+enabled = true
 max_entries = 4096
 min_ttl_secs = 0
 max_ttl_secs = 3600
+negative_max_ttl_secs = 30
 
 [logging]
 format = "json"
@@ -106,8 +120,9 @@ top_domains_max = 8192
 # 0 disables the per-client metrics export. Values > 10000 are rejected.
 client_metrics_max = 100
 
-# Upstream pool. `priority` defines strict tiers (selection never crosses a
-# tier boundary); `weight` splits traffic inside a tier.
+# Upstream pool. `priority` orders tiers (lower is better); with the default
+# `tier_policy = "strict"` selection never crosses a tier boundary while a
+# better tier has usable upstreams. `weight` splits traffic inside a tier.
 [[upstreams]]
 name = "cloudflare-1"
 address = "1.1.1.1"

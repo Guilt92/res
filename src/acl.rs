@@ -73,10 +73,22 @@ impl AclRules {
             return AclDecision::Deny;
         }
         if self.allowed.iter().any(|n| n.contains(&client)) {
-            AclDecision::Allow
-        } else {
-            AclDecision::Deny
+            return AclDecision::Allow;
         }
+        // IPv4-mapped IPv6 (`::ffff:a.b.c.d`, common on dual-stack sockets):
+        // also match the embedded IPv4 address against the IPv4 rules, so a
+        // client reaching the listener via the mapped form is not wrongly
+        // denied (or allowed, if only v6 rules match the mapped form itself).
+        if let Some(v4) = mapped_v4(client) {
+            let v4 = IpAddr::V4(v4);
+            if self.denied.iter().any(|n| n.contains(&v4)) {
+                return AclDecision::Deny;
+            }
+            if self.allowed.iter().any(|n| n.contains(&v4)) {
+                return AclDecision::Allow;
+            }
+        }
+        AclDecision::Deny
     }
 
     pub fn allowed_count(&self) -> usize {
@@ -85,6 +97,15 @@ impl AclRules {
 
     pub fn denied_count(&self) -> usize {
         self.denied.len()
+    }
+}
+
+/// Extract the IPv4 address out of an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`), if any.
+fn mapped_v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        IpAddr::V4(_) => None,
     }
 }
 
@@ -156,6 +177,41 @@ mod tests {
             r.decide(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
             AclDecision::Deny
         );
+    }
+
+    #[test]
+    fn ipv4_mapped_clients_match_v4_rules() {
+        // Dual-stack listeners see IPv4 clients as ::ffff:a.b.c.d; they must
+        // match the IPv4 allow rules, not be denied by the family mismatch.
+        let r = rules(&["10.0.0.0/8", "::1/128"], &[]);
+        assert_eq!(r.decide(ip("::ffff:10.1.2.3")), AclDecision::Allow);
+        // ... and a denied v4 subnet still denies the mapped form.
+        let r = rules(&["0.0.0.0/0"], &["10.5.0.0/16"]);
+        assert_eq!(r.decide(ip("::ffff:10.5.9.9")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("::ffff:10.1.2.3")), AclDecision::Allow);
+        // Public mapped address stays denied with default config.
+        let r = AclRules::parse(&AclConfig::default()).unwrap();
+        assert_eq!(r.decide(ip("::ffff:8.8.8.8")), AclDecision::Deny);
+        // Non-mapped IPv6 is unaffected.
+        assert_eq!(r.decide(ip("2001:db8::1")), AclDecision::Deny);
+    }
+
+    #[test]
+    fn public_cidr_can_be_allowed_explicitly() {
+        let r = rules(&["203.0.113.0/24", "2001:db8::/32"], &[]);
+        assert_eq!(r.decide(ip("203.0.113.55")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("203.0.114.1")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("2001:db8::55")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("2001:db9::1")), AclDecision::Deny);
+    }
+
+    #[test]
+    fn cidr_boundaries_are_exact() {
+        let r = rules(&["192.0.2.0/24"], &[]);
+        assert_eq!(r.decide(ip("192.0.2.0")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("192.0.2.255")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("192.0.1.255")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("192.0.3.0")), AclDecision::Deny);
     }
 
     #[test]

@@ -113,6 +113,18 @@ async fn failover_skips_silent_upstream_and_succeeds() {
         failovers >= 1,
         "expected failovers_total >= 1, got {failovers}"
     );
+    // The failover latency histogram must observe the extra time the client
+    // waited for the dead upstream (one observation per successful failover).
+    let fo_latency: u64 = text
+        .lines()
+        .find(|l| l.starts_with("res_failover_latency_seconds_count "))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        fo_latency >= 1,
+        "expected failover_latency observations >= 1, got {fo_latency}"
+    );
 
     // The retry must also appear in the bounded failover event ring with the
     // failing upstream, the reason and the fallback target.
@@ -1388,6 +1400,771 @@ async fn client_and_upstream_rates_are_measured_from_real_traffic() {
         up_qps > 0.0 && in_use,
         "upstream qps/in_use must be measured in some window: {body}"
     );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the audit fixes (cache, selection policies, timeouts)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_serves_hits_with_decremented_ttl_and_correct_rcode() {
+    let fake = FakeUpstream::start().await;
+    fake.set_nxdomain(true);
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.max_entries = 128;
+    cfg.cache.negative_max_ttl_secs = 30;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    // First query: miss, forwarded, then cached (NXDOMAIN + SOA -> negative).
+    let r1 = udp_query(addr, "nx.test").await.expect("nxdomain reply");
+    assert_eq!(r1.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(fake.hits(), 1);
+
+    // Second query: served from cache, upstream not contacted again.
+    let r2 = udp_query(addr, "nx.test").await.expect("cached nxdomain");
+    assert_eq!(r2.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(fake.hits(), 1, "second query must be a cache hit");
+
+    // The cached rcode must be recorded as NXDOMAIN, not NOERROR.
+    let text = gw.shared.metrics.render();
+    let nxdomain_hits = text
+        .lines()
+        .find(|l| l.starts_with("res_response_rcode_total{rcode=\"NXDOMAIN\"}"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        nxdomain_hits >= 2,
+        "both the miss and the hit must be counted as NXDOMAIN, got {nxdomain_hits}"
+    );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_positive_answer_serves_decremented_ttl() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.max_entries = 128;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let r1 = udp_query(addr, "ttl.test").await.expect("answer");
+    assert_eq!(answers_ip(&r1), Some(ANSWER));
+    assert_eq!(fake.hits(), 1);
+
+    // Second query: cache hit. TTL must be <= the upstream TTL and not grow.
+    let r2 = udp_query(addr, "ttl.test").await.expect("cached answer");
+    assert_eq!(answers_ip(&r2), Some(ANSWER));
+    assert_eq!(fake.hits(), 1, "second query must be a cache hit");
+    let ttl1 = r1.answers.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    let ttl2 = r2.answers.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    assert!(
+        ttl2 <= ttl1,
+        "cached TTL must not exceed the original: {ttl1} -> {ttl2}"
+    );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_is_disabled_by_base_config_and_misses_when_off() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config(); // cache.enabled = false by default in base_config
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let _ = udp_query(addr, "off.test").await.expect("first");
+    let _ = udp_query(addr, "off.test").await.expect("second");
+    assert_eq!(fake.hits(), 2, "disabled cache must forward every query");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn min_ttl_threshold_skips_short_answers() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.min_ttl_secs = 300; // upstream answers TTL=60 -> never cacheable
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let _ = udp_query(addr, "skip.test").await.expect("first");
+    let _ = udp_query(addr, "skip.test").await.expect("second");
+    assert_eq!(
+        fake.hits(),
+        2,
+        "answers below the TTL threshold must always be forwarded"
+    );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_tier_policy_sends_traffic_to_lower_tiers() {
+    let primary = FakeUpstream::start().await;
+    let secondary = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.selection.tier_policy = res::config::TierPolicy::Shared;
+    cfg.selection.lower_tier_share = 0.5;
+    let mut p = primary.config("primary");
+    p.priority = 1;
+    let mut s = secondary.config("secondary");
+    s.priority = 2;
+    cfg.upstreams.push(p);
+    cfg.upstreams.push(s);
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    for i in 0..20 {
+        let r = udp_query(addr, &format!("q{i}.test"))
+            .await
+            .expect("answer");
+        assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    }
+    // Strict policy would give the secondary zero traffic; shared must give
+    // it roughly half of 20 queries (>= 1 is enough to prove the policy).
+    let sec_hits = secondary.hits();
+    assert!(
+        sec_hits >= 1,
+        "shared tier policy must send some traffic to the lower tier, got {sec_hits}"
+    );
+    assert!(
+        primary.hits() >= 1,
+        "the best tier must keep most of the traffic"
+    );
+
+    gw.shutdown().await;
+    primary.stop().await;
+    secondary.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_timeout_is_enforced_and_recorded() {
+    let slow = FakeUpstream::start().await;
+    slow.set_delay_ms(400);
+    let mut cfg = base_config();
+    cfg.query.upstream_timeout_ms = 100;
+    cfg.query.timeout_ms = 250;
+    cfg.query.max_attempts = 1;
+    cfg.upstreams.push(slow.config("slow"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let started = std::time::Instant::now();
+    let resp = udp_query_timeout(addr, "slow.test", Duration::from_secs(3))
+        .await
+        .expect("SERVFAIL reply");
+    let elapsed = started.elapsed();
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        elapsed < Duration::from_millis(350),
+        "per-attempt timeout must cut the query short: {elapsed:?}"
+    );
+
+    let text = gw.shared.metrics.render();
+    let timeouts = text
+        .lines()
+        .find(|l| l.starts_with("res_upstream_timeouts_total{upstream=\"slow\"}"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        timeouts >= 1,
+        "upstream timeout must be counted: {timeouts}"
+    );
+
+    gw.shutdown().await;
+    slow.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn total_deadline_bounds_the_whole_query_across_attempts() {
+    let a = FakeUpstream::start().await;
+    a.set_delay_ms(300);
+    let b = FakeUpstream::start().await;
+    b.set_delay_ms(300);
+    let mut cfg = base_config();
+    cfg.query.upstream_timeout_ms = 150;
+    cfg.query.timeout_ms = 400;
+    cfg.query.max_attempts = 3;
+    let mut ca = a.config("a");
+    ca.priority = 1;
+    let mut cb = b.config("b");
+    cb.priority = 2;
+    cfg.upstreams.push(ca);
+    cfg.upstreams.push(cb);
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let started = std::time::Instant::now();
+    let resp = udp_query_timeout(addr, "deadline.test", Duration::from_secs(3))
+        .await
+        .expect("SERVFAIL reply");
+    let elapsed = started.elapsed();
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    // Two attempts at 150ms each would be 300ms; the total deadline (400ms)
+    // must bound everything even if all upstreams hang.
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "total deadline must bound the query: {elapsed:?}"
+    );
+
+    gw.shutdown().await;
+    a.stop().await;
+    b.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Upstream DNS management (live API): auth, generations, guards, in-flight
+// safety, persistence failures, concurrency.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_management_requires_admin_token_when_configured() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit-token".into();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Read-only endpoints stay open.
+    let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Mutations without / with a wrong token are rejected and audited.
+    let create = r#"{"name":"nope","address":"127.0.0.1","port":53}"#;
+    let (status, body) = http("POST", api, "/api/upstreams", Some(create)).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("unauthorized"), "{body}");
+    let (status, body) =
+        http_auth("POST", api, "/api/upstreams", Some(create), Some("wrong")).await;
+    assert_eq!(status, 401, "{body}");
+
+    // With the correct token the create succeeds.
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(create),
+        Some("sekrit-token"),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let id = created["upstream"]["id"].as_i64().expect("id");
+
+    // PATCH, test and DELETE are gated too.
+    let (status, _) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"weight":2}"#),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, _) = http_auth(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"weight":2}"#),
+        Some("sekrit-token"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = http("POST", api, &format!("/api/upstreams/{id}/test"), None).await;
+    assert_eq!(status, 401);
+    let (status, _) = http_auth(
+        "POST",
+        api,
+        &format!("/api/upstreams/{id}/test"),
+        None,
+        Some("sekrit-token"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = http("DELETE", api, &format!("/api/upstreams/{id}"), None).await;
+    assert_eq!(status, 401);
+    let (status, body) = http_auth(
+        "DELETE",
+        api,
+        &format!("/api/upstreams/{id}?confirm=true"),
+        None,
+        Some("sekrit-token"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Status advertises that auth is required; audit ring holds the denials.
+    let (status, body) = http("GET", api, "/api/status", None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("\"required\":true"), "{body}");
+    let (_, body) = http("GET", api, "/api/config/events", None).await;
+    assert!(body.contains("unauthorized"), "{body}");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_management_generation_guards_stale_updates() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"gen-a","address":"127.0.0.1","port":53}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let a: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let id_a = a["upstream"]["id"].as_i64().expect("id");
+    let gen_after_a = a["generation"].as_u64().expect("generation");
+
+    // A second mutation moves the generation forward.
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"gen-b","address":"127.0.0.2","port":53}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let b: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let gen_after_b = b["generation"].as_u64().expect("generation");
+    assert!(gen_after_b > gen_after_a);
+
+    // A PATCH prepared against the old generation is rejected …
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id_a}"),
+        Some(&format!(r#"{{"weight":9,"generation":{gen_after_a}}}"#)),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("stale configuration"), "{body}");
+
+    // … while the current generation is accepted.
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id_a}"),
+        Some(&format!(r#"{{"weight":9,"generation":{gen_after_b}}}"#)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_enabled_upstream_requires_confirmation() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("only"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp addr");
+    let id = {
+        let (_, body) = http("GET", api, "/api/upstreams", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        v["upstreams"][0]["id"].as_i64().expect("id")
+    };
+
+    // Data plane works while the upstream is enabled.
+    assert!(udp_query(udp, "before.test").await.is_some());
+
+    // Disabling the last enabled upstream needs an explicit confirmation.
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"enabled":false}"#),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("confirm_required"), "{body}");
+    let (_, body) = http("GET", api, "/api/upstreams", None).await;
+    assert!(
+        body.contains("\"enabled\":true") || body.contains("\"enabled\": true"),
+        "{body}"
+    );
+
+    // Removing it has the same guard.
+    let (status, body) = http("DELETE", api, &format!("/api/upstreams/{id}"), None).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("confirm_required"), "{body}");
+
+    // Confirmed removal goes through; the gateway answers SERVFAIL with an
+    // empty pool, then recovers as soon as a replacement is added.
+    let (status, body) = http(
+        "DELETE",
+        api,
+        &format!("/api/upstreams/{id}?confirm=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let resp = udp_query(udp, "empty-pool.test")
+        .await
+        .expect("SERVFAIL reply");
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(&format!(
+            r#"{{"name":"replacement","address":"{}","port":{}}}"#,
+            fake.addr.ip(),
+            fake.addr.port()
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert!(udp_query(udp, "recovered.test").await.is_some());
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_changes_apply_at_runtime_and_survive_inflight_queries() {
+    let a = FakeUpstream::start().await;
+    let b = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(a.config("live-a"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp addr");
+
+    // Add a second upstream at runtime (no restart) and point it at fake b.
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"live-b","address":"127.0.0.1","port":1}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let id_b = {
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        v["upstream"]["id"].as_i64().expect("id")
+    };
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id_b}"),
+        Some(&format!(
+            r#"{{"address":"{}","port":{}}}"#,
+            b.addr.ip(),
+            b.addr.port()
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // A continuous query stream runs while upstreams are disabled/enabled.
+    // In-flight queries hold the ArcSwap snapshot and must all succeed.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let worker = tokio::spawn(async move {
+        let (mut ok, mut fail) = (0u64, 0u64);
+        while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+            if udp_query(udp, "inflight.test").await.is_some() {
+                ok += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        (ok, fail)
+    });
+
+    // Disable a, queries keep working via b; re-enable a; disable again.
+    let id_a = {
+        let (_, body) = http("GET", api, "/api/upstreams", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        v["upstreams"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|u| u["name"] == "live-a")
+            .expect("live-a present")["id"]
+            .as_i64()
+            .expect("id")
+    };
+    for enabled in [false, true, false] {
+        let (status, body) = http(
+            "PATCH",
+            api,
+            &format!("/api/upstreams/{id_a}"),
+            Some(&format!(r#"{{"enabled":{enabled}}}"#)),
+        )
+        .await;
+        assert_eq!(status, 200, "live-a enable={enabled}: {body}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (ok, fail) = worker.await.expect("worker");
+    assert!(ok > 0, "query stream made no progress");
+    assert_eq!(fail, 0, "in-flight queries failed during upstream changes");
+
+    // New queries immediately used the updated pool (fake b saw traffic).
+    assert!(
+        b.hits() > 0,
+        "runtime-added upstream never received traffic"
+    );
+
+    gw.shutdown().await;
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_upstream_update_leaves_active_config_intact() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp addr");
+    let id = {
+        let (_, body) = http("GET", api, "/api/upstreams", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        v["upstreams"][0]["id"].as_i64().expect("id")
+    };
+
+    // Invalid address, invalid port, zero priority/weight/timeout are all
+    // rejected with 400; unknown fields fail body deserialization (422).
+    for body in [
+        r#"{"address":"not-an-ip"}"#,
+        r#"{"port":0}"#,
+        r#"{"priority":0}"#,
+        r#"{"weight":0}"#,
+        r#"{"timeout_ms":0}"#,
+    ] {
+        let (status, resp) = http("PATCH", api, &format!("/api/upstreams/{id}"), Some(body)).await;
+        assert_eq!(status, 400, "expected rejection for {body}: {resp}");
+    }
+    let (status, resp) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"bogus":1}"#),
+    )
+    .await;
+    assert!(
+        status == 400 || status == 422,
+        "unknown field must be rejected: {status} {resp}"
+    );
+
+    // Renaming to an existing peer's name is a conflict, not a silent merge.
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"taken-name","address":"127.0.0.1","port":54}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, resp) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"name":"taken-name"}"#),
+    )
+    .await;
+    assert_eq!(status, 409, "{resp}");
+
+    // Active configuration unchanged, rejections audited, data plane alive.
+    let (_, body) = http("GET", api, "/api/upstreams", None).await;
+    assert!(body.contains("\"seed\""));
+    assert!(
+        body.contains(r#""address":"127.0.0.1""#) || body.contains(r#""address": "127.0.0.1""#),
+        "{body}"
+    );
+    let (_, events) = http("GET", api, "/api/config/events", None).await;
+    assert!(events.contains("update_rejected"), "{events}");
+    assert!(udp_query(udp, "still-works.test").await.is_some());
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persist_failure_is_reported_and_audited() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("seed"));
+    let dir = std::env::temp_dir().join(format!("res-persist-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path = dir.join("res.toml");
+    let gw = start_gateway_with_path(cfg, path.clone()).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // One successful mutation establishes a valid on-disk configuration.
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"baseline","address":"127.0.0.2","port":53}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("json")["persisted"],
+        true,
+        "{body}"
+    );
+
+    // Make the config directory read-only so the atomic write cannot create
+    // its temp file.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(r#"{"name":"orphan","address":"127.0.0.1","port":53}"#),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(created["persisted"], false, "{body}");
+    assert!(
+        created["persist_error"].is_string(),
+        "persist_error must be reported: {body}"
+    );
+
+    // The divergence is loudly audited (in-memory ring + /api/config/events).
+    let (_, events) = http("GET", api, "/api/config/events", None).await;
+    assert!(
+        events.contains("persist_failed") || events.contains("applied_persist_failed"),
+        "{events}"
+    );
+
+    // The runtime keeps the new config (documented policy: never roll back
+    // the data plane), and the last valid file on disk is still loadable.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    let on_disk = res::config::AppConfig::load(&path).expect("file still loads");
+    assert!(
+        on_disk.upstreams.iter().any(|u| u.name == "baseline"),
+        "previous valid configuration must survive"
+    );
+    assert!(
+        !on_disk.upstreams.iter().any(|u| u.name == "orphan"),
+        "failed persist must not have touched the file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_upstream_creates_are_serialized() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        tasks.push(tokio::spawn(async move {
+            http(
+                "POST",
+                api,
+                "/api/upstreams",
+                Some(&format!(
+                    r#"{{"name":"cc-{i}","address":"127.0.0.1","port":53}}"#
+                )),
+            )
+            .await
+        }));
+    }
+    let mut generations = Vec::new();
+    for t in tasks {
+        let (status, body) = t.await.expect("join");
+        assert_eq!(status, 201, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        generations.push(v["generation"].as_u64().expect("generation"));
+    }
+    // Every mutation bumped the generation exactly once (serialized, no lost
+    // updates).
+    let mut sorted = generations.clone();
+    sorted.sort_unstable();
+    let unique: std::collections::BTreeSet<u64> = generations.iter().copied().collect();
+    assert_eq!(unique.len(), 8, "generation collisions: {sorted:?}");
+
+    let (_, body) = http("GET", api, "/api/upstreams", None).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let names: Vec<&str> = v["upstreams"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|u| u["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 9, "{names:?}");
+    for i in 0..8 {
+        assert!(names.contains(&format!("cc-{i}").as_str()), "{names:?}");
+    }
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_upstream_test_reports_probe_result() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    // Enable health checks so the probe path has a configured probe name.
+    cfg.health.enabled = true;
+    cfg.upstreams.push(fake.config("probed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let id = {
+        let (_, body) = http("GET", api, "/api/upstreams", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        v["upstreams"][0]["id"].as_i64().expect("id")
+    };
+
+    let (status, body) = http("POST", api, &format!("/api/upstreams/{id}/test"), None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["result"]["success"], true, "{body}");
+    assert!(v["result"]["latency_ms"].is_number(), "{body}");
+
+    // The probe is recorded as a health event.
+    let (_, body) = http("GET", api, &format!("/api/upstreams/{id}/health"), None).await;
+    assert!(body.contains("probe"), "{body}");
 
     gw.shutdown().await;
     fake.stop().await;

@@ -61,18 +61,34 @@ Docker stack — DNS `:53` (UDP+TCP), dashboard/API `:8080`,
 Prometheus `:9090` (localhost-only), Grafana `:3000` (auth required):
 
 ```console
+$ docker compose up -d --build
+$ dig @127.0.0.1 -p 53 example.com
+$ open http://localhost:8080/        # log in as admin (password below)
+```
+
+No credentials are hardcoded anywhere, and none are required to start: on a
+first run with no password configured, the gateway and Grafana each
+**generate a one-time random password and print it to their logs**:
+
+```console
+$ docker logs res-res-1     | grep 'generated one-time admin password'   # control plane (:8080)
+$ docker logs res-grafana-1 | grep 'generated one-time admin password'   # Grafana   (:3000)
+```
+
+The gateway persists only argon2 hashes in `config/res.credentials`
+(mode `0600`, gitignored), so that generated password keeps working across
+restarts and `down --volumes`; Grafana keeps it in its database. For real
+deployments choose your own instead (they always win, on every start) and
+keep them in an environment file outside the repo, e.g.
+`--env-file /etc/res/stack.env` (mode `0600`):
+
+```console
 $ RES_ADMIN_PASSWORD=<new-password> \
   GRAFANA_ADMIN_PASSWORD=<new-password> \
   docker compose up -d --build
-$ dig @127.0.0.1 -p 53 example.com
-$ open http://localhost:8080/        # log in as admin / RES_ADMIN_PASSWORD
 ```
 
-No credentials are hardcoded anywhere: the stack refuses to start until
-`RES_ADMIN_PASSWORD` and `GRAFANA_ADMIN_PASSWORD` are set (optionally
-`RES_VIEWER_PASSWORD` for a read-only dashboard login). Keep them in an
-environment file outside the repo, e.g.
-`--env-file /etc/res/stack.env` (mode `0600`).
+Optionally set `RES_VIEWER_PASSWORD` for a read-only dashboard login.
 
 If the host already owns port 53 (systemd-resolved, another resolver),
 do not edit the compose file — override the published port:
@@ -197,9 +213,10 @@ Safety properties:
   outcome.
 
 Prometheus scrapes `res:8080/metrics` every 5 s (`deploy/prometheus.yml`,
-15 days / 2 GB retention). Grafana (`:3000`) requires
-`admin / GRAFANA_ADMIN_PASSWORD`; anonymous access and sign-ups are
-disabled. Six dashboards are provisioned in folder `res` from
+15 days / 2 GB retention). Grafana (`:3000`) requires `admin` and
+`GRAFANA_ADMIN_PASSWORD` (or the one-time password printed to its log on
+first run); anonymous access and sign-ups are disabled. Six dashboards are
+provisioned in folder `res` from
 `deploy/grafana/dashboards/` every 30 s; regenerate the JSON with:
 
 ```console

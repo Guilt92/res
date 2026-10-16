@@ -39,6 +39,8 @@ COPY --from=builder /build/target/release/res /usr/local/bin/res
 COPY --from=builder /build/target/release/res-loadtest /usr/local/bin/res-loadtest
 COPY config/res.toml /etc/res/res.toml
 COPY dashboard /app/dashboard
+COPY docker/entrypoint.sh /usr/local/bin/res-entrypoint
+RUN chmod +x /usr/local/bin/res-entrypoint
 
 WORKDIR /app
 # Runs as root: binding :53 needs CAP_NET_BIND_SERVICE (or root), and the
@@ -51,5 +53,7 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD ["res", "--config", "/etc/res/res.toml", "probe", \
        "--server", "127.0.0.1:53", "--timeout-ms", "2000"]
 
-ENTRYPOINT ["res"]
+# Bootstrap: if no password env is set and no persisted credentials file
+# exists yet, generate a one-time admin password and print it (docker logs).
+ENTRYPOINT ["/usr/local/bin/res-entrypoint"]
 CMD ["--config", "/etc/res/res.toml", "serve"]

@@ -29,22 +29,41 @@ const HEALTH_LATENCY_WINDOW: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
-    Up,
+    Healthy,
     Degraded,
-    Down,
+    /// Was failing, is answering again, but has not yet met the recovery
+    /// threshold — usable, but scored below a fully healthy upstream.
+    Recovering,
+    Unhealthy,
 }
 
 impl HealthStatus {
     pub fn is_usable(self) -> bool {
-        matches!(self, HealthStatus::Up | HealthStatus::Degraded)
+        matches!(
+            self,
+            HealthStatus::Healthy | HealthStatus::Degraded | HealthStatus::Recovering
+        )
+    }
+
+    /// Severity rank used by anti-flap: higher = worse. Order matches the
+    /// health factor used in scoring: Healthy (0) < Recovering (1)
+    /// < Degraded (2) < Unhealthy (3).
+    pub fn badness(self) -> u8 {
+        match self {
+            HealthStatus::Healthy => 0,
+            HealthStatus::Recovering => 1,
+            HealthStatus::Degraded => 2,
+            HealthStatus::Unhealthy => 3,
+        }
     }
 
     /// Numeric encoding for Prometheus (`res_upstream_state`).
     pub fn state_value(self) -> i64 {
         match self {
-            HealthStatus::Down => 0,
+            HealthStatus::Unhealthy => 0,
             HealthStatus::Degraded => 1,
-            HealthStatus::Up => 2,
+            HealthStatus::Healthy => 2,
+            HealthStatus::Recovering => 3,
         }
     }
 }
@@ -101,12 +120,10 @@ impl OutcomeWindow {
 
     /// Laplace-smoothed success rate used by the selector: an upstream with a
     /// short history is not immediately trusted, and a single late failure in
-    /// a long clean history does not dominate.
+    /// a long clean history does not dominate. With no samples yet this is
+    /// the Laplace prior `(0+1)/(0+2) = 0.5`, never a fabricated 1.0.
     fn smoothed_reliability(&self) -> f64 {
         let n = self.samples.len() as f64;
-        if n == 0.0 {
-            return 1.0;
-        }
         let ok = self.samples.iter().filter(|k| k.is_success()).count() as f64;
         (ok + 1.0) / (n + 2.0)
     }
@@ -130,6 +147,12 @@ struct Inner {
     last_success: Option<Instant>,
     last_failure: Option<Instant>,
     state_changed: Option<Instant>,
+    /// When the most recent *worsening* transition was applied. The anti-flap
+    /// dwell window only opens on a worsening transition: improvements that
+    /// arrive while it is open are held (bounce-back damping), while
+    /// worsening transitions are always applied immediately so a failing
+    /// upstream is never reported healthy-looking for longer than one probe.
+    last_worsened: Option<Instant>,
     last_error: Option<String>,
     // Lifetime counters (monotonic, exported as metrics / stats).
     queries: u64,
@@ -157,13 +180,14 @@ struct Inner {
 impl Inner {
     fn new() -> Self {
         Self {
-            status: HealthStatus::Up,
+            status: HealthStatus::Healthy,
             consec_failures: 0,
             consec_successes: 0,
             last_check: None,
             last_success: None,
             last_failure: None,
             state_changed: None,
+            last_worsened: None,
             last_error: None,
             queries: 0,
             ok: 0,
@@ -203,6 +227,10 @@ pub struct ViewInputs {
     pub p95_ms: f64,
     pub avg_ms: f64,
     pub has_latency: bool,
+    /// Probe success rate over completed health rounds: `(rounds - failures)
+    /// / rounds`, or `None` when fewer than `min_probe_samples` rounds have
+    /// completed (callers substitute a neutral 1.0).
+    pub probe_success: Option<f64>,
 }
 
 /// Shared, mutable runtime state of a single upstream.
@@ -247,6 +275,11 @@ impl UpstreamRuntime {
 
     pub fn health_status(&self) -> HealthStatus {
         self.lock_inner().status
+    }
+
+    /// Timestamp of the last health-check round for this upstream.
+    pub fn last_health_check(&self) -> Option<Instant> {
+        self.lock_inner().last_check
     }
 
     /// Record that a failed attempt on this upstream triggered a retry on
@@ -297,12 +330,26 @@ impl UpstreamRuntime {
 
     /// Record one health-check round. Returns a transition when the state
     /// machine changed state.
+    ///
+    /// Anti-flap semantics (asymmetric on purpose):
+    ///
+    /// * **Worsening transitions always apply immediately.** A failing
+    ///   upstream must be reported as degraded/unhealthy without delay —
+    ///   holding a failure back is how an emergency goes unnoticed.
+    /// * **Improvements are held while the dwell window is open.** The
+    ///   window opens on each worsening transition; an improvement arriving
+    ///   inside it is suppressed (probes, metrics and consecutive counters
+    ///   still advance), so a single lucky probe cannot bounce an upstream
+    ///   straight back to healthy.
+    ///
+    /// `dwell == 0` disables the cooldown entirely.
     pub fn record_health_round(
         &self,
         ok: bool,
         latency: Option<Duration>,
         error: Option<String>,
         thresholds: &health::Hysteresis,
+        dwell: Duration,
     ) -> Option<HealthTransition> {
         let mut inner = self.lock_inner();
         inner.health_rounds += 1;
@@ -313,7 +360,9 @@ impl UpstreamRuntime {
         }
         if ok {
             inner.last_success = Some(Instant::now());
-            inner.last_error = None;
+            if error.is_none() {
+                inner.last_error = None;
+            }
         } else {
             inner.health_failures += 1;
             inner.last_failure = Some(Instant::now());
@@ -329,25 +378,61 @@ impl UpstreamRuntime {
             ok,
             thresholds,
         );
-        inner.status = step.status;
-        inner.consec_failures = step.consec_failures;
-        inner.consec_successes = step.consec_successes;
         if from != step.status {
+            let worsening = step.status.badness() > from.badness();
+            let held_back = !worsening
+                && inner
+                    .last_worsened
+                    .is_some_and(|w| dwell > Duration::ZERO && w.elapsed() < dwell);
+            if held_back {
+                inner.consec_failures = step.consec_failures;
+                inner.consec_successes = step.consec_successes;
+                tracing::debug!(
+                    event = "health_improvement_held",
+                    from = ?from,
+                    wanted = ?step.status,
+                    since_ms = inner
+                        .last_worsened
+                        .map(|w| w.elapsed().as_millis() as u64)
+                        .unwrap_or(0),
+                    dwell_ms = dwell.as_millis() as u64,
+                );
+                return None;
+            }
             inner.state_changed = Some(Instant::now());
+            if worsening {
+                inner.last_worsened = Some(Instant::now());
+            }
+            inner.status = step.status;
+            inner.consec_failures = step.consec_failures;
+            inner.consec_successes = step.consec_successes;
             Some(HealthTransition {
                 from,
                 to: step.status,
             })
         } else {
+            // No transition: still advance the consecutive counters so the
+            // hysteresis keeps working after a held-back improvement window.
+            inner.consec_failures = step.consec_failures;
+            inner.consec_successes = step.consec_successes;
             None
         }
     }
 
     /// Lightweight, allocation-free inputs for the selector hot path.
-    pub fn view_inputs(&self) -> ViewInputs {
+    pub fn view_inputs(&self, min_probe_samples: u32) -> ViewInputs {
         let cfg = self.config();
         let inner = self.lock_inner();
         let fwd = inner.forward_latency.stats();
+        let probe_success =
+            if inner.health_rounds >= u64::from(min_probe_samples) && min_probe_samples > 0 {
+                Some(
+                    (inner.health_rounds - inner.health_failures.min(inner.health_rounds)) as f64
+                        / inner.health_rounds as f64,
+                )
+            } else {
+                None
+            };
         ViewInputs {
             status: inner.status,
             priority: cfg.priority,
@@ -356,6 +441,7 @@ impl UpstreamRuntime {
             p95_ms: fwd.p95_ms,
             avg_ms: fwd.avg_ms,
             has_latency: fwd.count > 0,
+            probe_success,
         }
     }
 
@@ -379,12 +465,45 @@ impl UpstreamRuntime {
         inner.prev_sample = Some(now);
     }
 
-    /// Snapshot for the API / dashboard.
+    /// Snapshot for the API / dashboard (score uses the default 50 ms
+    /// latency reference and the default min-probe-sample gate; callers with
+    /// a configured reference should use [`stats_with_latency_ref`]).
     pub fn stats(&self) -> UpstreamStats {
+        self.stats_with_latency_ref(50.0, 3)
+    }
+
+    /// Snapshot with the score computed against the caller's configured
+    /// `selection.latency_reference_ms` and `selection.min_probe_samples`.
+    pub fn stats_with_latency_ref(
+        &self,
+        latency_reference_ms: f64,
+        min_probe_samples: u32,
+    ) -> UpstreamStats {
         let cfg = self.config();
         let inner = self.lock_inner();
         let fwd = inner.forward_latency.stats();
         let hea = inner.health_latency.stats();
+        let health_factor = match inner.status {
+            HealthStatus::Healthy => 1.0,
+            HealthStatus::Recovering => 0.7,
+            HealthStatus::Degraded => 0.4,
+            HealthStatus::Unhealthy => 0.0,
+        };
+        let reliability = inner.outcomes.smoothed_reliability();
+        let latency = if fwd.count > 0 {
+            fwd.p95_ms.max(fwd.avg_ms)
+        } else {
+            latency_reference_ms
+        };
+        let latency_factor = latency_reference_ms / (latency_reference_ms + latency);
+        let probe_factor =
+            if inner.health_rounds >= u64::from(min_probe_samples) && min_probe_samples > 0 {
+                (inner.health_rounds - inner.health_failures.min(inner.health_rounds)) as f64
+                    / inner.health_rounds as f64
+            } else {
+                1.0
+            };
+        let score = health_factor * reliability * latency_factor * probe_factor * cfg.weight as f64;
         UpstreamStats {
             id: cfg.id,
             name: cfg.name.clone(),
@@ -395,6 +514,10 @@ impl UpstreamRuntime {
             priority: cfg.priority,
             weight: cfg.weight,
             timeout_ms: cfg.timeout_ms,
+            probe_interval_ms: cfg.probe_interval_ms,
+            probe_timeout_ms: cfg.probe_timeout_ms,
+            expect_rcode: cfg.expect_rcode.clone(),
+            probes: cfg.probes.clone(),
             health: inner.status,
             latency: LatencySnapshot::from(fwd),
             health_latency: if hea.count > 0 {
@@ -431,6 +554,14 @@ impl UpstreamRuntime {
             last_failure_ago_secs: ago_secs(inner.last_failure),
             last_state_change_ago_secs: ago_secs(inner.state_changed),
             last_error: inner.last_error.clone(),
+            score: ScoreBreakdown {
+                health_factor,
+                reliability: round3(reliability),
+                latency_factor: round3(latency_factor),
+                probe_factor: round3(probe_factor),
+                weight: cfg.weight,
+                score: round3(score),
+            },
         }
     }
 }
@@ -523,6 +654,38 @@ pub struct UpstreamStats {
     pub last_failure_ago_secs: Option<u64>,
     pub last_state_change_ago_secs: Option<u64>,
     pub last_error: Option<String>,
+    /// Per-upstream probe interval override (`null` = inherit global).
+    pub probe_interval_ms: Option<u64>,
+    /// Per-upstream probe timeout override (`null` = inherit global).
+    pub probe_timeout_ms: Option<u64>,
+    /// Per-upstream expected rcode for health probes (`null` = any rcode).
+    /// Exposed so the dashboard edit form can show and change it.
+    pub expect_rcode: Option<String>,
+    /// Per-upstream probe list override (`null` = inherit `[health].probes`).
+    pub probes: Option<Vec<crate::config::HealthProbe>>,
+    /// Score-breakdown factors for the selection algorithm (see
+    /// `selection.rs`). `score` is the composite; the components explain
+    /// why an upstream wins or loses.
+    pub score: ScoreBreakdown,
+}
+
+/// Component factors of the selection score for one upstream.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ScoreBreakdown {
+    /// Health multiplier: 1.0 healthy, 0.7 recovering, 0.4 degraded, 0.0
+    /// unhealthy.
+    pub health_factor: f64,
+    /// Laplace-smoothed reliability over the rolling outcome window
+    /// (`(successes+1)/(samples+2)`; 0.5 with no samples yet).
+    pub reliability: f64,
+    /// Latency factor: `ref / (ref + max(p95, avg))`, or 0.5 with no data.
+    pub latency_factor: f64,
+    /// Probe success rate over completed health rounds; 1.0 (neutral) until
+    /// `selection.min_probe_samples` rounds have completed.
+    pub probe_factor: f64,
+    pub weight: u32,
+    /// Composite score (health * reliability * latency * probe * weight).
+    pub score: f64,
 }
 
 /// Map an upstream response code to an outcome classification.
@@ -691,7 +854,13 @@ mod tests {
             failure_threshold: 3,
             recovery_threshold: 3,
         };
-        rt.record_health_round(true, Some(Duration::from_millis(2)), None, &hyst);
+        rt.record_health_round(
+            true,
+            Some(Duration::from_millis(2)),
+            None,
+            &hyst,
+            Duration::ZERO,
+        );
         let s = rt.stats();
         assert_eq!(s.success_rate, None);
         assert_eq!(s.latency.p50_ms, None);
@@ -702,5 +871,51 @@ mod tests {
     fn health_status_serializes_lowercase() {
         let json = serde_json::to_string(&HealthStatus::Degraded).unwrap();
         assert_eq!(json, "\"degraded\"");
+    }
+
+    #[test]
+    fn anti_flap_holds_improvements_but_never_delays_failures() {
+        let rt = UpstreamRuntime::new(cfg(1, "a"));
+        let hyst = health::Hysteresis {
+            failure_threshold: 1,
+            recovery_threshold: 1,
+        };
+        let dwell = Duration::from_secs(60);
+
+        // Healthy → Degraded: worsening, applies and opens the dwell window.
+        let t = rt.record_health_round(false, None, None, &hyst, dwell);
+        assert_eq!(t.map(|t| t.to), Some(HealthStatus::Degraded));
+        // Degraded → Unhealthy: still worsening — must NOT be delayed by the
+        // window (holding back a failure is how outages go unnoticed).
+        let t = rt.record_health_round(false, None, None, &hyst, dwell);
+        assert_eq!(
+            t.map(|t| t.to),
+            Some(HealthStatus::Unhealthy),
+            "worsening transitions always apply immediately"
+        );
+        assert_eq!(rt.health_status(), HealthStatus::Unhealthy);
+
+        // One lucky probe wants Unhealthy → Healthy inside the window: held.
+        let t = rt.record_health_round(true, None, None, &hyst, dwell);
+        assert!(t.is_none(), "improvement inside dwell must be held");
+        assert_eq!(rt.health_status(), HealthStatus::Unhealthy);
+        // The probe round still counted (honest metrics while held).
+        let s = rt.stats();
+        assert_eq!(s.success_rate, None); // forward-path samples only
+        assert!(s.health_latency.is_none());
+
+        // Zero dwell: no hold.
+        let rt2 = UpstreamRuntime::new(cfg(2, "b"));
+        let t = rt2.record_health_round(false, None, None, &hyst, Duration::ZERO);
+        assert_eq!(t.map(|t| t.to), Some(HealthStatus::Degraded));
+        let t = rt2.record_health_round(false, None, None, &hyst, Duration::ZERO);
+        assert_eq!(t.map(|t| t.to), Some(HealthStatus::Unhealthy));
+        let t = rt2.record_health_round(true, None, None, &hyst, Duration::ZERO);
+        assert_eq!(
+            t.map(|t| t.to),
+            Some(HealthStatus::Healthy),
+            "dwell=0 must not hold improvements"
+        );
+        assert_eq!(rt2.health_status(), HealthStatus::Healthy);
     }
 }

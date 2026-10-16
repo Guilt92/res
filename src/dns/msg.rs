@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 
 /// Gateway-level response code classification (bounded label set).
@@ -141,12 +141,21 @@ pub fn parse_query(bytes: &[u8]) -> Result<ParsedQuery, QueryReject> {
 }
 
 /// Build a local gateway response for a rejected/failed query. The question
-/// section is echoed, as most resolvers expect.
+/// section is echoed, as most resolvers expect. When the client advertised
+/// EDNS(0), the response carries an OPT record too (RFC 6891 §6.1.1: a
+/// response to an EDNS query without OPT is indistinguishable from a server
+/// that does not support EDNS at all).
 pub fn error_response(req: &ParsedQuery, rcode: Rcode) -> Vec<u8> {
     let mut msg = Message::error_msg(req.id, req.op_code, rcode.to_response_code());
     msg.metadata.recursion_desired = req.recursion_desired;
     msg.metadata.recursion_available = true;
     msg.queries = req.queries.clone();
+    if req.has_edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(req.edns_payload.unwrap_or(512).max(512));
+        edns.set_dnssec_ok(req.dnssec_ok);
+        msg.edns = Some(edns);
+    }
     msg.to_vec().unwrap_or_default()
 }
 
@@ -314,6 +323,21 @@ pub fn parse_record_type(s: &str) -> Result<RecordType, String> {
     }
 }
 
+/// Parse a textual rcode (`NOERROR`, `NXDOMAIN`, `SERVFAIL`, ...). Case
+/// insensitive. Returns `None` for unknown names (including `OTHER`, which
+/// is a gateway-internal bucket, not a wire rcode).
+pub fn parse_rcode(s: &str) -> Option<Rcode> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "NOERROR" => Some(Rcode::NoError),
+        "FORMERR" => Some(Rcode::FormErr),
+        "SERVFAIL" => Some(Rcode::ServFail),
+        "NXDOMAIN" => Some(Rcode::NXDomain),
+        "NOTIMP" => Some(Rcode::NotImp),
+        "REFUSED" => Some(Rcode::Refused),
+        _ => None,
+    }
+}
+
 /// Question key used by the cache (lowercased name, type, class, CD bit).
 pub fn question_key(q: &Query, checking_disabled: bool) -> crate::cache::CacheKey {
     crate::cache::CacheKey {
@@ -366,7 +390,19 @@ pub fn cacheable_ttl(resp_bytes: &[u8], min_ttl: u64, max_ttl: u64) -> Option<u6
     if msg.answers.is_empty() {
         return None;
     }
-    let min = msg.answers.iter().map(|r| r.ttl).min()? as u64;
+    // RFC 2181 §5.2: TTLs of *every* section bound the cache lifetime —
+    // a long-lived answer paired with a short-lived authority/additional
+    // record must not be served beyond the shortest of them. The OPT
+    // pseudo-record is excluded (its TTL field carries EDNS flags, and
+    // hickory may already have lifted it out of `additionals`).
+    let min = msg
+        .answers
+        .iter()
+        .chain(msg.authorities.iter())
+        .chain(msg.additionals.iter())
+        .filter(|r| r.record_type() != RecordType::OPT)
+        .map(|r| u64::from(r.ttl))
+        .min()?;
     if min < min_ttl {
         return None; // below the operator's cacheability threshold
     }
@@ -383,11 +419,26 @@ pub fn negative_ttl(resp_bytes: &[u8], negative_max_ttl: u64) -> Option<u64> {
         return None;
     }
     match msg.metadata.response_code {
-        ResponseCode::NoError | ResponseCode::NXDomain => {}
+        ResponseCode::NoError => {
+            if !msg.answers.is_empty() {
+                return None; // positive answers are handled by cacheable_ttl
+            }
+        }
+        ResponseCode::NXDomain => {
+            // NXDOMAIN may legally arrive with a CNAME chain in the answer
+            // section (RFC 2308 §2.1: referral-by-CNAME with no target data
+            // below the alias) — those answers carry no data for the qname
+            // and must still be negatively cached. Any real data record means
+            // this is not a negative response.
+            if msg
+                .answers
+                .iter()
+                .any(|r| r.record_type() != RecordType::CNAME)
+            {
+                return None;
+            }
+        }
         _ => return None, // SERVFAIL / REFUSED / ... are never cached
-    }
-    if !msg.answers.is_empty() {
-        return None; // positive answers are handled by cacheable_ttl
     }
     if msg.queries.len() != 1 {
         return None;
@@ -467,6 +518,197 @@ pub fn set_transaction_id(bytes: &mut [u8], id: u16) {
     if bytes.len() >= 2 {
         bytes[0] = (id >> 8) as u8;
         bytes[1] = id as u8;
+    }
+}
+
+/// Byte span `[start, end)` of the first question section in `bytes`
+/// (offset 12 through type+class), or `None` when the layout is unusable.
+fn question_span(bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < 12 || u16::from_be_bytes([bytes[4], bytes[5]]) != 1 {
+        return None;
+    }
+    let end = skip_name(bytes, 12)?.checked_add(4)?;
+    (end <= bytes.len()).then_some((12, end))
+}
+
+/// Byte spans of every OPT pseudo-record (type 41) in the message, in wire
+/// order. Walks all three RR sections so a misplaced OPT is found (and can be
+/// stripped) too. Returns `None` on a malformed layout.
+fn find_opt_spans(bytes: &[u8]) -> Option<Vec<(usize, usize)>> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let rr_total = u16::from_be_bytes([bytes[6], bytes[7]]) as usize
+        + u16::from_be_bytes([bytes[8], bytes[9]]) as usize
+        + u16::from_be_bytes([bytes[10], bytes[11]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..qd {
+        pos = skip_name(bytes, pos)?;
+        pos = pos.checked_add(4)?;
+    }
+    let mut spans = Vec::new();
+    for _ in 0..rr_total {
+        let start = pos;
+        pos = skip_name(bytes, pos)?;
+        if pos.checked_add(10)? > bytes.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+        let rdlen = u16::from_be_bytes([bytes[pos + 8], bytes[pos + 9]]) as usize;
+        pos = pos.checked_add(10 + rdlen)?;
+        if pos > bytes.len() {
+            return None;
+        }
+        if rtype == 41 {
+            spans.push((start, pos));
+        }
+    }
+    Some(spans)
+}
+
+/// Adjust the header's ARCOUNT (additional-integer overflow is impossible
+/// for a well-formed message but checked anyway).
+fn bump_arcount(bytes: &mut [u8], delta: i32) -> Option<()> {
+    let cur = u16::from_be_bytes([bytes[10], bytes[11]]);
+    let next = i32::from(cur) + delta;
+    if !(0..=u16::MAX as i32).contains(&next) {
+        return None;
+    }
+    let next = next as u16;
+    bytes[10] = (next >> 8) as u8;
+    bytes[11] = next as u8;
+    Some(())
+}
+
+/// Align a proxied/cached/follower response to the *current* query before it
+/// goes on the wire:
+///
+/// * transaction id — follower/cached bytes may carry another client's id;
+/// * RD and CD header flags — echo this client's intent, not the leader's;
+/// * the question section's exact bytes — 0x20 randomisation means a cached
+///   answer stored under one qname casing must not be served to a query
+///   sent with a different casing (RFC 7816);
+/// * the OPT pseudo-record — present exactly once iff *this* client sent
+///   one, advertising *this* client's payload size and DO bit (RFC 6891);
+///   a non-EDNS client never receives an OPT, and duplicates are dropped
+///   (a message with >1 OPT is malformed).
+///
+/// Returns `false` when the packet cannot be aligned (malformed response);
+/// callers must discard it instead of sending it.
+pub fn align_response_to_query(resp: &mut Vec<u8>, query: &ParsedQuery, query_raw: &[u8]) -> bool {
+    if resp.len() < 12 || query_raw.len() < 12 {
+        return false;
+    }
+    set_transaction_id(resp, query.id);
+    let mut flags = u16::from_be_bytes([resp[2], resp[3]]);
+    flags = if query.recursion_desired {
+        flags | 0x0100
+    } else {
+        flags & !0x0100
+    };
+    flags = if query.checking_disabled {
+        flags | 0x0010
+    } else {
+        flags & !0x0010
+    };
+    resp[2] = (flags >> 8) as u8;
+    resp[3] = flags as u8;
+
+    // Question bytes: mirror the query's casing when the wire spans match
+    // (the common uncompressed case). When they cannot be spliced — e.g. the
+    // response compressed its question, which points into later sections —
+    // rebuild the message with the query's question via hickory instead.
+    let r_span = question_span(resp);
+    let q_span = question_span(query_raw);
+    match (r_span, q_span) {
+        (Some((rs, re)), Some((qs, qe))) if (re - rs) == (qe - qs) => {
+            resp[rs..re].copy_from_slice(&query_raw[qs..qe]);
+        }
+        _ => {
+            let mut rebuilt = match Message::from_vec(resp) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            rebuilt.metadata.id = query.id;
+            rebuilt.metadata.recursion_desired = query.recursion_desired;
+            rebuilt.metadata.checking_disabled = query.checking_disabled;
+            rebuilt.queries = query.queries.clone();
+            match rebuilt.to_vec() {
+                Ok(v) => *resp = v,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    align_opt(resp, query)
+}
+
+/// Strip/patch/append the OPT record so the response matches `query`'s EDNS
+/// advertisement exactly. Returns `false` only when the record layout cannot
+/// be safely rewritten.
+fn align_opt(resp: &mut Vec<u8>, query: &ParsedQuery) -> bool {
+    let spans = match find_opt_spans(resp) {
+        Some(s) => s,
+        None => return false,
+    };
+    if query.has_edns {
+        if spans.is_empty() {
+            // No OPT from upstream: add one advertising *this* client's size.
+            let payload = query.edns_payload.unwrap_or(512).max(512);
+            let flags: u16 = if query.dnssec_ok { 0x8000 } else { 0 };
+            resp.extend_from_slice(&[
+                0x00, // root name
+                0x00,
+                0x29, // type 41 (OPT)
+                (payload >> 8) as u8,
+                payload as u8, // class = UDP payload size
+                0x00,
+                0x00, // extended rcode + version
+                (flags >> 8) as u8,
+                flags as u8, // flags (DO)
+                0x00,
+                0x00, // rdlength
+            ]);
+            return bump_arcount(resp, 1).is_some();
+        }
+        // Keep the first OPT, drop duplicates (RFC 6891 §6.1.1: at most one
+        // OPT per message).
+        if spans.len() > 1 {
+            for (start, end) in spans.iter().skip(1).rev() {
+                resp.drain(*start..*end);
+                if bump_arcount(resp, -1).is_none() {
+                    return false;
+                }
+            }
+        }
+        // Patch payload size (class) and flags (TTL low 16: DO bit) to this
+        // client's values; extended-rcode/version bytes are preserved.
+        let start = spans[0].0;
+        let rtype_pos = match skip_name(resp, start) {
+            Some(p) if p + 10 <= resp.len() => p,
+            _ => return false,
+        };
+        let payload = query.edns_payload.unwrap_or(512).max(512);
+        resp[rtype_pos + 2] = (payload >> 8) as u8;
+        resp[rtype_pos + 3] = payload as u8;
+        let flags: u16 = if query.dnssec_ok { 0x8000 } else { 0 };
+        resp[rtype_pos + 6] = (flags >> 8) as u8;
+        resp[rtype_pos + 7] = flags as u8;
+        true
+    } else {
+        // Non-EDNS client: never serve an OPT (it would leak the EDNS
+        // advertisement of whichever client populated the cache).
+        if spans.is_empty() {
+            return true;
+        }
+        for (start, end) in spans.iter().rev() {
+            resp.drain(*start..*end);
+            if bump_arcount(resp, -1).is_none() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -723,5 +965,227 @@ mod tests {
         let mut bytes = sample_query();
         set_transaction_id(&mut bytes, 0xABCD);
         assert_eq!(u16::from_be_bytes([bytes[0], bytes[1]]), 0xABCD);
+    }
+
+    #[test]
+    fn parse_rcode_names() {
+        assert_eq!(parse_rcode("NOERROR"), Some(Rcode::NoError));
+        assert_eq!(parse_rcode("nxdomain"), Some(Rcode::NXDomain));
+        assert_eq!(parse_rcode(" SERVFAIL "), Some(Rcode::ServFail));
+        assert_eq!(parse_rcode("REFUSED"), Some(Rcode::Refused));
+        assert_eq!(parse_rcode("FORMERR"), Some(Rcode::FormErr));
+        assert_eq!(parse_rcode("NOTIMP"), Some(Rcode::NotImp));
+        assert_eq!(
+            parse_rcode("OTHER"),
+            None,
+            "internal bucket, not a wire rcode"
+        );
+        assert_eq!(parse_rcode("BOGUS"), None);
+        assert_eq!(parse_rcode(""), None);
+    }
+
+    // ---- EDNS-aware local responses (RFC 6891) ----
+
+    /// Build a raw query whose qname keeps its (0x20-style) mixed case and,
+    /// when `edns` is set, append an OPT record advertising `payload` + DO.
+    fn edns_query(name: &str, edns: Option<(u16, bool)>) -> Vec<u8> {
+        let mut raw = build_query(name, "A").unwrap();
+        if let Some((payload, do_bit)) = edns {
+            let flags: u16 = if do_bit { 0x8000 } else { 0 };
+            raw.extend_from_slice(&[
+                0x00,
+                0x00,
+                0x29,
+                (payload >> 8) as u8,
+                payload as u8,
+                0x00,
+                0x00,
+                (flags >> 8) as u8,
+                flags as u8,
+                0x00,
+                0x00,
+            ]);
+            let ar = u16::from_be_bytes([raw[10], raw[11]]) + 1;
+            raw[10] = (ar >> 8) as u8;
+            raw[11] = ar as u8;
+        }
+        raw
+    }
+
+    fn opt_count(bytes: &[u8]) -> usize {
+        find_opt_spans(bytes).map(|s| s.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn error_response_carries_opt_only_for_edns_queries() {
+        let plain = edns_query("example.com", None);
+        let q_plain = parse_query(&plain).unwrap();
+        let resp = error_response(&q_plain, Rcode::Refused);
+        assert_eq!(opt_count(&resp), 0, "plain query must not get an OPT");
+        assert_eq!(u16::from_be_bytes([resp[10], resp[11]]), 0);
+
+        let with_opt = edns_query("example.com", Some((4096, true)));
+        let q_edns = parse_query(&with_opt).unwrap();
+        let resp = error_response(&q_edns, Rcode::NotImp);
+        assert_eq!(opt_count(&resp), 1, "RFC 6891: EDNS query => EDNS response");
+        let decoded = Message::from_vec(&resp).unwrap();
+        let edns = decoded.edns.expect("OPT present");
+        assert_eq!(edns.max_payload(), 4096);
+        assert!(edns.flags().dnssec_ok, "DO bit mirrors the query");
+    }
+
+    // ---- Response alignment (0x20 question case + per-client OPT) ----
+
+    #[test]
+    fn align_mirrors_question_case_flags_and_adds_opt() {
+        // A response built for the *lowercase* spelling, no EDNS, RD off —
+        // as a cache entry populated by an earlier client might be.
+        let plain_lower = edns_query("example.com", None);
+        let q_lower = parse_query(&plain_lower).unwrap();
+        let mut resp = error_response(&q_lower, Rcode::NoError);
+        // Ensure RD is off in the response for this test.
+        let mut flags = u16::from_be_bytes([resp[2], resp[3]]);
+        flags &= !0x0100;
+        resp[2] = (flags >> 8) as u8;
+        resp[3] = flags as u8;
+
+        // Current client: mixed-case qname, EDNS 4096, DO set, RD set.
+        let raw = edns_query("ExAmPle.CoM", Some((4096, true)));
+        let q = parse_query(&raw).unwrap();
+        assert!(align_response_to_query(&mut resp, &q, &raw));
+
+        // Id + RD.
+        assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), q.id);
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        assert_ne!(flags & 0x0100, 0, "RD must echo the current query");
+        // Question bytes are the query's (mixed case).
+        let (rs, re) = question_span(&resp).expect("resp question");
+        let (qs, qe) = question_span(&raw).expect("query question");
+        assert_eq!(&resp[rs..re], &raw[qs..qe], "0x20 case must be mirrored");
+        // OPT added with *this* client's advertisement.
+        assert_eq!(opt_count(&resp), 1);
+        let decoded = Message::from_vec(&resp).unwrap();
+        let edns = decoded.edns.expect("OPT added");
+        assert_eq!(edns.max_payload(), 4096);
+        assert!(edns.flags().dnssec_ok);
+    }
+
+    #[test]
+    fn align_strips_opt_for_non_edns_clients_and_drops_duplicates() {
+        let with_opt = edns_query("example.com", Some((4096, false)));
+        let q_edns = parse_query(&with_opt).unwrap();
+        // Response with an OPT (from an EDNS-populated cache entry)...
+        let mut resp = error_response(&q_edns, Rcode::NoError);
+        assert_eq!(opt_count(&resp), 1);
+
+        // ...served to a plain-UDP client: OPT must be gone.
+        let plain = edns_query("example.com", None);
+        let q_plain = parse_query(&plain).unwrap();
+        assert!(align_response_to_query(&mut resp, &q_plain, &plain));
+        assert_eq!(opt_count(&resp), 0, "no OPT leak to a non-EDNS client");
+        assert_eq!(
+            u16::from_be_bytes([resp[10], resp[11]]),
+            0,
+            "arcount must follow"
+        );
+
+        // A response carrying *two* OPT records is malformed: alignment keeps
+        // exactly one (append a duplicate by hand).
+        let mut dup = error_response(&q_edns, Rcode::NoError);
+        let ar = u16::from_be_bytes([dup[10], dup[11]]);
+        // Duplicate by re-encoding a second OPT onto the wire: splice a copy
+        // of the existing OPT bytes before the end and bump arcount.
+        let spans = find_opt_spans(&dup).expect("spans");
+        let (s, e) = spans[0];
+        let opt_rr = dup[s..e].to_vec();
+        dup.extend_from_slice(&opt_rr);
+        dup[10] = ((ar + 1) >> 8) as u8;
+        dup[11] = (ar + 1) as u8;
+        assert_eq!(opt_count(&dup), 2);
+        assert!(align_response_to_query(&mut dup, &q_edns, &with_opt));
+        assert_eq!(opt_count(&dup), 1, "duplicates are collapsed");
+        assert_eq!(
+            u16::from_be_bytes([dup[10], dup[11]]),
+            1,
+            "arcount corrected"
+        );
+    }
+
+    #[test]
+    fn align_rejects_garbage() {
+        let raw = edns_query("example.com", None);
+        let q = parse_query(&raw).unwrap();
+        let mut junk = vec![0x00u8; 3];
+        assert!(!align_response_to_query(&mut junk, &q, &raw));
+    }
+
+    // ---- TTL correctness across sections (RFC 2181 / 2308) ----
+
+    #[test]
+    fn cacheable_ttl_bounds_by_shortest_record_in_any_section() {
+        let query = parse_query(&sample_query()).unwrap();
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.queries = query.queries.clone();
+        resp.answers.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("example.com").unwrap(),
+            600,
+            hickory_proto::rr::RData::A("1.2.3.4".parse().unwrap()),
+        ));
+        resp.authorities.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("ns.example.com").unwrap(),
+            60,
+            hickory_proto::rr::RData::NS(hickory_proto::rr::rdata::NS(
+                Name::from_ascii("ns.example.com").unwrap(),
+            )),
+        ));
+        let bytes = resp.to_vec().unwrap();
+
+        // Answer says 600, the authority says 60: cache for 60 (§5.2).
+        assert_eq!(cacheable_ttl(&bytes, 0, 3600), Some(60));
+        // The threshold applies to the bound, not just the answer.
+        assert_eq!(cacheable_ttl(&bytes, 120, 3600), None);
+    }
+
+    #[test]
+    fn negative_ttl_accepts_nxdomain_with_cname_answers_only() {
+        let query = parse_query(&sample_query()).unwrap();
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.queries = query.queries.clone();
+        resp.metadata.response_code = ResponseCode::NXDomain;
+        resp.answers.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("www.example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                Name::from_ascii("alias.example.com").unwrap(),
+            )),
+        ));
+        resp.authorities.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns.example.com").unwrap(),
+                Name::from_ascii("admin.example.com").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                60,
+            )),
+        ));
+        let bytes = resp.to_vec().unwrap();
+        assert_eq!(
+            negative_ttl(&bytes, 300),
+            Some(60),
+            "NXDOMAIN below a CNAME chain is still a negative answer (RFC 2308 §2.1)"
+        );
+
+        // Real data records in the answer section mean it is not negative.
+        resp.answers.clear();
+        resp.answers.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("www.example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::A("1.2.3.4".parse().unwrap()),
+        ));
+        assert_eq!(negative_ttl(&resp.to_vec().unwrap(), 300), None);
     }
 }

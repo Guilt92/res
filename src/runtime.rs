@@ -54,6 +54,17 @@ impl Gateway {
     /// Signal shutdown and wait (bounded) for every task to finish.
     pub async fn shutdown(self) {
         tracing::info!(event = "shutdown_started");
+        // Record a shutdown event on the system ring so an operator can see
+        // *when* the process went down (and that it was a clean shutdown).
+        self.shared.push_system_event(
+            "shutdown",
+            serde_json::json!({
+                "grace_ms": self.shared.app.load().server.shutdown_grace_ms,
+                "uptime_secs": self.shared.uptime().as_secs(),
+            }),
+            None,
+            None,
+        );
         let grace = Duration::from_millis(self.shared.app.load().server.shutdown_grace_ms);
         let deadline = tokio::time::Instant::now() + grace + Duration::from_secs(2);
         let _ = self.shutdown.send(true);
@@ -79,13 +90,53 @@ impl Gateway {
 /// Start the full gateway. Bind errors are fatal; nothing else is: the data
 /// plane runs purely from the validated in-memory configuration.
 pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Result<Gateway> {
+    let auth_cfg = app.auth.clone();
+    let auth = Arc::new(
+        crate::auth::AuthState::load(auth_cfg, config_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("authentication initialization failed: {e}"))?,
+    );
+    start_with_auth(app, config_path, auth).await
+}
+
+/// Start the gateway with an explicit [`AuthState`](crate::auth::AuthState)
+/// (used by integration tests that need password auth without touching the
+/// process environment).
+pub async fn start_with_auth(
+    app: AppConfig,
+    config_path: Option<PathBuf>,
+    auth: Arc<crate::auth::AuthState>,
+) -> anyhow::Result<Gateway> {
     let shared = Shared::new(app)?;
-    if let Some(p) = config_path {
+    if let Some(p) = config_path.clone() {
         let _ = shared.config_path.set(p);
     }
 
+    if !auth.enabled() {
+        tracing::warn!(
+            event = "auth_disabled",
+            note = "no password configured (RES_ADMIN_PASSWORD / credentials file); \
+                    the control plane relies on server.api_token or is open"
+        );
+    } else if !auth.secure_cookies() {
+        let api_ip = shared.app.load().server.api_addr.ip();
+        if !api_ip.is_loopback() {
+            tracing::warn!(
+                event = "insecure_cookies",
+                note = "password auth is enabled on a non-loopback address but \
+                        [auth].secure_cookies is false; session cookies are not \
+                        marked Secure. Enable secure_cookies when serving the \
+                        management API over HTTPS."
+            );
+        }
+    }
+
+    // Forwarder used by the API's explicit probe endpoint (health checks).
+    // The query path builds its own per-request from the config snapshot
+    // (see `Prepared::tcp_fallback`); probes keep this startup flag, which
+    // matches config-at-probe time closely enough for an operator-triggered
+    // single exchange.
     let forwarder = Forwarder::new(shared.app.load().server.upstream_tcp_fallback);
-    let pipeline = Pipeline::new(Arc::clone(&shared), forwarder);
+    let pipeline = Pipeline::new(Arc::clone(&shared));
 
     // Bind listeners before spawning anything so startup failures are clean.
     let udp_addr = shared.rt.load().udp_addr;
@@ -144,7 +195,7 @@ pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Resu
         tokio::spawn(sampler(Arc::clone(&shared), shutdown_rx.clone())),
     ));
 
-    let router = api::router(Arc::clone(&shared), forwarder);
+    let router = api::router(Arc::clone(&shared), forwarder, auth);
     let api_shutdown = {
         let mut rx = shutdown_rx.clone();
         async move {
@@ -154,9 +205,12 @@ pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Resu
     tasks.push((
         "api_server",
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(api_listener, router)
-                .with_graceful_shutdown(api_shutdown)
-                .await
+            if let Err(e) = axum::serve(
+                api_listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(api_shutdown)
+            .await
             {
                 tracing::error!(event = "api_server_error", error = %e);
             }
@@ -222,9 +276,94 @@ async fn sampler(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
                 shared.traffic.sample_rates();
                 shared.registry.sample_rates();
 
+                // Selection score / rank gauges (same semantics as the API).
+                sample_score_rank(&shared);
+
                 shared.flush_system_events();
                 shared.history.record(&shared.metrics);
             }
         }
+    }
+}
+
+/// Sample per-upstream selection score and rank into Prometheus gauges.
+///
+/// Mirrors the eligibility rules used by `/api/upstreams` and the selector:
+/// disabled upstreams score 0; UNHEALTHY is scored 0 while any HEALTHY/
+/// RECOVERING upstream exists; DEGRADED is scored 0 under
+/// `degraded_policy = last_resort` in the same situation. Rank is assigned
+/// only to eligible upstreams (1 = highest score).
+fn sample_score_rank(shared: &Shared) {
+    let rt = shared.rt.load();
+    let views: Vec<crate::selection::StateView> = shared
+        .registry
+        .snapshot()
+        .iter()
+        .map(|u| crate::selection::StateView::from_runtime(u, rt.selection.min_probe_samples))
+        .collect();
+    let any_up = views.iter().any(|v| {
+        matches!(
+            v.health,
+            crate::upstream::HealthStatus::Healthy | crate::upstream::HealthStatus::Recovering
+        )
+    });
+    let degraded_last_resort =
+        rt.selection.degraded_policy == crate::config::DegradedPolicy::LastResort;
+
+    // Score every upstream; collect eligible ones for ranking.
+    let mut scores: Vec<(i64, String, f64, bool)> = Vec::with_capacity(views.len());
+    let mut eligible: Vec<(i64, f64)> = Vec::new();
+    for v in &views {
+        let up = shared.registry.get(v.id);
+        let name = up
+            .as_ref()
+            .map(|u| u.config().name.clone())
+            .unwrap_or_default();
+        let enabled = up.as_ref().map(|u| u.config().enabled).unwrap_or(false);
+        if !enabled {
+            scores.push((v.id, name, 0.0, false));
+            continue;
+        }
+        let is_eligible = match v.health {
+            crate::upstream::HealthStatus::Healthy | crate::upstream::HealthStatus::Recovering => {
+                true
+            }
+            crate::upstream::HealthStatus::Unhealthy => !any_up,
+            crate::upstream::HealthStatus::Degraded => !(any_up && degraded_last_resort),
+        };
+        let score = if is_eligible {
+            v.score(rt.selection.latency_reference_ms)
+        } else {
+            0.0
+        };
+        if is_eligible {
+            eligible.push((v.id, score));
+        }
+        scores.push((v.id, name, score, is_eligible));
+    }
+
+    // Rank eligible by score desc (ties by id for determinism).
+    eligible.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let ranks: std::collections::HashMap<i64, i64> = eligible
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (*id, i as i64 + 1))
+        .collect();
+
+    let m = &shared.metrics;
+    for (id, name, score, is_eligible) in scores {
+        m.upstream_score
+            .with_label_values(&[&name])
+            .set((score * 1000.0).round() as i64); // milli-units for integer gauge precision
+        let rank = if is_eligible {
+            ranks.get(&id).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        m.upstream_rank.with_label_values(&[&name]).set(rank);
     }
 }

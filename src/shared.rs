@@ -43,6 +43,9 @@ pub struct Shared {
     pub registry: Registry,
     pub metrics: Arc<Metrics>,
     pub cache: DnsCache,
+    /// Cache-miss single-flight registry: concurrent identical misses coalesce
+    /// onto one upstream query (leader/follower), avoiding thundering herds.
+    pub singleflight: Arc<crate::cache::SingleFlight>,
     pub ratelimit: RateLimiter,
     /// Bounded in-memory event rings (config / health / failover / system).
     pub events: Arc<EventLogs>,
@@ -145,6 +148,7 @@ impl Shared {
             registry,
             metrics,
             cache: DnsCache::new(),
+            singleflight: crate::cache::SingleFlight::new(),
             ratelimit: RateLimiter::new(),
             events: Arc::new(EventLogs::new()),
             history: HistoryStore::new(),
@@ -204,6 +208,9 @@ impl Shared {
             next.upstreams.iter().map(|u| u.name.clone()).collect();
         for name in old_names.difference(&new_names) {
             self.metrics.drop_upstream(name);
+            // History keeps per-upstream accumulator/ring keys too — they
+            // must go with the upstream or config churn grows them forever.
+            self.history.remove_upstream(name);
         }
 
         self.registry.reconcile(&next.upstreams);
@@ -218,6 +225,32 @@ impl Shared {
         self.selector.store(Arc::new(SelectorHandle::new(selector)));
         self.rt.store(Arc::new(rt));
         self.app.store(Arc::new(next));
+        // Trim the cache to the new capacity (or clear it when disabled) so a
+        // smaller `max_entries` never leaves an oversized cache resident.
+        let new_rt = self.rt.load();
+        if !new_rt.cache.enabled {
+            self.cache.clear();
+        } else {
+            let removed = self
+                .cache
+                .trim_to(new_rt.cache.max_entries, new_rt.cache.max_memory_bytes);
+            if removed > 0 {
+                self.metrics.cache_evictions_total.inc_by(removed as u64);
+                tracing::info!(
+                    event = "cache_trimmed",
+                    removed,
+                    max_entries = new_rt.cache.max_entries,
+                    max_memory_bytes = new_rt.cache.max_memory_bytes
+                );
+            }
+        }
+        self.metrics
+            .cache_capacity
+            .set(new_rt.cache.max_entries as i64);
+        self.metrics.cache_entries.set(self.cache.len() as i64);
+        self.metrics
+            .cache_memory_bytes
+            .set(self.cache.memory_bytes() as i64);
         self.config_generation.fetch_add(1, Ordering::Release);
         self.metrics.config_reloads_total.inc();
         tracing::info!(event = "configuration_reloaded");

@@ -2,6 +2,13 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# rule_files and scrape_configs only: retention is not a config-file field
+# in Prometheus (it is rejected at startup), so the time/size bounds live in
+# docker-compose.yml as --storage.tsdb.retention.* command flags.
+
+rule_files:
+  - alerts.yml
+
 scrape_configs:
   - job_name: res
     static_configs:

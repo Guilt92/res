@@ -136,6 +136,7 @@ impl FakeUpstream {
             priority: 1,
             weight: 1,
             timeout_ms: None,
+            ..Default::default()
         }
     }
 
@@ -267,6 +268,22 @@ pub async fn start_gateway(cfg: AppConfig) -> Gateway {
         .expect("gateway should start")
 }
 
+/// Start a gateway with password auth enabled (admin + optional viewer).
+pub async fn start_gateway_with_passwords(
+    cfg: AppConfig,
+    admin_password: &str,
+    viewer_password: Option<&str>,
+) -> Gateway {
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        Some(admin_password.to_string()),
+        viewer_password.map(str::to_string),
+    ));
+    res::runtime::start_with_auth(cfg, None, auth)
+        .await
+        .expect("gateway should start")
+}
+
 /// Start a gateway that persists configuration mutations to `path`.
 pub async fn start_gateway_with_path(cfg: AppConfig, path: std::path::PathBuf) -> Gateway {
     res::runtime::start(cfg, Some(path))
@@ -277,6 +294,19 @@ pub async fn start_gateway_with_path(cfg: AppConfig, path: std::path::PathBuf) -
 /// Send one A query over UDP and wait for a response (None on timeout/error).
 pub async fn udp_query(server: SocketAddr, name: &str) -> Option<Message> {
     udp_query_timeout(server, name, Duration::from_secs(3)).await
+}
+
+/// Send a UDP query of the given record type (e.g. "ANY").
+pub async fn udp_query_type(server: SocketAddr, name: &str, qtype: &str) -> Option<Message> {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.ok()?;
+    sock.connect(server).await.ok()?;
+    let query = res::dns::msg::build_query(name, qtype).ok()?;
+    sock.send(&query).await.ok()?;
+    let mut buf = vec![0u8; 65_535];
+    match tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await {
+        Ok(Ok(n)) => Message::from_vec(&buf[..n]).ok(),
+        _ => None,
+    }
 }
 
 pub async fn udp_query_timeout(server: SocketAddr, name: &str, wait: Duration) -> Option<Message> {
@@ -345,10 +375,26 @@ pub async fn http_auth(
     body: Option<&str>,
     token: Option<&str>,
 ) -> (u16, String) {
+    let mut headers = Vec::new();
+    if let Some(t) = token {
+        headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+    }
+    http_headers(method, addr, path, body, &headers).await
+}
+
+/// HTTP request with arbitrary extra headers (Cookie, X-CSRF-Token, ...).
+/// Returns `(status_code, response_body)`.
+pub async fn http_headers(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.expect("api connect");
     let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if let Some(t) = token {
-        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
     }
     if let Some(b) = body {
         req.push_str("Content-Type: application/json\r\n");
@@ -372,4 +418,48 @@ pub async fn http_auth(
         .map(|(_, b)| b.to_string())
         .unwrap_or_default();
     (status, body)
+}
+
+/// Extract a `Set-Cookie` value for `name` from a raw HTTP response string.
+pub fn set_cookie(raw_response: &str, name: &str) -> Option<String> {
+    for line in raw_response.split("\r\n") {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("set-cookie:")
+            && lower.contains(&format!("{}=", name.to_ascii_lowercase()))
+        {
+            let value = line.split_once(':')?.1.trim();
+            // "name=value; Path=/; ..."
+            let cookie_pair = value.split(';').next()?.trim();
+            let (_, v) = cookie_pair.split_once('=')?;
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Raw HTTP request returning the full response text (for Set-Cookie parsing).
+pub async fn http_raw(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &[(String, String)],
+) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("api connect");
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(b) = body {
+        req.push_str("Content-Type: application/json\r\n");
+        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
+    req.push_str("\r\n");
+    if let Some(b) = body {
+        req.push_str(b);
+    }
+    stream.write_all(req.as_bytes()).await.expect("api write");
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.expect("api read");
+    String::from_utf8_lossy(&resp).into_owned()
 }

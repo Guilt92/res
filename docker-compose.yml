@@ -1,11 +1,20 @@
 # res full stack: gateway + Prometheus + Grafana. No database.
 #
-# Start:   docker-compose up -d --build
-# DNS:     dig @127.0.0.1 -p 15353 example.com
-# API:     http://localhost:8080/  (dashboard), /metrics, /api/status,
-#          /api/diagnostics, /api/config (export/import)
-# Metrics: http://localhost:9090/  (Prometheus)
-# Charts:  http://localhost:3000/  (Grafana, admin/admin)
+# Required environment (no credentials are hardcoded; the stack refuses to
+# start without them):
+#   RES_ADMIN_PASSWORD      control-plane login (user "admin") for :8080
+#   RES_VIEWER_PASSWORD     optional read-only login (user "viewer")
+#   GRAFANA_ADMIN_PASSWORD  Grafana admin login for :3000
+#
+# Start:   RES_ADMIN_PASSWORD=... GRAFANA_ADMIN_PASSWORD=... docker compose up -d --build
+# DNS:     dig @127.0.0.1 example.com          (host port 53 -> container 53)
+#          If something on the host already owns :53 (systemd-resolved,
+#          another resolver), override the publish port without editing
+#          this file:  RES_DNS_PUBLISH=5353 docker compose up -d
+#          then:        dig @127.0.0.1 -p 5353 example.com
+# API:     http://localhost:8080/  (dashboard; log in with RES_ADMIN_PASSWORD)
+# Metrics: http://localhost:9090/  (Prometheus; localhost-only in this file)
+# Charts:  http://localhost:3000/  (Grafana; log in as admin / GRAFANA_ADMIN_PASSWORD)
 
 services:
   res:
@@ -23,23 +32,42 @@ services:
       # Dashboard time-series proxy: query Prometheus directly by its
       # in-network DNS name (overrides [monitoring].prometheus_url).
       RES_PROMETHEUS_URL: http://prometheus:9090
+      # Control-plane credentials (hashed with argon2 at startup; never
+      # written to the TOML config). The password file is created next to
+      # the config with mode 0600.
+      RES_ADMIN_PASSWORD: ${RES_ADMIN_PASSWORD:?set RES_ADMIN_PASSWORD}
+      RES_VIEWER_PASSWORD: ${RES_VIEWER_PASSWORD:-}
     volumes:
       # Whole directory (rw): the gateway rewrites the config atomically via
       # temp-file + fsync + rename and keeps a .backup next to it.
       - ./config:/etc/res:rw
       - ./dashboard:/app/dashboard:ro
     ports:
-      - "15353:53/udp"
-      - "15353:53/tcp"
+      # Host publish port is overridable (e.g. systemd-resolved owns :53):
+      #   RES_DNS_PUBLISH=5353 docker compose up -d
+      - "${RES_DNS_PUBLISH:-53}:53/udp"
+      - "${RES_DNS_PUBLISH:-53}:53/tcp"
       - "8080:8080"
     restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:v2.53.2
+    # Retention is set via CLI flags: the config file rejects a top-level
+    # `retention` field (it is not part of Prometheus' YAML schema).
+    # 15 days / 2 GB keeps two weeks of incidents within a bounded store.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--storage.tsdb.retention.size=2GB"
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Persistent metrics store (retention flags above; 15 days / 2 GB).
+      # Named volume survives restarts without polluting the repo tree.
+      - prom-data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     depends_on:
       - res
     restart: unless-stopped
@@ -48,11 +76,12 @@ services:
     image: grafana/grafana:11.1.4
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Required; the stack refuses anonymous access and ships no default password.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "true"
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -61,3 +90,6 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
+
+volumes:
+  prom-data:

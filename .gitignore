@@ -13,6 +13,11 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Runtime artifacts: argon2 credential store (written by the gateway, mode
+# 0600) and regenerable benchmark output. Never commit either.
+config/res.credentials
+bench/results/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

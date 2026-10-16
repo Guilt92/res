@@ -163,6 +163,7 @@ async fn probe(
         priority: 1,
         weight: 1,
         timeout_ms: None,
+        ..Default::default()
     };
     let raw = msg::build_query(&name, &qtype).map_err(|e| anyhow::anyhow!("{e}"))?;
     let parsed = msg::parse_query(&raw).map_err(|e| anyhow::anyhow!("{e:?}"))?;

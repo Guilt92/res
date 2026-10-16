@@ -59,6 +59,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
     let result = (|| -> Result<(), String> {
         let mut f = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        // Owner-only: `res.toml` may embed `api_token`/session secrets and
+        // the credentials file holds password hashes; world-readable config
+        // would leak them to any local user (umask could otherwise leave
+        // the 0666-create default in place).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod {}: {e}", tmp.display()))?;
+        }
         f.write_all(bytes)
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;
         f.sync_all()
@@ -181,5 +191,27 @@ mod tests {
         bad.upstreams[0].priority = 0;
         assert!(save_atomic(&path, &bad).is_err());
         assert!(!path.exists());
+    }
+
+    /// Config may embed `api_token` and password material: neither the
+    /// primary nor the backup copy may be readable by other local users.
+    #[cfg(unix)]
+    #[test]
+    fn saved_files_are_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_file("perm.toml");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+
+        save_atomic(&path, &cfg_with(53)).unwrap();
+        save_atomic(&path, &cfg_with(54)).unwrap(); // second save creates the backup
+
+        for p in [path.clone(), backup_path(&path)] {
+            let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be 0600, got {mode:o}", p.display());
+        }
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
     }
 }

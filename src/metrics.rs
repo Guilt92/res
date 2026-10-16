@@ -47,6 +47,9 @@ pub struct Metrics {
     // Wire-level counters (packets and payload bytes actually seen).
     pub udp_packets_received_total: IntCounter,
     pub udp_packets_sent_total: IntCounter,
+    /// `send_to` failures toward clients (destination unreachable, etc.) —
+    /// responses we intended to send but never left the socket.
+    pub udp_send_errors_total: IntCounter,
     pub request_bytes_total: IntCounter,
     pub response_bytes_total: IntCounter,
     /// Packets larger than `server.max_udp_packet_size` (dropped before parse).
@@ -74,6 +77,18 @@ pub struct Metrics {
     pub healthcheck_last_success_timestamp_seconds: IntGaugeVec,
     /// Health-state transitions per upstream (up/degraded/down changes).
     pub upstream_state_changes_total: IntCounterVec,
+    /// Current composite selection score per upstream (sampled by the
+    /// runtime sampler; 0 for disabled upstreams).
+    pub upstream_score: IntGaugeVec,
+    /// Current selection rank per upstream (1 = best score among eligible;
+    /// 0 for ineligible/disabled). Sampled by the runtime sampler.
+    pub upstream_rank: IntGaugeVec,
+    /// Failover events by the reason the previous attempt gave up
+    /// (`timeout`, `network`, `servfail`, `invalid`, `deadline`, `refused`).
+    pub failover_reason_total: IntCounterVec,
+    /// Health-check round failures by classified reason (`timeout`,
+    /// `network`, `rcode`, `build_error`, `parse_error`, `no_probe`).
+    pub healthcheck_reason_total: IntCounterVec,
     pub active_upstreams: IntGauge,
     pub healthy_upstreams: IntGauge,
     pub failovers_total: IntCounter,
@@ -85,10 +100,19 @@ pub struct Metrics {
     pub cache_hits_total: IntCounter,
     pub cache_misses_total: IntCounter,
     pub cache_entries: IntGauge,
+    /// Configured hard cap on cached entries (mirrors `cache.max_entries`).
+    pub cache_capacity: IntGauge,
+    /// Approximate bytes held by cached responses (observability only).
+    pub cache_memory_bytes: IntGauge,
     /// Entries removed because the cache was full (capacity pressure).
     pub cache_evictions_total: IntCounter,
     /// Entries removed because their TTL expired (observed lazily on lookup).
     pub cache_expirations_total: IntCounter,
+    /// Explicit `POST /api/cache/clear` calls (operator-initiated flushes).
+    pub cache_clears_total: IntCounter,
+    /// Cache-miss queries that coalesced onto an already-in-flight identical
+    /// query (single-flight followers; the upstream was queried only once).
+    pub cache_coalesced_total: IntCounter,
 
     // TCP / operational.
     pub tcp_connections_total: IntCounter,
@@ -180,6 +204,10 @@ impl Metrics {
         let udp_packets_sent_total = mk(
             "res_udp_packets_sent_total",
             "UDP packets successfully sent to clients",
+        );
+        let udp_send_errors_total = mk(
+            "res_udp_send_errors_total",
+            "UDP send_to() failures when replying to clients",
         );
         let request_bytes_total = mk(
             "res_request_bytes_total",
@@ -281,6 +309,32 @@ impl Metrics {
             "Upstream health-state transitions (up/degraded/down)",
             &["upstream"],
         );
+        let upstream_score = IntGaugeVec::new(
+            Opts::new(
+                "res_upstream_score",
+                "Composite selection score per upstream (0 when disabled)",
+            ),
+            &["upstream"],
+        )
+        .expect("metric");
+        let upstream_rank = IntGaugeVec::new(
+            Opts::new(
+                "res_upstream_rank",
+                "Selection rank per upstream (1 = best eligible score; 0 = ineligible)",
+            ),
+            &["upstream"],
+        )
+        .expect("metric");
+        let failover_reason_total = mk1(
+            "res_failover_reason_total",
+            "Failover attempts by the reason the previous upstream attempt gave up",
+            &["reason"],
+        );
+        let healthcheck_reason_total = mk1(
+            "res_healthcheck_reason_total",
+            "Health-check failures by classified reason",
+            &["upstream", "reason"],
+        );
         let active_upstreams = IntGauge::with_opts(Opts::new(
             "res_active_upstreams",
             "Enabled upstreams currently in the pool",
@@ -311,6 +365,16 @@ impl Metrics {
             "Current number of cached responses",
         ))
         .expect("metric");
+        let cache_capacity = IntGauge::with_opts(Opts::new(
+            "res_cache_capacity",
+            "Configured maximum number of cached responses",
+        ))
+        .expect("metric");
+        let cache_memory_bytes = IntGauge::with_opts(Opts::new(
+            "res_cache_memory_bytes",
+            "Approximate bytes held by cached DNS responses",
+        ))
+        .expect("metric");
         let cache_evictions_total = mk(
             "res_cache_evictions_total",
             "Cache entries removed because the cache was full",
@@ -318,6 +382,14 @@ impl Metrics {
         let cache_expirations_total = mk(
             "res_cache_expirations_total",
             "Cache entries removed because their TTL expired",
+        );
+        let cache_clears_total = mk(
+            "res_cache_clears_total",
+            "Operator-initiated full cache flushes (POST /api/cache/clear)",
+        );
+        let cache_coalesced_total = mk(
+            "res_cache_coalesced_total",
+            "Cache-miss queries coalesced onto an in-flight identical query (single-flight)",
         );
 
         let tcp_connections_total = mk("res_tcp_connections_total", "Accepted TCP DNS connections");
@@ -371,6 +443,8 @@ impl Metrics {
             &upstream_rcode_total,
             &healthcheck_total,
             &upstream_state_changes_total,
+            &failover_reason_total,
+            &healthcheck_reason_total,
         ] {
             registry.register(Box::new(c.clone())).expect("register");
         }
@@ -384,12 +458,15 @@ impl Metrics {
             &cache_misses_total,
             &cache_evictions_total,
             &cache_expirations_total,
+            &cache_clears_total,
+            &cache_coalesced_total,
             &tcp_connections_total,
             &tcp_connections_rejected_total,
             &config_reloads_total,
             &config_errors_total,
             &udp_packets_received_total,
             &udp_packets_sent_total,
+            &udp_send_errors_total,
             &request_bytes_total,
             &response_bytes_total,
             &oversized_packets_total,
@@ -416,6 +493,8 @@ impl Metrics {
             &upstream_health,
             &upstream_state,
             &healthcheck_last_success_timestamp_seconds,
+            &upstream_score,
+            &upstream_rank,
         ] {
             registry.register(Box::new(g.clone())).expect("register");
         }
@@ -423,6 +502,8 @@ impl Metrics {
             &active_upstreams,
             &healthy_upstreams,
             &cache_entries,
+            &cache_capacity,
+            &cache_memory_bytes,
             &udp_inflight,
             &tcp_connections,
             &resident_memory_bytes,
@@ -458,6 +539,7 @@ impl Metrics {
             query_type_total,
             udp_packets_received_total,
             udp_packets_sent_total,
+            udp_send_errors_total,
             request_bytes_total,
             response_bytes_total,
             oversized_packets_total,
@@ -475,6 +557,10 @@ impl Metrics {
             healthcheck_duration_seconds,
             healthcheck_last_success_timestamp_seconds,
             upstream_state_changes_total,
+            upstream_score,
+            upstream_rank,
+            failover_reason_total,
+            healthcheck_reason_total,
             active_upstreams,
             healthy_upstreams,
             failovers_total,
@@ -482,8 +568,12 @@ impl Metrics {
             cache_hits_total,
             cache_misses_total,
             cache_entries,
+            cache_capacity,
+            cache_memory_bytes,
             cache_evictions_total,
             cache_expirations_total,
+            cache_clears_total,
+            cache_coalesced_total,
             tcp_connections_total,
             tcp_connections_rejected_total,
             config_reloads_total,
@@ -739,6 +829,14 @@ mod tests {
         m.upstream_state_changes_total
             .with_label_values(&["warmup"])
             .inc();
+        m.upstream_score.with_label_values(&["warmup"]).set(1);
+        m.upstream_rank.with_label_values(&["warmup"]).set(1);
+        m.failover_reason_total
+            .with_label_values(&["timeout"])
+            .inc();
+        m.healthcheck_reason_total
+            .with_label_values(&["warmup", "timeout"])
+            .inc();
         let text = m.render();
         for name in [
             "res_queries_total",
@@ -754,6 +852,9 @@ mod tests {
             "res_cache_misses_total",
             "res_cache_evictions_total",
             "res_cache_expirations_total",
+            "res_cache_clears_total",
+            "res_cache_capacity",
+            "res_cache_memory_bytes",
             "res_active_upstreams",
             "res_failovers_total",
             "res_failover_latency_seconds",
@@ -768,6 +869,10 @@ mod tests {
             "res_healthcheck_total",
             "res_healthcheck_duration_seconds",
             "res_upstream_state_changes_total",
+            "res_upstream_score",
+            "res_upstream_rank",
+            "res_failover_reason_total",
+            "res_healthcheck_reason_total",
         ] {
             assert!(text.contains(name), "missing metric {name}");
         }

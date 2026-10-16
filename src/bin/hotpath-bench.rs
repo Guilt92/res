@@ -79,13 +79,14 @@ fn main() {
         .map(|i| StateView {
             id: i as i64 + 1,
             health: if i == 0 {
-                HealthStatus::Up
+                HealthStatus::Healthy
             } else {
                 HealthStatus::Degraded
             },
             priority: 1,
             weight: 1 + (i as u32 % 3),
             reliability: 0.9,
+            probe_success: None,
             p95_ms: 8.0 + i as f64,
             avg_ms: 6.0 + i as f64,
             has_latency: true,
@@ -261,6 +262,7 @@ fn bench_udp_exchange(raw: &[u8], iters: u64) -> f64 {
             priority: 1,
             weight: 1,
             timeout_ms: None,
+            ..Default::default()
         };
         let fwd = Forwarder::new(false);
         let q = msg::parse_query(raw).expect("parse");

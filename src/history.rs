@@ -75,8 +75,11 @@ struct Snap {
     fds: f64,
     healthy: f64,
     degraded: f64,
+    recovering: f64,
     down: f64,
     cache_entries: f64,
+    cache_capacity: f64,
+    cache_memory_bytes: f64,
     // Histograms (cumulative bucket counts incl. +Inf).
     global_hist: Vec<u64>,
     upstreams: HashMap<String, UpSnap>,
@@ -217,6 +220,8 @@ fn take_snapshot(metrics: &Metrics) -> Snap {
         // gauge (which reports the same healthy count).
         healthy: 0.0,
         cache_entries: gauge(&fams, "res_cache_entries"),
+        cache_capacity: gauge(&fams, "res_cache_capacity"),
+        cache_memory_bytes: gauge(&fams, "res_cache_memory_bytes"),
         global_hist: histogram(&fams, "res_query_duration_seconds"),
         ..Default::default()
     };
@@ -228,7 +233,7 @@ fn take_snapshot(metrics: &Metrics) -> Snap {
         snap.rcode[i] = counter_by_label(&fams, "res_response_rcode_total", "rcode", rcode);
     }
 
-    // Per-upstream state gauges (0=DOWN, 1=DEGRADED, 2=UP).
+    // Per-upstream state gauges (0=UNHEALTHY, 1=DEGRADED, 2=HEALTHY, 3=RECOVERING).
     if let Some(f) = find(&fams, "res_upstream_state") {
         for m in f.get_metric() {
             if let Some(name) = label_of(m, "upstream") {
@@ -237,6 +242,7 @@ fn take_snapshot(metrics: &Metrics) -> Snap {
                 match entry.state as i64 {
                     2 => snap.healthy += 1.0,
                     1 => snap.degraded += 1.0,
+                    3 => snap.recovering += 1.0,
                     _ => snap.down += 1.0,
                 }
             }
@@ -333,8 +339,11 @@ struct GBucket {
     fds: f64,
     healthy: f64,
     degraded: f64,
+    recovering: f64,
     down: f64,
     cache_entries: f64,
+    cache_capacity: f64,
+    cache_memory_bytes: f64,
 }
 
 impl GBucket {
@@ -371,8 +380,11 @@ impl GBucket {
             fds: 0.0,
             healthy: 0.0,
             degraded: 0.0,
+            recovering: 0.0,
             down: 0.0,
             cache_entries: 0.0,
+            cache_capacity: 0.0,
+            cache_memory_bytes: 0.0,
         }
     }
 
@@ -419,8 +431,11 @@ impl GBucket {
         self.fds = b.fds;
         self.healthy = b.healthy;
         self.degraded = b.degraded;
+        self.recovering = b.recovering;
         self.down = b.down;
         self.cache_entries = b.cache_entries;
+        self.cache_capacity = b.cache_capacity;
+        self.cache_memory_bytes = b.cache_memory_bytes;
     }
 
     fn reset(&mut self, ts_ms: u64) {
@@ -432,8 +447,11 @@ impl GBucket {
             self.fds,
             self.healthy,
             self.degraded,
+            self.recovering,
             self.down,
             self.cache_entries,
+            self.cache_capacity,
+            self.cache_memory_bytes,
         );
         *self = GBucket::new(ts_ms);
         (
@@ -444,8 +462,11 @@ impl GBucket {
             self.fds,
             self.healthy,
             self.degraded,
+            self.recovering,
             self.down,
             self.cache_entries,
+            self.cache_capacity,
+            self.cache_memory_bytes,
         ) = gauges;
     }
 }
@@ -556,6 +577,19 @@ impl HistoryStore {
         std::sync::Arc::new(Self {
             inner: Mutex::new(Inner::new()),
         })
+    }
+
+    /// Drop every per-upstream series for a deleted upstream. Without this,
+    /// each create/delete cycle would leave keys in the accumulator and ring
+    /// maps forever — unbounded growth driven by configuration churn.
+    pub fn remove_upstream(&self, name: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.up_cur.remove(name);
+        inner.up_acc10.remove(name);
+        inner.up_acc60.remove(name);
+        inner.up_r1.remove(name);
+        inner.up_r2.remove(name);
+        inner.up_r3.remove(name);
     }
 
     /// Record one per-second sample. Called from the runtime sampler only.
@@ -878,8 +912,11 @@ fn apply_gauges(b: &mut GBucket, snap: &Snap) {
     b.fds = snap.fds;
     b.healthy = snap.healthy;
     b.degraded = snap.degraded;
+    b.recovering = snap.recovering;
     b.down = snap.down;
     b.cache_entries = snap.cache_entries;
+    b.cache_capacity = snap.cache_capacity;
+    b.cache_memory_bytes = snap.cache_memory_bytes;
 }
 
 pub fn range_secs(range: &str) -> Result<u64, String> {
@@ -1043,8 +1080,11 @@ fn global_series(buckets: &[GBucket], ts: &[u64]) -> Value {
         ("fds", Vec::with_capacity(buckets.len())),
         ("healthy", Vec::with_capacity(buckets.len())),
         ("degraded", Vec::with_capacity(buckets.len())),
+        ("recovering", Vec::with_capacity(buckets.len())),
         ("down", Vec::with_capacity(buckets.len())),
         ("cache_entries", Vec::with_capacity(buckets.len())),
+        ("cache_capacity", Vec::with_capacity(buckets.len())),
+        ("cache_memory_bytes", Vec::with_capacity(buckets.len())),
         ("tcp_conn_per_min", Vec::with_capacity(buckets.len())),
         ("queries", Vec::with_capacity(buckets.len())),
         ("packets_in", Vec::with_capacity(buckets.len())),
@@ -1068,7 +1108,7 @@ fn global_series(buckets: &[GBucket], ts: &[u64]) -> Value {
         } else {
             b.queries
         };
-        let vals: [Option<f64>; 32] = [
+        let vals: [Option<f64>; 35] = [
             Some(b.queries as f64 / w),
             ratio_pct(success, resp),
             ratio_pct(resp.saturating_sub(success), resp),
@@ -1091,8 +1131,11 @@ fn global_series(buckets: &[GBucket], ts: &[u64]) -> Value {
             Some(b.fds),
             Some(b.healthy),
             Some(b.degraded),
+            Some(b.recovering),
             Some(b.down),
             Some(b.cache_entries),
+            Some(b.cache_capacity),
+            Some(b.cache_memory_bytes),
             Some(b.tcp_accepted as f64 / w * 60.0),
             Some(b.queries as f64),
             Some(b.packets_in as f64 / w),

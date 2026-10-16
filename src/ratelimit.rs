@@ -79,13 +79,25 @@ impl RateLimiter {
     }
 
     /// Returns `true` when the query is allowed to proceed.
+    ///
+    /// Order matters for fairness: the *per-IP* bucket is consulted first,
+    /// so a single noisy client that is over its own limit cannot drain the
+    /// shared global bucket and starve every other client (a global token is
+    /// only spent once the client's own budget has admitted the query).
     pub fn check(&self, client: IpAddr, cfg: &RateLimitConfig) -> bool {
         if !cfg.enabled {
             return true;
         }
-        if !self.take(&self.global, cfg.global_qps, cfg.global_burst) {
+        // Dual-stack listeners present IPv4 peers as ::ffff:a.b.c.d; bucket
+        // both spellings to the same key or each client gets two buckets.
+        let client = canonical(client);
+        if !self.take_per_ip(client, cfg) {
             return false;
         }
+        self.take(&self.global, cfg.global_qps, cfg.global_burst)
+    }
+
+    fn take_per_ip(&self, client: IpAddr, cfg: &RateLimitConfig) -> bool {
         let shard_idx = shard_of(client);
         let shard = &self.shards[shard_idx];
         let cap = (cfg.max_tracked_clients / SHARDS).max(1);
@@ -138,6 +150,18 @@ fn shard_of(ip: IpAddr) -> usize {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ip.hash(&mut h);
     (h.finish() as usize) % SHARDS
+}
+
+/// Fold IPv4-mapped IPv6 (`::ffff:a.b.c.d`) onto plain IPv4 so one client
+/// cannot hold two buckets under dual-stack sockets.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
 }
 
 fn prune(map: &mut HashMap<IpAddr, Bucket>, cap: usize) {
@@ -248,5 +272,51 @@ mod tests {
             "tracked clients {} exceeds bound",
             rl.tracked_clients()
         );
+    }
+
+    /// One client over its own limit must not consume global tokens:
+    /// per-IP denial happens *before* the global bucket is touched (the
+    /// §13 "one noisy client" isolation rule).
+    #[test]
+    fn per_ip_denial_does_not_drain_global_bucket() {
+        let rl = RateLimiter::new();
+        let mut c = cfg();
+        c.per_ip_burst = 1;
+        c.per_ip_qps = 0.0001;
+        c.global_burst = 5;
+        c.global_qps = 0.0001; // no meaningful refill during the test
+
+        // Noisy client: 1 allowed, then 9 per-IP denials.
+        for _ in 0..10 {
+            rl.check(ip(7), &c);
+        }
+        // 4 of the 5 global tokens must remain for everyone else.
+        let mut allowed = 0;
+        for n in 100..110u8 {
+            if rl.check(ip(n), &c) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(
+            allowed, 4,
+            "per-IP denials must not drain the shared global bucket"
+        );
+    }
+
+    /// `::ffff:10.0.0.1` and `10.0.0.1` are the same client.
+    #[test]
+    fn v4_mapped_ipv6_shares_the_v4_bucket() {
+        let rl = RateLimiter::new();
+        let c = cfg(); // per_ip_burst = 5
+        let plain = ip(3);
+        let mapped: IpAddr = "::ffff:10.0.0.3".parse().unwrap();
+        for _ in 0..5 {
+            assert!(rl.check(mapped, &c), "mapped spelling within burst");
+        }
+        assert!(
+            !rl.check(plain, &c),
+            "plain v4 must see the same exhausted bucket"
+        );
+        assert!(!rl.check(mapped, &c), "mapped spelling exhausted too");
     }
 }

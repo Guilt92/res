@@ -9,8 +9,14 @@
 //! queries keep the snapshot they started with and finish safely; queries
 //! accepted after the swap observe the new configuration immediately.
 //!
-//! When `server.api_token` is set, every configuration-changing endpoint
-//! requires `Authorization: Bearer <token>`; read-only endpoints stay open.
+//! Authentication (when a password is configured via `RES_ADMIN_PASSWORD` or
+//! the credentials file): every `/api/*` route except `/api/health` and
+//! `/api/auth/login` requires a session cookie (viewer or admin) or the
+//! legacy `Authorization: Bearer <api_token>` header. Mutations additionally
+//! require the admin role and, for cookie-authenticated requests, a matching
+//! `X-CSRF-Token` header (double-submit). When password auth is not
+//! configured, the legacy token-only posture applies: mutations require
+//! `server.api_token` (if set) and reads stay open.
 
 mod prom;
 
@@ -19,15 +25,17 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::services::{ServeDir, ServeFile};
 
+use crate::acl::{AclAction, AclConfig, AclEntry, AclRules};
+use crate::auth::{AuthState, LoginError, Role};
 use crate::config::{AppConfig, Protocol, UpstreamConfig};
 use crate::dns::forward::Forwarder;
 use crate::dns::msg::Rcode;
@@ -35,15 +43,31 @@ use crate::events::Event;
 use crate::shared::Shared;
 use crate::upstream::{health::probe_once, HealthStatus};
 
+/// Name of the session cookie (HttpOnly, SameSite=Strict).
+pub const SESSION_COOKIE: &str = "res_session";
+/// Name of the CSRF cookie (readable by dashboard JS; double-submit).
+pub const CSRF_COOKIE: &str = "res_csrf";
+
 #[derive(Clone)]
 pub struct ApiState {
     pub shared: Arc<Shared>,
     pub forwarder: Forwarder,
     /// Serialises configuration mutations (create/update/delete/import).
     pub mutation: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded HTTP concurrency: at most `API_CONCURRENCY` handlers run at
+    /// once; further requests wait briefly and then fail fast with 503.
+    pub api_sem: Arc<tokio::sync::Semaphore>,
     /// Cached Prometheus reachability probe (refreshed at most every 10 s).
     probe: Arc<std::sync::Mutex<Option<ProbeState>>>,
+    /// Password authentication state (sessions, lockouts, argon2 hashes).
+    pub auth: Arc<AuthState>,
 }
+
+/// Cap on simultaneous HTTP handlers (each waiting request holds a
+/// connection plus its buffered body — this is the memory ceiling).
+const API_CONCURRENCY: usize = 256;
+/// How long a request may wait for a concurrency permit before getting 503.
+const API_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct ProbeState {
@@ -57,6 +81,9 @@ struct ProbeState {
 pub enum ApiError {
     BadRequest(String),
     Unauthorized(String),
+    /// 403: authenticated but not allowed (viewer attempting a mutation, or
+    /// a cookie-authenticated mutation without a valid CSRF token).
+    Forbidden(String),
     NotFound(String),
     Conflict(String),
     /// 409: the operation is only allowed with an explicit confirmation
@@ -70,6 +97,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest(_) => "bad_request",
             ApiError::Unauthorized(_) => "unauthorized",
+            ApiError::Forbidden(_) => "forbidden",
             ApiError::NotFound(_) => "not_found",
             ApiError::Conflict(_) => "conflict",
             ApiError::NeedsConfirm(_) => "confirm_required",
@@ -81,6 +109,7 @@ impl ApiError {
         match self {
             ApiError::BadRequest(m)
             | ApiError::Unauthorized(m)
+            | ApiError::Forbidden(m)
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
             | ApiError::NeedsConfirm(m)
@@ -94,6 +123,7 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) | ApiError::NeedsConfirm(_) => StatusCode::CONFLICT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -103,28 +133,122 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Bearer-token check for configuration-changing endpoints. An empty
-/// configured token keeps the control plane open (development default; a
-/// startup warning is emitted). Failures are audited (op only — never the
-/// presented token).
-fn require_admin(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), ApiError> {
+/// Extract the session token from the `Cookie` header.
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|pair| {
+            let (k, v) = pair.trim().split_once('=')?;
+            (k == SESSION_COOKIE).then_some(v)
+        })
+        .next()
+}
+
+/// The authenticated principal of a request, if any.
+#[derive(Debug, Clone)]
+struct Principal {
+    username: String,
+    role: Role,
+    /// True when authentication used the session cookie (CSRF applies).
+    via_cookie: bool,
+}
+
+/// Resolve the request principal: bearer `api_token` (admin) first, then the
+/// session cookie. `None` when the request is anonymous.
+fn principal(st: &ApiState, headers: &HeaderMap) -> Option<Principal> {
     let token = st.shared.app.load().server.api_token.clone();
-    if token.is_empty() {
-        return Ok(());
+    if !token.is_empty() {
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if ct_eq(provided.as_bytes(), token.as_bytes()) {
+            return Some(Principal {
+                username: "(api_token)".into(),
+                role: Role::Admin,
+                via_cookie: false,
+            });
+        }
     }
+    if let Some(tok) = session_cookie(headers) {
+        if let Some(sess) = st.auth.session(tok) {
+            return Some(Principal {
+                username: sess.username,
+                role: sess.role,
+                via_cookie: true,
+            });
+        }
+    }
+    None
+}
+
+/// CSRF double-submit check for cookie-authenticated mutations: the
+/// `X-CSRF-Token` header must equal the session's CSRF token. Bearer-token
+/// requests are exempt (no ambient credentials to ride).
+fn check_csrf(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), ApiError> {
+    let Some(tok) = session_cookie(headers) else {
+        return Err(ApiError::Forbidden("session cookie required".into()));
+    };
+    let Some(sess) = st.auth.session(tok) else {
+        return Err(ApiError::Unauthorized("session expired".into()));
+    };
     let provided = headers
-        .get(header::AUTHORIZATION)
+        .get("x-csrf-token")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if ct_eq(provided.as_bytes(), token.as_bytes()) {
+    if ct_eq(provided.as_bytes(), sess.csrf.as_bytes()) {
         Ok(())
     } else {
-        st.shared
-            .record_config_event("unauthorized", json!({ "op": op, "outcome": "denied" }));
-        Err(ApiError::Unauthorized(
-            "admin token required (Authorization: Bearer <token>)".into(),
+        st.shared.record_config_event(
+            "unauthorized",
+            json!({ "op": op, "outcome": "denied", "reason": "csrf" }),
+        );
+        Err(ApiError::Forbidden(
+            "missing or invalid X-CSRF-Token header".into(),
         ))
+    }
+}
+
+/// Authorization for configuration-changing endpoints.
+///
+/// Order: bearer `api_token` (admin) → admin session (+ CSRF when via
+/// cookie) → open (only when password auth is disabled and no token is
+/// configured). Viewer sessions are rejected. Failures are audited (op only —
+/// never the presented credentials).
+fn require_admin(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), ApiError> {
+    match principal(st, headers) {
+        Some(p) if p.role == Role::Admin => {
+            if p.via_cookie {
+                check_csrf(st, headers, op)?;
+            }
+            Ok(())
+        }
+        Some(p) => {
+            st.shared.record_config_event(
+                "unauthorized",
+                json!({ "op": op, "outcome": "denied", "role": p.role.as_str() }),
+            );
+            Err(ApiError::Forbidden(format!(
+                "admin role required (authenticated as {})",
+                p.role.as_str()
+            )))
+        }
+        None => {
+            let token_configured = !st.shared.app.load().server.api_token.is_empty();
+            if !token_configured && !st.auth.enabled() {
+                // Development posture: no password and no token configured.
+                return Ok(());
+            }
+            st.shared
+                .record_config_event("unauthorized", json!({ "op": op, "outcome": "denied" }));
+            Err(ApiError::Unauthorized(
+                "authentication required (session cookie or Authorization: Bearer <token>)".into(),
+            ))
+        }
     }
 }
 
@@ -200,12 +324,14 @@ fn reject(st: &ApiState, action: &str, mut detail: Value, err: ApiError) -> ApiE
     err
 }
 
-pub fn router(shared: Arc<Shared>, forwarder: Forwarder) -> Router {
+pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -> Router {
     let state = ApiState {
         shared,
         forwarder,
         mutation: Arc::new(tokio::sync::Mutex::new(())),
+        api_sem: Arc::new(tokio::sync::Semaphore::new(API_CONCURRENCY)),
         probe: Arc::new(std::sync::Mutex::new(None)),
+        auth,
     };
 
     let dashboard = state
@@ -217,8 +343,14 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder) -> Router {
         .clone()
         .filter(|d| d.exists());
 
-    let app = Router::new()
+    // Unauthenticated: liveness probe + login.
+    let open = Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/login", post(login));
+
+    // Everything else requires a principal when password auth is enabled.
+    let protected = Router::new()
+        .route("/api/auth/session", get(session_info).delete(logout))
         .route("/api/status", get(status))
         .route("/api/stats", get(stats))
         .route("/api/diagnostics", get(diagnostics))
@@ -232,6 +364,7 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder) -> Router {
         .route("/api/upstreams/{id}/test", post(test_upstream))
         .route("/api/upstreams/{id}/health", get(upstream_events))
         .route("/api/config", get(export_config).put(import_config))
+        .route("/api/config/rollback", post(rollback_config))
         .route("/api/config/events", get(config_events))
         .route("/api/events", get(all_events))
         .route("/api/history", get(history))
@@ -239,15 +372,219 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder) -> Router {
         .route("/api/clients", get(top_clients))
         .route("/api/domains", get(top_domains))
         .route("/api/monitoring", get(monitoring_info))
+        .route("/api/acl", get(get_acl).put(put_acl))
+        .route("/api/acl/entries", post(create_acl_entry))
+        .route(
+            "/api/acl/entries/{id}",
+            patch(patch_acl_entry).delete(delete_acl_entry),
+        )
+        .route("/api/cache", get(get_cache).put(put_cache))
+        .route("/api/cache/clear", post(clear_cache))
+        .route(
+            "/api/health/config",
+            get(get_health_config).put(put_health_config),
+        )
+        .route("/api/selection", get(get_selection).put(put_selection))
+        .route("/api/auth/rotate-password", post(rotate_password))
+        .route_layer(middleware::from_fn_with_state(state.clone(), read_guard));
+
+    // /metrics: open by default (Prometheus scrapes it without cookies);
+    // optionally guarded when [auth].protect_metrics is on.
+    let metrics = Router::new()
         .route("/metrics", get(metrics_endpoint))
+        .route_layer(middleware::from_fn_with_state(state.clone(), metrics_guard));
+
+    // Bounded control-plane concurrency (outermost of the API routers, so
+    // it caps argon2 logins and mutations too). Registered before the
+    // dashboard fallback so static files never consume permits: the panel
+    // must stay loadable while the API is shedding load.
+    let app = open
+        .merge(protected)
+        .merge(metrics)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_concurrency,
+        ))
         .with_state(state);
 
-    match dashboard {
-        Some(dir) => {
-            let index = dir.join("index.html");
-            app.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(index)))
+    let app = match dashboard {
+        Some(dir) => app.fallback(move |req: axum::extract::Request| {
+            let dir = dir.clone();
+            async move { dashboard_fallback(&dir, &req) }
+        }),
+        // No dashboard: still answer unknown paths with JSON, never an
+        // empty opaque 404 (clients get a machine-readable error).
+        None => app.fallback(|req: axum::extract::Request| async move {
+            ApiError::NotFound(format!("no route for {}", req.uri().path())).into_response()
+        }),
+    };
+    app.layer(middleware::from_fn(security_headers))
+}
+
+/// Bounded HTTP concurrency (audit GAP-3): at most `API_CONCURRENCY`
+/// handlers run at once; a request waits up to `API_BUSY_TIMEOUT` for a
+/// permit and then fails fast with a typed JSON 503. Bounding *in-flight*
+/// handlers is the memory ceiling; bounding the *wait queue* too keeps a
+/// slow backend from accumulating an unbounded pile of parked connections.
+async fn api_concurrency(
+    State(st): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(API_BUSY_TIMEOUT, st.api_sem.acquire()).await {
+        Ok(Ok(_permit)) => next.run(req).await,
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "control plane at capacity, retry shortly",
+                "code": "busy",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Response headers for every API/dashboard reply: MIME sniffing off,
+/// framing off, no referrer leakage. A CSP is deliberately not set — the
+/// dashboard ships an inline script/stylesheet by design, and a hash/nonce
+/// policy would have to be kept in lockstep with `index.html` (documented
+/// in the README instead).
+async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    res
+}
+
+/// Hardened dashboard/static fallback (replaces `ServeDir` + index
+/// fallback):
+///
+/// * `/api/*` (and `/metrics`) that matched no route answer **JSON 404** —
+///   serving `index.html` with status 200 would mask broken clients;
+/// * `..` segments and dotfiles are never served (the config, credentials
+///   and `.git` material can sit next to the dashboard directory);
+/// * a missing *asset* (has a file extension) is a visible 404; only
+///   extensionless paths fall back to `index.html` (SPA entry);
+/// * non-GET/HEAD methods are refused.
+fn dashboard_fallback(dir: &std::path::Path, req: &axum::extract::Request) -> Response {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/api/") || path == "/metrics" {
+        return ApiError::NotFound(format!("no route for {path}")).into_response();
+    }
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(json!({
+                "error": "method not allowed",
+                "code": "method_not_allowed",
+            })),
+        )
+            .into_response();
+    }
+
+    let rel = path.trim_start_matches('/');
+    let mut clean = std::path::PathBuf::from(&dir);
+    let mut last_seg = "";
+    if !rel.is_empty() {
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('.') {
+                return ApiError::NotFound(format!("no route for {path}")).into_response();
+            }
+            clean.push(seg);
+            last_seg = seg;
         }
-        None => app,
+    }
+    if !clean.starts_with(dir) {
+        return ApiError::NotFound(format!("no route for {path}")).into_response();
+    }
+
+    match std::fs::read(&clean) {
+        Ok(bytes) => {
+            let mime = match clean.extension().and_then(|e| e.to_str()) {
+                Some("html") => "text/html; charset=utf-8",
+                Some("css") => "text/css",
+                Some("js") => "application/javascript",
+                Some("ttf") => "font/ttf",
+                Some("woff") => "font/woff",
+                Some("woff2") => "font/woff2",
+                Some("svg") => "image/svg+xml",
+                Some("png") => "image/png",
+                Some("ico") => "image/x-icon",
+                _ => "application/octet-stream",
+            };
+            ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+        }
+        Err(_) => {
+            if last_seg.contains('.') {
+                // An asset that does not exist must be a visible failure,
+                // not a silently-rending HTML page.
+                ApiError::NotFound(format!("asset not found: {path}")).into_response()
+            } else {
+                let index = dir.join("index.html");
+                match std::fs::read(&index) {
+                    Ok(b) => {
+                        ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], b).into_response()
+                    }
+                    Err(e) => {
+                        ApiError::Internal(format!("index.html unreadable: {e}")).into_response()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read-route guard: when password auth is enabled, every authenticated
+/// read route requires a live session (viewer or admin) or the bearer
+/// api_token. `/api/health` and `/api/auth/login` are registered before the
+/// route_layer and stay open. When password auth is disabled the guard is a
+/// no-op (legacy posture: reads open, mutations gated by token in handlers).
+async fn read_guard(
+    State(st): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !st.auth.enabled() {
+        return next.run(req).await;
+    }
+    match principal(&st, req.headers()) {
+        Some(_) => next.run(req).await,
+        None => {
+            st.shared.record_config_event(
+                "unauthorized",
+                serde_json::json!({ "op": "read", "outcome": "denied" }),
+            );
+            ApiError::Unauthorized(
+                "authentication required (session cookie or Authorization: Bearer <token>)".into(),
+            )
+            .into_response()
+        }
+    }
+}
+
+/// `/metrics` guard: open by default (Prometheus scrapes without cookies);
+/// when `[auth].protect_metrics` is on, a principal is required.
+async fn metrics_guard(
+    State(st): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !st.auth.enabled() || !st.auth.config().protect_metrics {
+        return next.run(req).await;
+    }
+    match principal(&st, req.headers()) {
+        Some(_) => next.run(req).await,
+        None => {
+            ApiError::Unauthorized("authentication required for /metrics".into()).into_response()
+        }
     }
 }
 
@@ -262,6 +599,319 @@ async fn health() -> Json<Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Authentication: login, logout, session introspection
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginRequest {
+    username: String,
+    password: String,
+}
+
+/// POST /api/auth/login — exchange username/password for a session cookie.
+/// Always returns 401 with an identical message for unknown users and wrong
+/// passwords; lockouts and per-IP rate limits return 429. Rate/lockout state
+/// is per-username and per-client-IP.
+async fn login(
+    State(st): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    Json(req): Json<LoginRequest>,
+) -> Response {
+    if !st.auth.enabled() {
+        return ApiError::Unauthorized("password authentication is not configured".into())
+            .into_response();
+    }
+    // Bound credential sizes before they touch argon2, the lockout table or
+    // the audit ring: without this a 2 MB body (framework default) could be
+    // fed straight into the hash and stored verbatim in bounded maps/rings.
+    if req.username.is_empty() || req.username.len() > 64 {
+        return ApiError::BadRequest("username must be 1..=64 characters".into()).into_response();
+    }
+    if req.password.is_empty() || req.password.len() > 1024 {
+        return ApiError::BadRequest("password must be 1..=1024 characters".into()).into_response();
+    }
+    // Per-IP rate limit (independent of per-username lockout).
+    if let Err(retry_after_secs) = st.auth.check_login_rate(addr.ip()) {
+        st.shared.record_config_event(
+            "login",
+            serde_json::json!({
+                "user": req.username,
+                "client": st.shared.client_label(addr.ip()),
+                "outcome": "rate_limited",
+                "retry_after_secs": retry_after_secs,
+            }),
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_secs.to_string())
+                    .unwrap_or(HeaderValue::from_static("60")),
+            )],
+            Json(json!({
+                "error": "too many login attempts from this address; try again later",
+                "code": "rate_limited",
+            })),
+        )
+            .into_response();
+    }
+    st.auth.record_login_attempt(addr.ip());
+    // argon2 (~19 MiB, tens of ms) runs on the blocking pool so Tokio
+    // workers and the DNS hot path never stall behind a login.
+    let auth = Arc::clone(&st.auth);
+    let (u, p) = (req.username.clone(), req.password.clone());
+    let verified = tokio::task::spawn_blocking(move || auth.login(&u, &p)).await;
+    let login_result = match verified {
+        Ok(r) => r,
+        Err(join_err) => {
+            tracing::error!(event = "login_task_failed", error = %join_err);
+            return ApiError::Internal("login evaluation failed".into()).into_response();
+        }
+    };
+    match login_result {
+        Ok((token, session)) => {
+            st.auth.clear_login_rate(addr.ip());
+            st.shared.record_config_event(
+                "login",
+                serde_json::json!({
+                    "user": session.username,
+                    "role": session.role.as_str(),
+                    "client": st.shared.client_label(addr.ip()),
+                    "outcome": "success",
+                }),
+            );
+            let max_age = st.auth.session_ttl().as_secs();
+            let secure = if st.auth.secure_cookies() {
+                "; Secure"
+            } else {
+                ""
+            };
+            let cookie = |name: &str, value: &str, http_only: bool| {
+                format!(
+                    "{name}={value}; Path=/; Max-Age={max_age}; SameSite=Strict{secure}{}",
+                    if http_only { "; HttpOnly" } else { "" }
+                )
+            };
+            // HeaderMap::append (not insert) so both Set-Cookie headers survive.
+            let mut headers = HeaderMap::new();
+            headers.append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&cookie(SESSION_COOKIE, &token, true))
+                    .unwrap_or(HeaderValue::from_static("res_session=; Max-Age=0")),
+            );
+            headers.append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&cookie(CSRF_COOKIE, &session.csrf, false))
+                    .unwrap_or(HeaderValue::from_static("res_csrf=; Max-Age=0")),
+            );
+            let body = json!({
+                "username": session.username,
+                "role": session.role.as_str(),
+                "csrf_token": session.csrf,
+                "expires_in_secs": max_age,
+            });
+            (StatusCode::OK, headers, Json(body)).into_response()
+        }
+        Err(LoginError::InvalidCredentials) => {
+            st.shared.record_config_event(
+                "login",
+                serde_json::json!({
+                    "user": req.username,
+                    "client": st.shared.client_label(addr.ip()),
+                    "outcome": "failed",
+                }),
+            );
+            ApiError::Unauthorized("invalid username or password".into()).into_response()
+        }
+        Err(LoginError::Locked { retry_after_secs }) => {
+            st.shared.record_config_event(
+                "login",
+                serde_json::json!({
+                    "user": req.username,
+                    "client": st.shared.client_label(addr.ip()),
+                    "outcome": "locked",
+                    "retry_after_secs": retry_after_secs,
+                }),
+            );
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    header::RETRY_AFTER,
+                    HeaderValue::from_str(&retry_after_secs.to_string())
+                        .unwrap_or(HeaderValue::from_static("60")),
+                )],
+                Json(json!({
+                    "error": format!("too many failed attempts; try again in {retry_after_secs}s"),
+                    "code": "locked",
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// DELETE /api/auth/session — invalidate the current session and clear
+/// cookies. Requires a live session and, for cookie-authenticated requests,
+/// a matching `X-CSRF-Token` header (prevents forced-logout CSRF). Bearer
+/// requests clear nothing extra.
+async fn logout(State(st): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(tok) = session_cookie(&headers) {
+        if let Some(sess) = st.auth.session(tok) {
+            // CSRF double-submit for cookie-authenticated logout.
+            let provided = headers
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct_eq(provided.as_bytes(), sess.csrf.as_bytes()) {
+                return ApiError::Forbidden("missing or invalid X-CSRF-Token header".into())
+                    .into_response();
+            }
+            st.auth.logout(tok);
+            st.shared.record_config_event(
+                "logout",
+                serde_json::json!({ "user": sess.username, "outcome": "success" }),
+            );
+        }
+    }
+    let secure = if st.auth.secure_cookies() {
+        "; Secure"
+    } else {
+        ""
+    };
+    let clear =
+        |name: &str| format!("{name}=; Path=/; Max-Age=0; SameSite=Strict; HttpOnly{secure}");
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear(SESSION_COOKIE))
+            .unwrap_or(HeaderValue::from_static("res_session=; Max-Age=0")),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear(CSRF_COOKIE))
+            .unwrap_or(HeaderValue::from_static("res_csrf=; Max-Age=0")),
+    );
+    (headers, Json(json!({ "status": "ok" }))).into_response()
+}
+
+/// GET /api/auth/session — who am I? Returns 401 when unauthenticated.
+async fn session_info(State(st): State<ApiState>, headers: HeaderMap) -> Response {
+    match principal(&st, &headers) {
+        Some(p) => Json(json!({
+            "username": p.username,
+            "role": p.role.as_str(),
+            "via": if p.via_cookie { "session" } else { "token" },
+            "session_ttl_secs": st.auth.session_ttl().as_secs(),
+            "sessions": st.auth.session_count(),
+        }))
+        .into_response(),
+        None => ApiError::Unauthorized("no active session".into()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotatePasswordRequest {
+    /// Which account to rotate: `"admin"` or `"viewer"`.
+    account: String,
+    new_password: String,
+}
+
+/// POST /api/auth/rotate-password — change a stored password (admin only).
+/// Requires either an admin session (with CSRF) or the bearer api_token.
+/// Persists the new hash to the credentials file when a config path is known.
+async fn rotate_password(
+    State(st): State<ApiState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<RotatePasswordRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "rotate_password")?;
+    if req.new_password.is_empty() || req.new_password.len() > 1024 {
+        return Err(ApiError::BadRequest(
+            "new_password must be 1..=1024 characters".into(),
+        ));
+    }
+    let account = req.account.to_ascii_lowercase();
+    // Hashing (argon2) and the credential-file write run on the blocking
+    // pool; nothing here may stall a Tokio worker.
+    let auth = Arc::clone(&st.auth);
+    let cfg_path = st.shared.config_path.get().cloned();
+    let new_password = req.new_password.clone();
+    let account_for_task = account.clone();
+    let rotated = tokio::task::spawn_blocking(move || {
+        let changed = match account_for_task.as_str() {
+            "admin" => auth.rotate_admin_password(&new_password),
+            "viewer" => auth.rotate_viewer_password(&new_password),
+            other => {
+                return (
+                    Err(format!("unknown account '{other}' (expected admin|viewer)")),
+                    false,
+                    None,
+                )
+            }
+        };
+        if !changed {
+            return (
+                Err(format!(
+                    "no '{account_for_task}' credential is configured to rotate"
+                )),
+                false,
+                None,
+            );
+        }
+        // Persist when a config path is known; report failure honestly.
+        match cfg_path {
+            Some(path) => match auth.persist_credentials(&path) {
+                Ok(()) => (Ok(()), true, None),
+                Err(e) => (Ok(()), false, Some(e)),
+            },
+            None => (
+                Ok(()),
+                false,
+                Some("no config path known; hash is in-memory only".into()),
+            ),
+        }
+    })
+    .await;
+    let (outcome, persisted, persist_error) = match rotated {
+        Ok(r) => r,
+        Err(join_err) => {
+            tracing::error!(event = "rotate_task_failed", error = %join_err);
+            return Err(ApiError::Internal("password rotation failed".into()));
+        }
+    };
+    if let Err(msg) = outcome {
+        return Err(ApiError::BadRequest(msg));
+    }
+    // Revoking every existing session is the point of rotating a possibly
+    // compromised credential: sessions minted with the old password must
+    // not outlive the rotation. The operator logs in again with the new one.
+    let sessions_revoked = st.auth.session_count();
+    st.auth.logout_all();
+    st.shared.record_config_event(
+        "rotate_password",
+        json!({
+            "account": account,
+            "client": st.shared.client_label(addr.ip()),
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "sessions_revoked": sessions_revoked,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+        }),
+    );
+    Ok(Json(json!({
+        "status": "ok",
+        "account": account,
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "sessions_revoked": sessions_revoked,
+        "note": "all existing sessions were invalidated; log in again with the new password",
+    })))
+}
+
 async fn status(State(st): State<ApiState>) -> Json<Value> {
     let app = st.shared.app.load();
     let rt = st.shared.rt.load();
@@ -272,7 +922,7 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    let (total, enabled, healthy, degraded, down) = upstream_counts(&st);
+    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(&st);
     let cfg_state = st.shared.config_state();
 
     Json(json!({
@@ -294,7 +944,13 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "generation": st.shared.config_generation(),
         },
         "auth": {
-            "required": !app.server.api_token.is_empty(),
+            "required": !app.server.api_token.is_empty() || st.auth.enabled(),
+            "password_auth": st.auth.enabled(),
+            "token_auth": !app.server.api_token.is_empty(),
+            "admin_username": st.auth.admin_username(),
+            "viewer_enabled": st.auth.viewer_enabled(),
+            "session_ttl_secs": st.auth.session_ttl().as_secs(),
+            "sessions": st.auth.session_count(),
         },
         "selector": {
             "strategy": st.shared.current_selector().describe(),
@@ -335,14 +991,20 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "enabled": rt.cache.enabled,
             "entries": st.shared.cache.len(),
             "max_entries": rt.cache.max_entries,
+            "max_memory_bytes": rt.cache.max_memory_bytes,
+            "min_ttl_secs": rt.cache.min_ttl_secs,
+            "max_ttl_secs": rt.cache.max_ttl_secs,
             "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
+            "memory_bytes": st.shared.cache.memory_bytes(),
         },
         "upstreams": {
             "total": total,
             "enabled": enabled,
             "healthy": healthy,
             "degraded": degraded,
+            "recovering": recovering,
             "down": down,
+            "unhealthy": down,
         },
         "emergency": {
             "no_healthy_upstreams": total > 0 && healthy == 0,
@@ -392,7 +1054,7 @@ fn build_stats(st: &ApiState) -> Value {
     let errors = responses.saturating_sub(success);
 
     let lat = st.shared.global_latency_stats();
-    let (total, enabled, healthy, degraded, down) = upstream_counts(st);
+    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(st);
 
     let hits = metrics.cache_hits_total.get();
     let misses = metrics.cache_misses_total.get();
@@ -454,13 +1116,18 @@ fn build_stats(st: &ApiState) -> Value {
             "hit_ratio": ratio(hits, cache_reads),
             "evictions": metrics.cache_evictions_total.get(),
             "expirations": metrics.cache_expirations_total.get(),
+            "memory_bytes": st.shared.cache.memory_bytes(),
+            "capacity": st.shared.rt.load().cache.max_entries,
+            "memory_capacity_bytes": st.shared.rt.load().cache.max_memory_bytes,
         },
         "upstreams": {
             "total": total,
             "enabled": enabled,
             "healthy": healthy,
             "degraded": degraded,
+            "recovering": recovering,
             "down": down,
+            "unhealthy": down,
         },
         "failovers": metrics.failovers_total.get(),
         "timeout_count": metrics.query_errors_total.with_label_values(&["deadline"]).get(),
@@ -530,14 +1197,20 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
         .clone();
     let cfg_state = st.shared.config_state();
 
+    let sel = st.shared.rt.load().selection.clone();
+    let latency_ref = sel.latency_reference_ms;
+    let min_probe_samples = sel.min_probe_samples;
     let upstreams: Vec<Value> = st
         .shared
         .registry
         .snapshot()
         .iter()
-        .map(|u| serde_json::to_value(u.stats()).expect("serializable"))
+        .map(|u| {
+            serde_json::to_value(u.stats_with_latency_ref(latency_ref, min_probe_samples))
+                .expect("serializable")
+        })
         .collect();
-    let (total, enabled, healthy, degraded, down) = upstream_counts(&st);
+    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(&st);
 
     let metrics = &st.shared.metrics;
     let bound_addr = |a: Option<std::net::SocketAddr>| a.map(|x| x.to_string());
@@ -572,7 +1245,9 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "enabled": enabled,
             "healthy": healthy,
             "degraded": degraded,
+            "recovering": recovering,
             "down": down,
+            "unhealthy": down,
             "list": upstreams,
         },
         "health_check": {
@@ -585,7 +1260,11 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "enabled": rt.cache.enabled,
             "entries": st.shared.cache.len(),
             "max_entries": rt.cache.max_entries,
+            "max_memory_bytes": rt.cache.max_memory_bytes,
+            "min_ttl_secs": rt.cache.min_ttl_secs,
+            "max_ttl_secs": rt.cache.max_ttl_secs,
             "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
+            "memory_bytes": st.shared.cache.memory_bytes(),
         },
         "inflight": {
             "udp": st.shared.udp_inflight.current(),
@@ -613,24 +1292,26 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
     }))
 }
 
-fn upstream_counts(st: &ApiState) -> (usize, usize, usize, usize, usize) {
+fn upstream_counts(st: &ApiState) -> (usize, usize, usize, usize, usize, usize) {
     let snap = st.shared.registry.snapshot();
     let total = snap.len();
     let mut enabled = 0;
     let mut healthy = 0;
     let mut degraded = 0;
+    let mut recovering = 0;
     let mut down = 0;
     for u in &snap {
         if u.is_enabled() {
             enabled += 1;
         }
         match u.health_status() {
-            HealthStatus::Up => healthy += 1,
+            HealthStatus::Healthy => healthy += 1,
             HealthStatus::Degraded => degraded += 1,
-            HealthStatus::Down => down += 1,
+            HealthStatus::Recovering => recovering += 1,
+            HealthStatus::Unhealthy => down += 1,
         }
     }
-    (total, enabled, healthy, degraded, down)
+    (total, enabled, healthy, degraded, recovering, down)
 }
 
 async fn metrics_endpoint(State(st): State<ApiState>) -> Response {
@@ -649,9 +1330,21 @@ async fn metrics_endpoint(State(st): State<ApiState>) -> Response {
 // Configuration export / import / events
 // ---------------------------------------------------------------------------
 
-async fn export_config(State(st): State<ApiState>) -> Result<Json<Value>, ApiError> {
+async fn export_config(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
     let app = st.shared.app.load();
-    let toml_text = app.to_toml().map_err(ApiError::Internal)?;
+    // Viewers (and anonymous open-mode readers) must never see the bearer
+    // token: re-serialize with it stripped. Admins get the full export.
+    let is_admin = principal(&st, &headers).is_some_and(|p| p.role == Role::Admin);
+    let toml_text = if is_admin {
+        app.to_toml().map_err(ApiError::Internal)?
+    } else {
+        let mut redacted = AppConfig::clone(app.as_ref());
+        redacted.server.api_token = String::new();
+        redacted.to_toml().map_err(ApiError::Internal)?
+    };
     Ok(Json(json!({
         "toml": toml_text,
         "path": st.shared.config_path.get().map(|p| p.display().to_string()),
@@ -729,6 +1422,86 @@ async fn import_config(
 
     Ok(Json(json!({
         "status": "ok",
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "upstreams": st.shared.app.load().upstreams.len(),
+        "generation": st.shared.config_generation(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackConfigQuery {
+    generation: Option<u64>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// POST /api/config/rollback — restore the configuration from the
+/// `<file>.backup` written by the previous successful persist. Applies at
+/// runtime and re-persists the restored content as the primary file (so the
+/// backup becomes the pre-rollback configuration, enabling a double-rollback).
+async fn rollback_config(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<RollbackConfigQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "rollback")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, q.generation, "rollback")?;
+
+    let Some(path) = st.shared.config_path.get().cloned() else {
+        return Err(ApiError::BadRequest(
+            "no configuration file is set; rollback requires a persisted config path".into(),
+        ));
+    };
+    let backup = AppConfig::backup_path(&path);
+    if !backup.exists() {
+        return Err(ApiError::NotFound(format!(
+            "no backup file at {}",
+            backup.display()
+        )));
+    }
+
+    // Parse + validate BEFORE touching runtime state.
+    let next = AppConfig::load(&backup).map_err(|e| {
+        reject(
+            &st,
+            "rollback_rejected",
+            json!({ "op": "rollback", "backup": backup.display().to_string() }),
+            ApiError::BadRequest(format!("backup is invalid: {e}")),
+        )
+    })?;
+
+    check_last_usable(&st, &next.upstreams, q.confirm, "rollback", "(backup)")?;
+
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "rollback_rejected",
+            json!({ "op": "rollback" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+
+    // Persist the restored configuration as the primary file. A failure here
+    // is reported but the runtime already runs the backup content.
+    let (persisted, persist_error) = persist_or_report(&st);
+
+    st.shared.record_config_event(
+        "rollback",
+        json!({
+            "backup": backup.display().to_string(),
+            "upstreams": st.shared.app.load().upstreams.len(),
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+        }),
+    );
+
+    Ok(Json(json!({
+        "status": "ok",
+        "backup": backup.display().to_string(),
         "persisted": persisted,
         "persist_error": persist_error,
         "upstreams": st.shared.app.load().upstreams.len(),
@@ -979,6 +1752,682 @@ async fn monitoring_info(State(st): State<ApiState>) -> Json<Value> {
     }))
 }
 
+// ---------------------------------------------------------------------------
+// ACL management (runtime apply + atomic persist) and cache control
+// ---------------------------------------------------------------------------
+
+/// `source` distinguishes entries loaded from the structured `[[acl.entries]]`
+/// config ("config") from those synthesised from the legacy flat
+/// `allowed_cidrs`/`denied_cidrs` lists ("legacy") — the dashboard's Source
+/// column needs it and cannot be derived client-side.
+fn acl_entry_json(e: &AclEntry, source: &str) -> Value {
+    json!({
+        "id": e.id,
+        "cidr": e.cidr,
+        "action": e.action.as_str(),
+        "enabled": e.enabled,
+        "source": source,
+    })
+}
+
+/// Shared guardrails for any ACL mutation that would produce an empty allow
+/// list (fail-closed = refuse every query) or a /0 open-resolver allow network.
+fn acl_guardrails(entries: &[AclEntry], confirm: bool) -> Result<(), ApiError> {
+    if confirm {
+        return Ok(());
+    }
+    let any_allow = entries
+        .iter()
+        .any(|e| e.action == AclAction::Allow && e.enabled);
+    if !any_allow {
+        return Err(ApiError::NeedsConfirm(
+            "every allow entry is disabled or the allow list is empty (fail-closed refuses \
+             every DNS query); retry with confirm=true to proceed"
+                .into(),
+        ));
+    }
+    let open = entries.iter().any(|e| {
+        e.action == AclAction::Allow
+            && e.enabled
+            && crate::acl::normalize_cidr(&e.cidr)
+                .map(|n| n.prefix_len() == 0)
+                .unwrap_or(false)
+    });
+    if open {
+        return Err(ApiError::NeedsConfirm(
+            "the allow list contains a /0 network, which makes this an open resolver; \
+             retry with confirm=true to proceed"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply a full entry list to the running config, persist atomically, and
+/// record a config event. Callers must already hold the mutation lock, have
+/// validated the entries parse, and checked the optimistic generation.
+async fn apply_acl_entries(
+    st: &ApiState,
+    entries: Vec<AclEntry>,
+    op: &str,
+    confirm: bool,
+) -> Result<Json<Value>, ApiError> {
+    acl_guardrails(&entries, confirm)?;
+
+    let mut next = AppConfig::clone(st.shared.app.load().as_ref());
+    next.acl.set_entries(entries.clone());
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            st,
+            &format!("{op}_rejected"),
+            json!({ "op": op }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+    let (persisted, persist_error) = persist_or_report(st);
+    let outcome = if persist_error.is_some() {
+        "applied_persist_failed"
+    } else {
+        "applied"
+    };
+    st.shared.record_config_event(
+        op,
+        json!({
+            "entries": entries.len(),
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": outcome,
+        }),
+    );
+    let rt = st.shared.rt.load();
+    Ok(Json(json!({
+        "status": "ok",
+        "entries": entries.iter().map(|e| acl_entry_json(e, "config")).collect::<Vec<_>>(),
+        "allowed_count": rt.acl.allowed_count(),
+        "denied_count": rt.acl.denied_count(),
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
+    })))
+}
+
+/// GET /api/acl — effective entries (with ids) + evaluation counts.
+async fn get_acl(State(st): State<ApiState>) -> Json<Value> {
+    let app = st.shared.app.load();
+    let rt = st.shared.rt.load();
+    let entries = app.acl.effective_entries();
+    let acl_source = if app.acl.entries.is_empty() {
+        "legacy"
+    } else {
+        "config"
+    };
+    Json(json!({
+        "entries": entries
+            .iter()
+            .map(|e| acl_entry_json(e, acl_source))
+            .collect::<Vec<_>>(),
+        // Legacy view for older dashboards: synthesised from enabled entries.
+        "allowed_cidrs": entries
+            .iter()
+            .filter(|e| e.action == AclAction::Allow && e.enabled)
+            .map(|e| e.cidr.clone())
+            .collect::<Vec<_>>(),
+        "denied_cidrs": entries
+            .iter()
+            .filter(|e| e.action == AclAction::Deny && e.enabled)
+            .map(|e| e.cidr.clone())
+            .collect::<Vec<_>>(),
+        "allowed_count": rt.acl.allowed_count(),
+        "denied_count": rt.acl.denied_count(),
+        "generation": st.shared.config_generation(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AclUpdateRequest {
+    /// Preferred shape: full structured entry list (replaces everything).
+    #[serde(default)]
+    entries: Option<Vec<AclEntry>>,
+    /// Legacy shape: flat allow list (used when `entries` is absent).
+    #[serde(default)]
+    allowed_cidrs: Option<Vec<String>>,
+    /// Legacy shape: flat deny list (used when `entries` is absent).
+    #[serde(default)]
+    denied_cidrs: Option<Vec<String>>,
+    /// Optimistic concurrency guard (generation of the read the client edited).
+    generation: Option<u64>,
+    /// Required when the resulting allow list is empty (fail-closed would
+    /// refuse every query) or contains a /0 network (open resolver).
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// PUT /api/acl — validate, apply at runtime, persist atomically. Accepts
+/// either the structured `entries` list or the legacy flat CIDR lists.
+/// Denies are evaluated before allows (deny wins). Invalid CIDRs, bare-IP
+/// normalisation failures, duplicates and allow/deny conflicts are rejected
+/// without touching the running rules.
+async fn put_acl(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<AclPutQuery>,
+    Json(req): Json<AclUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "acl_update")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation.or(q.generation), "acl_update")?;
+
+    // Build the entry list from whichever shape the client sent.
+    let entries: Vec<AclEntry> = if let Some(entries) = req.entries {
+        entries
+    } else {
+        let allowed = req.allowed_cidrs.unwrap_or_default();
+        let denied = req.denied_cidrs.unwrap_or_default();
+        let mut out = Vec::with_capacity(allowed.len() + denied.len());
+        for s in allowed {
+            out.push(AclEntry {
+                id: String::new(),
+                cidr: s,
+                action: AclAction::Allow,
+                enabled: true,
+            });
+        }
+        for s in denied {
+            out.push(AclEntry {
+                id: String::new(),
+                cidr: s,
+                action: AclAction::Deny,
+                enabled: true,
+            });
+        }
+        out
+    };
+
+    // Reject invalid CIDRs / duplicates / conflicts before touching anything.
+    let mut probe = AclConfig::default();
+    probe.set_entries(entries.clone());
+    AclRules::parse(&probe).map_err(|e| {
+        reject(
+            &st,
+            "acl_update_rejected",
+            json!({ "op": "acl_update" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+
+    apply_acl_entries(&st, entries, "acl_update", req.confirm).await
+}
+
+#[derive(Deserialize)]
+struct AclPutQuery {
+    generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AclEntryCreate {
+    /// CIDR network or bare IPv4/IPv6 address.
+    cidr: String,
+    /// `"allow"` or `"deny"`.
+    action: AclAction,
+    /// Defaults to true.
+    #[serde(default = "default_true_bool")]
+    enabled: bool,
+    generation: Option<u64>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+/// POST /api/acl/entries — append one entry (admin only).
+async fn create_acl_entry(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<AclEntryCreate>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "acl_entry_create")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation, "acl_entry_create")?;
+
+    let mut entries = st.shared.app.load().acl.effective_entries();
+    let new = AclEntry {
+        id: String::new(),
+        cidr: req.cidr.trim().to_string(),
+        action: req.action,
+        enabled: req.enabled,
+    }
+    .with_derived_id();
+    // Reject exact duplicates early for a clearer error than the parse path.
+    if entries.iter().any(|e| {
+        e.action == new.action
+            && crate::acl::normalize_cidr(&e.cidr)
+                .ok()
+                .zip(crate::acl::normalize_cidr(&new.cidr).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false)
+    }) {
+        return Err(ApiError::Conflict(format!(
+            "duplicate ACL entry: {} {}",
+            new.action.as_str(),
+            new.cidr
+        )));
+    }
+    entries.push(new);
+    apply_acl_entries(&st, entries, "acl_entry_create", req.confirm).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AclEntryPatch {
+    /// New CIDR (bare IP or network).
+    #[serde(default)]
+    cidr: Option<String>,
+    #[serde(default)]
+    action: Option<AclAction>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    generation: Option<u64>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// PATCH /api/acl/entries/{id} — update one entry in place (admin only).
+async fn patch_acl_entry(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<AclEntryPatch>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "acl_entry_patch")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation, "acl_entry_patch")?;
+
+    let mut entries = st.shared.app.load().acl.effective_entries();
+    let pos = entries
+        .iter()
+        .position(|e| e.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("ACL entry '{id}' not found")))?;
+
+    if let Some(cidr) = &req.cidr {
+        entries[pos].cidr = cidr.trim().to_string();
+    }
+    if let Some(action) = req.action {
+        entries[pos].action = action;
+    }
+    if let Some(enabled) = req.enabled {
+        entries[pos].enabled = enabled;
+    }
+    // Changing cidr/action invalidates a content-derived id; re-derive so the
+    // id stays a stable function of the entry's meaning.
+    if req.cidr.is_some() || req.action.is_some() {
+        entries[pos].id = AclEntry::derive_id(entries[pos].action, &entries[pos].cidr);
+    }
+    apply_acl_entries(&st, entries, "acl_entry_patch", req.confirm).await
+}
+
+#[derive(Deserialize)]
+struct AclEntryDeleteQuery {
+    generation: Option<u64>,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// DELETE /api/acl/entries/{id} — remove one entry (admin only).
+async fn delete_acl_entry(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<AclEntryDeleteQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "acl_entry_delete")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, q.generation, "acl_entry_delete")?;
+
+    let mut entries = st.shared.app.load().acl.effective_entries();
+    let pos = entries
+        .iter()
+        .position(|e| e.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("ACL entry '{id}' not found")))?;
+    entries.remove(pos);
+    apply_acl_entries(&st, entries, "acl_entry_delete", q.confirm).await
+}
+
+/// POST /api/cache/clear — drop every cache entry immediately (admin only).
+async fn clear_cache(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "cache_clear")?;
+    let before = st.shared.cache.len();
+    let mem = st.shared.cache.memory_bytes();
+    st.shared.cache.clear();
+    st.shared.metrics.cache_entries.set(0);
+    st.shared.metrics.cache_memory_bytes.set(0);
+    st.shared.metrics.cache_clears_total.inc();
+    st.shared.record_config_event(
+        "cache_clear",
+        json!({
+            "entries_dropped": before,
+            "memory_bytes_freed": mem,
+            "outcome": "applied"
+        }),
+    );
+    Ok(Json(json!({
+        "status": "ok",
+        "entries_dropped": before,
+        "memory_bytes_freed": mem,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Cache settings (hot-reloadable TTL bounds / capacity / enable flag)
+// ---------------------------------------------------------------------------
+
+/// GET /api/cache — live cache state + the settings that control it.
+async fn get_cache(State(st): State<ApiState>) -> Json<Value> {
+    let rt = st.shared.rt.load();
+    Json(json!({
+        "enabled": rt.cache.enabled,
+        "entries": st.shared.cache.len(),
+        "max_entries": rt.cache.max_entries,
+        "max_memory_bytes": rt.cache.max_memory_bytes,
+        "min_ttl_secs": rt.cache.min_ttl_secs,
+        "max_ttl_secs": rt.cache.max_ttl_secs,
+        "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
+        "memory_bytes": st.shared.cache.memory_bytes(),
+        "generation": st.shared.config_generation(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheUpdateRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    max_entries: Option<usize>,
+    #[serde(default)]
+    max_memory_bytes: Option<usize>,
+    #[serde(default)]
+    min_ttl_secs: Option<u64>,
+    #[serde(default)]
+    max_ttl_secs: Option<u64>,
+    #[serde(default)]
+    negative_max_ttl_secs: Option<u64>,
+    generation: Option<u64>,
+}
+
+/// PUT /api/cache — update cache settings, apply at runtime, persist
+/// atomically. Lowering `max_entries` trims the live cache immediately;
+/// disabling the cache clears it.
+async fn put_cache(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<AclPutQuery>,
+    Json(req): Json<CacheUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "cache_update")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation.or(q.generation), "cache_update")?;
+
+    let mut next = AppConfig::clone(st.shared.app.load().as_ref());
+    if let Some(enabled) = req.enabled {
+        next.cache.enabled = enabled;
+    }
+    if let Some(max_entries) = req.max_entries {
+        next.cache.max_entries = max_entries;
+    }
+    if let Some(max_memory_bytes) = req.max_memory_bytes {
+        next.cache.max_memory_bytes = max_memory_bytes;
+    }
+    if let Some(min_ttl_secs) = req.min_ttl_secs {
+        next.cache.min_ttl_secs = min_ttl_secs;
+    }
+    if let Some(max_ttl_secs) = req.max_ttl_secs {
+        next.cache.max_ttl_secs = max_ttl_secs;
+    }
+    if let Some(negative_max_ttl_secs) = req.negative_max_ttl_secs {
+        next.cache.negative_max_ttl_secs = negative_max_ttl_secs;
+    }
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "cache_update_rejected",
+            json!({ "op": "cache_update" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+    let (persisted, persist_error) = persist_or_report(&st);
+    let outcome = if persist_error.is_some() {
+        "applied_persist_failed"
+    } else {
+        "applied"
+    };
+    st.shared.record_config_event(
+        "cache_update",
+        json!({
+            "enabled": req.enabled,
+            "max_entries": req.max_entries,
+            "max_memory_bytes": req.max_memory_bytes,
+            "min_ttl_secs": req.min_ttl_secs,
+            "max_ttl_secs": req.max_ttl_secs,
+            "negative_max_ttl_secs": req.negative_max_ttl_secs,
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": outcome,
+        }),
+    );
+    let rt = st.shared.rt.load();
+    Ok(Json(json!({
+        "status": "ok",
+        "enabled": rt.cache.enabled,
+        "entries": st.shared.cache.len(),
+        "max_entries": rt.cache.max_entries,
+        "max_memory_bytes": rt.cache.max_memory_bytes,
+        "min_ttl_secs": rt.cache.min_ttl_secs,
+        "max_ttl_secs": rt.cache.max_ttl_secs,
+        "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
+        "memory_bytes": st.shared.cache.memory_bytes(),
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Health-check and selection policy configuration (read + write)
+// ---------------------------------------------------------------------------
+
+/// GET `/api/health/config`: the full `[health]` section as the dashboard
+/// edits it (the liveness probe stays at the open `/api/health` route).
+async fn get_health_config(State(st): State<ApiState>) -> Json<Value> {
+    let app = st.shared.app.load();
+    Json(json!({
+        "health": app.health,
+        "generation": st.shared.config_generation(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthConfigUpdateRequest {
+    enabled: Option<bool>,
+    interval_ms: Option<u64>,
+    timeout_ms: Option<u64>,
+    failure_threshold: Option<u32>,
+    recovery_threshold: Option<u32>,
+    min_successes: Option<usize>,
+    tcp_probes: Option<bool>,
+    probes: Option<Vec<crate::config::HealthProbe>>,
+    dwell_ms: Option<u64>,
+    generation: Option<u64>,
+}
+
+async fn put_health_config(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<AclPutQuery>,
+    Json(req): Json<HealthConfigUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "health_update")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation.or(q.generation), "health_update")?;
+
+    let mut next = AppConfig::clone(st.shared.app.load().as_ref());
+    let probes_updated = req.probes.is_some();
+    if let Some(v) = req.enabled {
+        next.health.enabled = v;
+    }
+    if let Some(v) = req.interval_ms {
+        next.health.interval_ms = v;
+    }
+    if let Some(v) = req.timeout_ms {
+        next.health.timeout_ms = v;
+    }
+    if let Some(v) = req.failure_threshold {
+        next.health.failure_threshold = v;
+    }
+    if let Some(v) = req.recovery_threshold {
+        next.health.recovery_threshold = v;
+    }
+    if let Some(v) = req.min_successes {
+        next.health.min_successes = v;
+    }
+    if let Some(v) = req.tcp_probes {
+        next.health.tcp_probes = v;
+    }
+    if let Some(v) = req.probes {
+        next.health.probes = v;
+    }
+    if let Some(v) = req.dwell_ms {
+        next.health.dwell_ms = v;
+    }
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "health_update_rejected",
+            json!({ "op": "health_update" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+    let (persisted, persist_error) = persist_or_report(&st);
+    let outcome = if persist_error.is_some() {
+        "applied_persist_failed"
+    } else {
+        "applied"
+    };
+    st.shared.record_config_event(
+        "health_update",
+        json!({
+            "enabled": req.enabled,
+            "interval_ms": req.interval_ms,
+            "timeout_ms": req.timeout_ms,
+            "probes": probes_updated,
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": outcome,
+        }),
+    );
+    Ok(Json(json!({
+        "status": "ok",
+        "health": st.shared.app.load().health,
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
+    })))
+}
+
+async fn get_selection(State(st): State<ApiState>) -> Json<Value> {
+    let app = st.shared.app.load();
+    Json(json!({
+        "selection": app.selection,
+        "generation": st.shared.config_generation(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectionConfigUpdateRequest {
+    strategy: Option<crate::config::SelectionStrategy>,
+    latency_reference_ms: Option<f64>,
+    tier_policy: Option<crate::config::TierPolicy>,
+    lower_tier_share: Option<f64>,
+    degraded_policy: Option<crate::config::DegradedPolicy>,
+    min_probe_samples: Option<u32>,
+    generation: Option<u64>,
+}
+
+async fn put_selection(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<AclPutQuery>,
+    Json(req): Json<SelectionConfigUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "selection_update")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation.or(q.generation), "selection_update")?;
+
+    let mut next = AppConfig::clone(st.shared.app.load().as_ref());
+    if let Some(v) = req.strategy {
+        next.selection.strategy = v;
+    }
+    if let Some(v) = req.latency_reference_ms {
+        next.selection.latency_reference_ms = v;
+    }
+    if let Some(v) = req.tier_policy {
+        next.selection.tier_policy = v;
+    }
+    if let Some(v) = req.lower_tier_share {
+        next.selection.lower_tier_share = v;
+    }
+    if let Some(v) = req.degraded_policy {
+        next.selection.degraded_policy = v;
+    }
+    if let Some(v) = req.min_probe_samples {
+        next.selection.min_probe_samples = v;
+    }
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "selection_update_rejected",
+            json!({ "op": "selection_update" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+    let (persisted, persist_error) = persist_or_report(&st);
+    let outcome = if persist_error.is_some() {
+        "applied_persist_failed"
+    } else {
+        "applied"
+    };
+    st.shared.record_config_event(
+        "selection_update",
+        json!({
+            "strategy": req.strategy,
+            "latency_reference_ms": req.latency_reference_ms,
+            "tier_policy": req.tier_policy,
+            "lower_tier_share": req.lower_tier_share,
+            "degraded_policy": req.degraded_policy,
+            "min_probe_samples": req.min_probe_samples,
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": outcome,
+        }),
+    );
+    let rt = st.shared.rt.load();
+    Ok(Json(json!({
+        "status": "ok",
+        "selection": rt.selection,
+        "persisted": persisted,
+        "persist_error": persist_error,
+        "generation": st.shared.config_generation(),
+    })))
+}
+
 async fn cached_probe(st: &ApiState, url: &str) -> (bool, Option<String>) {
     const TTL: Duration = Duration::from_secs(10);
     {
@@ -1163,6 +2612,19 @@ pub struct CreateUpstreamRequest {
     pub priority: Option<u32>,
     pub weight: Option<u32>,
     pub timeout_ms: Option<u64>,
+    /// Per-upstream health probe interval override (ms).
+    pub probe_interval_ms: Option<u64>,
+    /// Per-upstream health probe timeout override (ms).
+    pub probe_timeout_ms: Option<u64>,
+    /// Per-upstream probe list override (replaces `[health].probes`).
+    pub probes: Option<Vec<crate::config::HealthProbe>>,
+    /// Per-upstream expected rcode for health probes (`UpstreamConfig::expect_rcode`).
+    pub expect_rcode: Option<String>,
+    /// Accepted and ignored on create (the dashboard sends `confirm` on every
+    /// write; only updates/deletes need it). Typed here because
+    /// `deny_unknown_fields` would otherwise reject the panel's payload with
+    /// a 422 — the "Add upstream" button was broken by exactly that.
+    pub confirm: Option<bool>,
     /// Optional optimistic-concurrency guard: reject if the active
     /// configuration generation no longer matches.
     pub generation: Option<u64>,
@@ -1181,6 +2643,26 @@ pub struct UpdateUpstreamRequest {
     pub timeout_ms: Option<u64>,
     /// Explicitly clear the timeout override.
     pub clear_timeout: Option<bool>,
+    /// Per-upstream health probe interval override (ms).
+    pub probe_interval_ms: Option<u64>,
+    /// Per-upstream health probe timeout override (ms).
+    pub probe_timeout_ms: Option<u64>,
+    /// Explicitly clear the probe interval override (back to inheriting
+    /// `[health].interval`). Independent of `clear_probes`: wiping the probe
+    /// *list* must not silently delete the cadence overrides.
+    pub clear_probe_interval_ms: Option<bool>,
+    /// Explicitly clear the probe timeout override (back to inheriting
+    /// `[health].timeout`).
+    pub clear_probe_timeout_ms: Option<bool>,
+    /// Per-upstream probe list override (replaces `[health].probes`).
+    pub probes: Option<Vec<crate::config::HealthProbe>>,
+    /// Per-upstream expected rcode for health probes; validated against the
+    /// known rcode set by `UpstreamConfig::validate`.
+    pub expect_rcode: Option<String>,
+    /// Explicitly clear the `expect_rcode` override.
+    pub clear_expect_rcode: Option<bool>,
+    /// Explicitly clear the per-upstream probe overrides.
+    pub clear_probes: Option<bool>,
     /// Required when the update would disable the last enabled upstream.
     pub confirm: Option<bool>,
     /// Optional optimistic-concurrency guard (see `CreateUpstreamRequest`).
@@ -1210,19 +2692,25 @@ fn parse_address(s: &str) -> Result<IpAddr, ApiError> {
 async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
     use crate::upstream::HealthStatus;
 
+    let sel = st.shared.rt.load().selection.clone();
+    let latency_ref = sel.latency_reference_ms;
+    let min_probe_samples = sel.min_probe_samples;
     let rows: Vec<crate::upstream::UpstreamStats> = st
         .shared
         .registry
         .snapshot()
         .iter()
-        .map(|u| u.stats())
+        .map(|u| u.stats_with_latency_ref(latency_ref, min_probe_samples))
         .collect();
 
-    // Selection semantics (mirrors `selection.rs`): a DOWN upstream is scored
-    // 0 while any upstream is UP, so it is *kept* as a fallback but not used.
-    // With `degraded_policy = "last_resort"`, DEGRADED behaves like DOWN while
-    // any UP upstream exists.
-    let any_up = rows.iter().any(|r| r.health == HealthStatus::Up);
+    // Selection semantics (mirrors `selection.rs`): an UNHEALTHY upstream is
+    // scored 0 while any upstream is HEALTHY, so it is *kept* as a fallback
+    // but not used. RECOVERING is usable (scored between healthy and
+    // degraded). With `degraded_policy = "last_resort"`, DEGRADED behaves like
+    // UNHEALTHY while any HEALTHY/RECOVERING upstream exists.
+    let any_up = rows
+        .iter()
+        .any(|r| matches!(r.health, HealthStatus::Healthy | HealthStatus::Recovering));
     let degraded_last_resort =
         st.shared.rt.load().selection.degraded_policy == crate::config::DegradedPolicy::LastResort;
     let mut eligible = Vec::new();
@@ -1230,39 +2718,93 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
     let mut idle = Vec::new();
     let mut avoided = Vec::new();
     let mut disabled = Vec::new();
-    let (mut up, mut degraded, mut down) = (0usize, 0usize, 0usize);
+    let (mut up, mut degraded, mut recovering, mut down) = (0usize, 0usize, 0usize, 0usize);
     let mut sum_qps = 0.0f64;
 
-    let upstreams: Vec<Value> = rows
+    // First pass: classify, then rank eligible upstreams by composite score
+    // (descending) so operators can see why a given upstream wins or loses.
+    let classified: Vec<(Value, bool, f64, String)> = rows
         .iter()
         .map(|r| {
             let mut v = serde_json::to_value(r).expect("serializable");
             if !r.enabled {
                 disabled.push(r.name.clone());
                 v["eligible"] = Value::Bool(false);
-                return v;
+                return (v, false, 0.0, "disabled".into());
             }
             match r.health {
-                HealthStatus::Up => up += 1,
+                HealthStatus::Healthy => up += 1,
                 HealthStatus::Degraded => degraded += 1,
-                HealthStatus::Down => down += 1,
+                HealthStatus::Recovering => recovering += 1,
+                HealthStatus::Unhealthy => down += 1,
             }
             let is_eligible = match r.health {
-                HealthStatus::Up => true,
-                HealthStatus::Down => !any_up,
+                HealthStatus::Healthy | HealthStatus::Recovering => true,
+                HealthStatus::Unhealthy => !any_up,
                 HealthStatus::Degraded => !(any_up && degraded_last_resort),
             };
             v["eligible"] = Value::Bool(is_eligible);
             sum_qps += r.qps;
-            if is_eligible {
-                eligible.push(r.name.clone());
-                if r.in_use {
-                    in_use.push(r.name.clone());
-                } else {
-                    idle.push(r.name.clone());
+            let reason = if is_eligible {
+                match r.health {
+                    HealthStatus::Healthy => "healthy",
+                    HealthStatus::Recovering => "recovering",
+                    HealthStatus::Degraded => "degraded_usable",
+                    HealthStatus::Unhealthy => "unhealthy_last_resort",
                 }
             } else {
-                avoided.push(r.name.clone());
+                match r.health {
+                    HealthStatus::Degraded => "degraded_last_resort",
+                    HealthStatus::Unhealthy => "unhealthy_fallback",
+                    _ => "not_eligible",
+                }
+            };
+            (v, is_eligible, r.score.score, reason.into())
+        })
+        .collect();
+
+    // Rank eligible by score descending (stable: higher score first, ties
+    // broken by lower upstream id for determinism).
+    let mut order: Vec<usize> = classified
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, ok, _, _))| *ok)
+        .map(|(i, _)| i)
+        .collect();
+    order.sort_by(|&a, &b| {
+        classified[b]
+            .2
+            .partial_cmp(&classified[a].2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let id_a = classified[a].0["id"].as_i64().unwrap_or(i64::MAX);
+                let id_b = classified[b].0["id"].as_i64().unwrap_or(i64::MAX);
+                id_a.cmp(&id_b)
+            })
+    });
+    let mut ranks: HashMap<i64, u32> = HashMap::new();
+    for (rank, &idx) in order.iter().enumerate() {
+        let id = classified[idx].0["id"].as_i64().unwrap_or(0);
+        ranks.insert(id, rank as u32 + 1);
+    }
+
+    let upstreams: Vec<Value> = classified
+        .into_iter()
+        .map(|(mut v, is_eligible, score, reason)| {
+            let id = v["id"].as_i64().unwrap_or(0);
+            v["score"] = json!(score);
+            v["rank"] = ranks.get(&id).map_or(Value::Null, |r| json!(r));
+            v["reason"] = Value::String(reason);
+            if is_eligible {
+                eligible.push(v["name"].as_str().unwrap_or("").to_string());
+                let in_use_now = v["in_use"].as_bool().unwrap_or(false);
+                if in_use_now {
+                    in_use.push(v["name"].as_str().unwrap_or("").to_string());
+                } else {
+                    idle.push(v["name"].as_str().unwrap_or("").to_string());
+                }
+            } else if v["enabled"].as_bool().unwrap_or(true) {
+                avoided.push(v["name"].as_str().unwrap_or("").to_string());
             }
             v
         })
@@ -1273,8 +2815,14 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
         "generation": st.shared.config_generation(),
         "state": {
             "total": rows.len(),
+            // "up"/"down" are legacy aliases for healthy/unhealthy counts;
+            // the canonical per-state names are healthy/degraded/recovering/
+            // unhealthy (also present on each upstream's `health` field).
             "up": up,
+            "healthy": up,
             "degraded": degraded,
+            "recovering": recovering,
+            "unhealthy": down,
             "down": down,
             "disabled": disabled.len(),
             "eligible": eligible,
@@ -1283,7 +2831,7 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
             "avoided": avoided,
             "disabled_names": disabled,
             "total_qps": round2(sum_qps),
-            // Same rule as /api/status: no UP upstream while any exists.
+            // Same rule as /api/status: no HEALTHY upstream while any exists.
             "emergency": !rows.is_empty() && up == 0,
         },
     }))
@@ -1293,10 +2841,17 @@ async fn get_upstream(
     State(st): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiError> {
+    let sel = st.shared.rt.load().selection.clone();
     st.shared
         .registry
         .get(id)
-        .map(|u| Json(json!({ "upstream": serde_json::to_value(u.stats()).unwrap() })))
+        .map(|u| {
+            Json(json!({
+                "upstream": serde_json::to_value(
+                    u.stats_with_latency_ref(sel.latency_reference_ms, sel.min_probe_samples)
+                ).unwrap()
+            }))
+        })
         .ok_or_else(|| ApiError::NotFound(format!("upstream {id} not found")))
 }
 
@@ -1322,6 +2877,10 @@ async fn create_upstream(
         priority: req.priority.unwrap_or(1),
         weight: req.weight.unwrap_or(1),
         timeout_ms: req.timeout_ms,
+        probe_interval_ms: req.probe_interval_ms,
+        probe_timeout_ms: req.probe_timeout_ms,
+        probes: req.probes.clone(),
+        expect_rcode: req.expect_rcode.clone(),
     };
     candidate.validate().map_err(|e| {
         reject(
@@ -1365,11 +2924,17 @@ async fn create_upstream(
         }),
     );
 
+    let sel = st.shared.rt.load().selection.clone();
     let stats = st
         .shared
         .registry
         .get(next_id)
-        .map(|u| serde_json::to_value(u.stats()).unwrap())
+        .map(|u| {
+            serde_json::to_value(
+                u.stats_with_latency_ref(sel.latency_reference_ms, sel.min_probe_samples),
+            )
+            .unwrap()
+        })
         .unwrap_or(Value::Null);
     Ok((
         StatusCode::CREATED,
@@ -1426,6 +2991,26 @@ async fn patch_upstream(
         updated.timeout_ms = None;
     } else if let Some(t) = req.timeout_ms {
         updated.timeout_ms = Some(t);
+    }
+    if Some(true) == req.clear_expect_rcode {
+        updated.expect_rcode = None;
+    } else if let Some(rc) = &req.expect_rcode {
+        updated.expect_rcode = Some(rc.clone());
+    }
+    if Some(true) == req.clear_probes {
+        updated.probes = None;
+    } else if let Some(probes) = &req.probes {
+        updated.probes = Some(probes.clone());
+    }
+    if Some(true) == req.clear_probe_interval_ms {
+        updated.probe_interval_ms = None;
+    } else if let Some(t) = req.probe_interval_ms {
+        updated.probe_interval_ms = Some(t);
+    }
+    if Some(true) == req.clear_probe_timeout_ms {
+        updated.probe_timeout_ms = None;
+    } else if let Some(t) = req.probe_timeout_ms {
+        updated.probe_timeout_ms = Some(t);
     }
     updated.validate().map_err(|e| {
         reject(
@@ -1486,11 +3071,17 @@ async fn patch_upstream(
         }),
     );
 
+    let sel = st.shared.rt.load().selection.clone();
     let stats = st
         .shared
         .registry
         .get(id)
-        .map(|u| serde_json::to_value(u.stats()).unwrap())
+        .map(|u| {
+            serde_json::to_value(
+                u.stats_with_latency_ref(sel.latency_reference_ms, sel.min_probe_samples),
+            )
+            .unwrap()
+        })
         .unwrap_or(Value::Null);
     Ok(Json(json!({
         "upstream": stats,

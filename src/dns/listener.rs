@@ -105,12 +105,25 @@ pub async fn run_udp(
                         set.spawn(async move {
                             let _guard = guard;
                             if let Some(resp) = pipeline.handle(peer, Transport::Udp, data).await {
-                                if sock.send_to(&resp, peer).await.is_ok() {
-                                    pipeline.shared.metrics.udp_packets_sent_total.inc();
-                                    pipeline
-                                        .shared
-                                        .metrics
-                                        .observe_response_bytes(resp.len());
+                                match sock.send_to(&resp, peer).await {
+                                    Ok(_) => {
+                                        pipeline.shared.metrics.udp_packets_sent_total.inc();
+                                        pipeline
+                                            .shared
+                                            .metrics
+                                            .observe_response_bytes(resp.len());
+                                    }
+                                    Err(e) => {
+                                        // Never swallow a failed reply: without
+                                        // this counter a broken client route is
+                                        // invisible (queries look served).
+                                        pipeline.shared.metrics.udp_send_errors_total.inc();
+                                        tracing::debug!(
+                                            event = "udp_send_failed",
+                                            error = %e,
+                                            client = %pipeline.shared.client_label(peer.ip()),
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -318,5 +331,289 @@ async fn drain(mut set: JoinSet<()>, shared: &Arc<crate::shared::Shared>) {
         tracing::warn!(event = "drain_timeout_aborting_inflight");
         let mut set = set;
         set.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::AppConfig;
+    use crate::dns::msg::{self, Rcode};
+
+    /// Poll a condition for up to ~2s (metrics are written by sibling tasks).
+    async fn wait_for(mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition not met within 2s");
+    }
+
+    async fn start_udp(
+        app: AppConfig,
+    ) -> (
+        Arc<Pipeline>,
+        SocketAddr,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let shared = crate::shared::Shared::new(app).expect("shared state");
+        let inflight = Arc::clone(&shared.udp_inflight);
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind udp"));
+        let addr = sock.local_addr().expect("udp addr");
+        let pipeline = Pipeline::new(shared);
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(run_udp(sock, Arc::clone(&pipeline), inflight, rx));
+        (pipeline, addr, tx, task)
+    }
+
+    async fn start_tcp(
+        app: AppConfig,
+    ) -> (
+        Arc<Pipeline>,
+        SocketAddr,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let shared = crate::shared::Shared::new(app).expect("shared state");
+        let connections = Arc::clone(&shared.tcp_connections);
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind tcp"));
+        let addr = listener.local_addr().expect("tcp addr");
+        let pipeline = Pipeline::new(shared);
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(run_tcp(listener, Arc::clone(&pipeline), connections, rx));
+        (pipeline, addr, tx, task)
+    }
+
+    async fn stop(tx: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) {
+        let _ = tx.send(true);
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .expect("listener must stop after shutdown")
+            .expect("listener task must not panic");
+    }
+
+    async fn udp_ask(addr: SocketAddr, raw: &[u8], wait: Duration) -> Option<Vec<u8>> {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        sock.connect(addr).await.expect("connect");
+        sock.send(raw).await.expect("send");
+        let mut buf = vec![0u8; 65_535];
+        match timeout(wait, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => Some(buf[..n].to_vec()),
+            _ => None,
+        }
+    }
+
+    async fn tcp_write(stream: &mut TcpStream, raw: &[u8]) {
+        let mut frame = Vec::with_capacity(2 + raw.len());
+        frame.extend_from_slice(&(raw.len() as u16).to_be_bytes());
+        frame.extend_from_slice(raw);
+        stream.write_all(&frame).await.expect("tcp write");
+    }
+
+    async fn tcp_read(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await?;
+        let len = usize::from(u16::from_be_bytes(len_buf));
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await?;
+        Ok(body)
+    }
+
+    #[test]
+    fn counter_acquires_up_to_max_then_rejects() {
+        let c = Arc::new(Counter::default());
+        let g1 = c.try_acquire(2).expect("first slot");
+        let g2 = c.try_acquire(2).expect("second slot");
+        assert!(c.try_acquire(2).is_none(), "max reached");
+        assert_eq!(c.current(), 2);
+        drop(g1);
+        assert_eq!(c.current(), 1, "guard must release on drop");
+        let g3 = c.try_acquire(2).expect("slot freed");
+        assert_eq!(c.current(), 2);
+        drop(g2);
+        drop(g3);
+        assert_eq!(c.current(), 0);
+    }
+
+    #[tokio::test]
+    async fn udp_listener_replies_servfail_without_upstreams() {
+        let (pipeline, addr, tx, task) = start_udp(AppConfig::default()).await;
+
+        let raw = msg::build_query("example.com", "A").expect("query");
+        let id = msg::parse_query(&raw).expect("parse query").id;
+        let out = udp_ask(addr, &raw, Duration::from_secs(2))
+            .await
+            .expect("udp reply");
+        let view = msg::parse_response(&out).expect("parse reply");
+        assert_eq!(view.rcode, Rcode::ServFail);
+        assert_eq!(view.id, id);
+
+        assert_eq!(pipeline.shared.metrics.udp_packets_received_total.get(), 1);
+        wait_for(|| pipeline.shared.metrics.udp_packets_sent_total.get() == 1).await;
+
+        stop(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_packets_are_dropped_silently() {
+        let mut app = AppConfig::default();
+        app.server.max_udp_packet_size = 512;
+        let (pipeline, addr, tx, task) = start_udp(app).await;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+        sock.connect(addr).await.expect("connect");
+        sock.send(&vec![0u8; 600]).await.expect("send junk");
+
+        // The oversized datagram must produce no response at all.
+        let mut buf = [0u8; 64];
+        assert!(
+            timeout(Duration::from_millis(300), sock.recv(&mut buf))
+                .await
+                .is_err(),
+            "oversized packet must not be answered"
+        );
+        assert_eq!(pipeline.shared.metrics.oversized_packets_total.get(), 1);
+
+        // The listener must still serve normal queries.
+        let raw = msg::build_query("example.com", "A").expect("query");
+        sock.send(&raw).await.expect("send query");
+        let n = timeout(Duration::from_secs(2), sock.recv(&mut buf))
+            .await
+            .expect("valid query must be answered")
+            .expect("valid query reply");
+        let view = msg::parse_response(&buf[..n]).expect("parse reply");
+        assert_eq!(view.rcode, Rcode::ServFail);
+        assert_eq!(pipeline.shared.metrics.udp_packets_received_total.get(), 2);
+
+        stop(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn udp_overload_sheds_load_when_inflight_is_saturated() {
+        let mut app = AppConfig::default();
+        app.server.max_inflight_udp = 1;
+        let (pipeline, addr, tx, task) = start_udp(app).await;
+
+        // Occupy the single in-flight slot, as a slow query would.
+        let held = pipeline
+            .shared
+            .udp_inflight
+            .try_acquire(1)
+            .expect("hold the slot");
+
+        let raw = msg::build_query("example.com", "A").expect("query");
+        assert!(
+            udp_ask(addr, &raw, Duration::from_millis(300))
+                .await
+                .is_none(),
+            "saturated listener must shed the query"
+        );
+        assert_eq!(pipeline.shared.metrics.overload_dropped_total.get(), 1);
+
+        drop(held);
+        let out = udp_ask(addr, &raw, Duration::from_secs(2))
+            .await
+            .expect("served after load shedding");
+        let view = msg::parse_response(&out).expect("parse reply");
+        assert_eq!(view.rcode, Rcode::ServFail);
+
+        stop(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_serves_length_prefixed_frames() {
+        let (pipeline, addr, tx, task) = start_tcp(AppConfig::default()).await;
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let raw = msg::build_query("example.com", "A").expect("query");
+        let id = msg::parse_query(&raw).expect("parse query").id;
+        tcp_write(&mut stream, &raw).await;
+        let body = timeout(Duration::from_secs(2), tcp_read(&mut stream))
+            .await
+            .expect("tcp reply must arrive")
+            .expect("tcp reply bytes");
+        let view = msg::parse_response(&body).expect("parse reply");
+        assert_eq!(view.rcode, Rcode::ServFail);
+        assert_eq!(view.id, id);
+        assert_eq!(pipeline.shared.metrics.tcp_connections_total.get(), 1);
+
+        drop(stream);
+        stop(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_connection_limit_rejects_excess_connections() {
+        let mut app = AppConfig::default();
+        app.server.max_tcp_connections = 1;
+        let (pipeline, addr, tx, task) = start_tcp(app).await;
+
+        // First connection is accepted and served (its handler keeps the
+        // only slot occupied while it waits for the next frame).
+        let mut first = TcpStream::connect(addr).await.expect("connect first");
+        let raw = msg::build_query("example.com", "A").expect("query");
+        tcp_write(&mut first, &raw).await;
+        let body = timeout(Duration::from_secs(2), tcp_read(&mut first))
+            .await
+            .expect("first reply")
+            .expect("first reply bytes");
+        assert_eq!(
+            msg::parse_response(&body).expect("parse").rcode,
+            Rcode::ServFail
+        );
+        assert_eq!(pipeline.shared.metrics.tcp_connections_total.get(), 1);
+
+        // Second connection exceeds the limit: accepted but immediately
+        // dropped, so the client sees EOF without a single byte.
+        let mut second = TcpStream::connect(addr).await.expect("connect second");
+        let mut len_buf = [0u8; 2];
+        let read = timeout(Duration::from_secs(2), second.read_exact(&mut len_buf)).await;
+        assert!(
+            matches!(&read, Ok(Err(_))),
+            "rejected connection must see immediate EOF, got {read:?}"
+        );
+        assert_eq!(
+            pipeline.shared.metrics.tcp_connections_rejected_total.get(),
+            1
+        );
+        assert_eq!(pipeline.shared.metrics.tcp_connections_total.get(), 1);
+
+        drop(first);
+        drop(second);
+        stop(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn tcp_connection_closes_after_max_queries() {
+        let mut app = AppConfig::default();
+        app.server.max_queries_per_tcp_conn = 1;
+        let (pipeline, addr, tx, task) = start_tcp(app).await;
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let raw = msg::build_query("example.com", "A").expect("query");
+        tcp_write(&mut stream, &raw).await;
+        let body = timeout(Duration::from_secs(2), tcp_read(&mut stream))
+            .await
+            .expect("first reply")
+            .expect("first reply bytes");
+        assert_eq!(
+            msg::parse_response(&body).expect("parse").rcode,
+            Rcode::ServFail
+        );
+
+        // The server must close the connection instead of serving a second
+        // query: the next read observes EOF.
+        let read = timeout(Duration::from_secs(2), tcp_read(&mut stream)).await;
+        assert!(
+            matches!(&read, Ok(Err(_))),
+            "connection must close after max_queries_per_tcp_conn, got {read:?}"
+        );
+        assert_eq!(pipeline.shared.metrics.tcp_connections_total.get(), 1);
+
+        drop(stream);
+        stop(tx, task).await;
     }
 }

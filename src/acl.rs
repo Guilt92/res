@@ -3,24 +3,95 @@
 //! Evaluation happens before any forwarding work. The rules are fail-closed:
 //! an empty allow list denies everything, so an unconfigured res instance
 //! can never become an open resolver.
+//!
+//! Configuration supports two shapes:
+//!
+//! * **Entries** (preferred): `[[acl.entries]]` rows with `cidr`, `action`
+//!   (`allow`/`deny`) and `enabled`. Disabled entries are retained but never
+//!   evaluated. Bare IPv4/IPv6 addresses are accepted and normalised to host
+//!   CIDRs (`/32`, `/128`).
+//! * **Legacy lists** (still accepted on load): `allowed_cidrs` / `denied_cidrs`
+//!   string arrays. Used only when `entries` is empty; synthesised into
+//!   always-enabled entries.
+//!
+//! Duplicate entries and the same network appearing in both an allow and a
+//! deny entry are rejected at parse time (conflict), never silently resolved.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+/// Action of one ACL entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AclAction {
+    Allow,
+    Deny,
+}
+
+impl AclAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AclAction::Allow => "allow",
+            AclAction::Deny => "deny",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One structured ACL entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclEntry {
+    /// Stable identifier. Derived from `action:cidr` on legacy import and on
+    /// first parse; preserved across edits of other fields.
+    #[serde(default)]
+    pub id: String,
+    /// CIDR network or bare IPv4/IPv6 address.
+    pub cidr: String,
+    /// Allow or deny clients matching `cidr`.
+    pub action: AclAction,
+    /// Disabled entries stay in the configuration but are never evaluated.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl AclEntry {
+    /// Canonical content-derived id (`allow:10.0.0.0/8`).
+    pub fn derive_id(action: AclAction, cidr: &str) -> String {
+        format!("{}:{}", action.as_str(), cidr.trim())
+    }
+
+    /// Ensure the entry has a stable id (assign one when missing).
+    pub fn with_derived_id(mut self) -> Self {
+        if self.id.is_empty() {
+            self.id = Self::derive_id(self.action, &self.cidr);
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AclConfig {
-    /// Networks allowed to use the resolver. Empty = deny everyone.
+    /// Structured entries (preferred). When non-empty this list is
+    /// authoritative and the legacy fields are ignored.
+    pub entries: Vec<AclEntry>,
+    /// Legacy flat allow list (used only when `entries` is empty).
     pub allowed_cidrs: Vec<String>,
-    /// Networks always denied (evaluated first).
+    /// Legacy flat deny list (used only when `entries` is empty).
     pub denied_cidrs: Vec<String>,
 }
 
 impl Default for AclConfig {
     fn default() -> Self {
         Self {
+            entries: Vec::new(),
             allowed_cidrs: vec![
                 "127.0.0.0/8".into(),
                 "::1/128".into(),
@@ -35,10 +106,75 @@ impl Default for AclConfig {
     }
 }
 
+impl AclConfig {
+    /// Effective entries: the structured list when present, otherwise the
+    /// legacy lists synthesised into always-enabled entries (ids derived).
+    pub fn effective_entries(&self) -> Vec<AclEntry> {
+        if !self.entries.is_empty() {
+            return self
+                .entries
+                .iter()
+                .map(|e| e.clone().with_derived_id())
+                .collect();
+        }
+        let mut out = Vec::with_capacity(self.allowed_cidrs.len() + self.denied_cidrs.len());
+        for s in &self.allowed_cidrs {
+            out.push(
+                AclEntry {
+                    id: String::new(),
+                    cidr: s.clone(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                }
+                .with_derived_id(),
+            );
+        }
+        for s in &self.denied_cidrs {
+            out.push(
+                AclEntry {
+                    id: String::new(),
+                    cidr: s.clone(),
+                    action: AclAction::Deny,
+                    enabled: true,
+                }
+                .with_derived_id(),
+            );
+        }
+        out
+    }
+
+    /// Replace the configuration with a structured entry list, clearing the
+    /// legacy fields so only one format is ever serialised.
+    pub fn set_entries(&mut self, entries: Vec<AclEntry>) {
+        self.entries = entries.into_iter().map(AclEntry::with_derived_id).collect();
+        self.allowed_cidrs.clear();
+        self.denied_cidrs.clear();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclDecision {
     Allow,
     Deny,
+}
+
+/// Parse a CIDR network or bare IPv4/IPv6 address into a host/network CIDR.
+pub fn normalize_cidr(s: &str) -> Result<IpNet, String> {
+    let t = s.trim();
+    if let Ok(net) = t.parse::<IpNet>() {
+        return Ok(net);
+    }
+    if let Ok(ip) = t.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => Ok(IpNet::V4(
+                ipnet::Ipv4Net::new(v4, 32).map_err(|e| format!("invalid host '{s}': {e}"))?,
+            )),
+            IpAddr::V6(v6) => Ok(IpNet::V6(
+                ipnet::Ipv6Net::new(v6, 128).map_err(|e| format!("invalid host '{s}': {e}"))?,
+            )),
+        };
+    }
+    Err(format!("invalid CIDR or IP address '{s}'"))
 }
 
 /// Parsed, ready-to-evaluate ACL (built once per configuration swap).
@@ -50,19 +186,56 @@ pub struct AclRules {
 
 impl AclRules {
     pub fn parse(cfg: &AclConfig) -> Result<Self, String> {
-        let parse_list = |list: &[String], what: &str| -> Result<Vec<IpNet>, String> {
-            list.iter()
-                .map(|s| {
-                    s.trim()
-                        .parse::<IpNet>()
-                        .map_err(|e| format!("invalid {what} CIDR '{s}': {e}"))
-                })
-                .collect()
-        };
-        Ok(Self {
-            allowed: parse_list(&cfg.allowed_cidrs, "allowed")?,
-            denied: parse_list(&cfg.denied_cidrs, "denied")?,
-        })
+        let entries = cfg.effective_entries();
+
+        // Conflict / duplicate validation before any evaluation data is built.
+        let mut seen: HashSet<(AclAction, String)> = HashSet::new();
+        let mut allow_nets: HashSet<IpNet> = HashSet::new();
+        let mut deny_nets: HashSet<IpNet> = HashSet::new();
+        for e in &entries {
+            let net = normalize_cidr(&e.cidr)?;
+            let key = (e.action, net.to_string());
+            if !seen.insert(key) {
+                return Err(format!(
+                    "duplicate ACL entry: {} {}",
+                    e.action.as_str(),
+                    net
+                ));
+            }
+            match e.action {
+                AclAction::Allow => {
+                    if deny_nets.contains(&net) {
+                        return Err(format!(
+                            "ACL conflict: {net} appears in both an allow and a deny entry"
+                        ));
+                    }
+                    allow_nets.insert(net);
+                }
+                AclAction::Deny => {
+                    if allow_nets.contains(&net) {
+                        return Err(format!(
+                            "ACL conflict: {net} appears in both an allow and a deny entry"
+                        ));
+                    }
+                    deny_nets.insert(net);
+                }
+            }
+        }
+
+        let mut allowed = Vec::new();
+        let mut denied = Vec::new();
+        for e in &entries {
+            if !e.enabled {
+                continue;
+            }
+            // Re-parse (cheap; validation already succeeded above).
+            let net = normalize_cidr(&e.cidr)?;
+            match e.action {
+                AclAction::Allow => allowed.push(net),
+                AclAction::Deny => denied.push(net),
+            }
+        }
+        Ok(Self { allowed, denied })
     }
 
     pub fn decide(&self, client: IpAddr) -> AclDecision {
@@ -120,6 +293,7 @@ mod tests {
 
     fn rules(allowed: &[&str], denied: &[&str]) -> AclRules {
         AclRules::parse(&AclConfig {
+            entries: Vec::new(),
             allowed_cidrs: allowed.iter().map(|s| s.to_string()).collect(),
             denied_cidrs: denied.iter().map(|s| s.to_string()).collect(),
         })
@@ -158,15 +332,139 @@ mod tests {
     #[test]
     fn invalid_cidr_rejected() {
         let cfg = AclConfig {
+            entries: Vec::new(),
             allowed_cidrs: vec!["10.0.0.0/99".into()],
             denied_cidrs: vec![],
         };
         assert!(AclRules::parse(&cfg).is_err());
         let cfg = AclConfig {
-            allowed_cidrs: vec!["10.0.0.0".into()],
+            entries: Vec::new(),
+            allowed_cidrs: vec!["not-a-thing".into()],
             denied_cidrs: vec![],
         };
         assert!(AclRules::parse(&cfg).is_err());
+    }
+
+    #[test]
+    fn bare_ip_is_accepted_and_normalised() {
+        let r = rules(&["192.0.2.10"], &[]);
+        assert_eq!(r.decide(ip("192.0.2.10")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("192.0.2.11")), AclDecision::Deny);
+        let r = rules(&["2001:db8::5"], &[]);
+        assert_eq!(r.decide(ip("2001:db8::5")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("2001:db8::6")), AclDecision::Deny);
+    }
+
+    #[test]
+    fn duplicate_entries_rejected() {
+        let cfg = AclConfig {
+            entries: vec![
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                },
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                },
+            ],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        let err = AclRules::parse(&cfg).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn allow_deny_conflict_rejected() {
+        let cfg = AclConfig {
+            entries: vec![
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                },
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Deny,
+                    enabled: true,
+                },
+            ],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        let err = AclRules::parse(&cfg).unwrap_err();
+        assert!(err.contains("conflict"), "{err}");
+    }
+
+    #[test]
+    fn disabled_entries_are_not_evaluated() {
+        let cfg = AclConfig {
+            entries: vec![
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Allow,
+                    enabled: false, // disabled: not evaluated
+                },
+                AclEntry {
+                    id: String::new(),
+                    cidr: "192.0.2.0/24".into(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                },
+            ],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        let r = AclRules::parse(&cfg).unwrap();
+        assert_eq!(r.allowed_count(), 1);
+        assert_eq!(r.decide(ip("10.1.2.3")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("192.0.2.5")), AclDecision::Allow);
+    }
+
+    #[test]
+    fn entries_take_precedence_over_legacy_lists() {
+        let cfg = AclConfig {
+            entries: vec![AclEntry {
+                id: String::new(),
+                cidr: "203.0.113.0/24".into(),
+                action: AclAction::Allow,
+                enabled: true,
+            }],
+            allowed_cidrs: vec!["10.0.0.0/8".into()],
+            denied_cidrs: vec![],
+        };
+        let r = AclRules::parse(&cfg).unwrap();
+        assert_eq!(r.allowed_count(), 1);
+        assert_eq!(r.decide(ip("203.0.113.1")), AclDecision::Allow);
+        assert_eq!(
+            r.decide(ip("10.1.2.3")),
+            AclDecision::Deny,
+            "legacy ignored"
+        );
+    }
+
+    #[test]
+    fn set_entries_clears_legacy_fields() {
+        let mut cfg = AclConfig::default();
+        assert!(!cfg.allowed_cidrs.is_empty());
+        cfg.set_entries(vec![AclEntry {
+            id: String::new(),
+            cidr: "192.0.2.1".into(),
+            action: AclAction::Allow,
+            enabled: true,
+        }]);
+        assert!(cfg.allowed_cidrs.is_empty());
+        assert!(cfg.denied_cidrs.is_empty());
+        assert_eq!(cfg.entries.len(), 1);
+        assert!(!cfg.entries[0].id.is_empty(), "id derived on set");
     }
 
     #[test]

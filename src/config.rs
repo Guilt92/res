@@ -132,6 +132,18 @@ pub struct UpstreamConfig {
     pub weight: u32,
     /// Optional per-upstream timeout override (milliseconds).
     pub timeout_ms: Option<u64>,
+    /// Optional per-upstream health-check interval override (milliseconds).
+    /// When set, this upstream is probed on its own schedule instead of the
+    /// global `[health].interval`.
+    pub probe_interval_ms: Option<u64>,
+    /// Optional per-upstream health-probe timeout override (milliseconds).
+    pub probe_timeout_ms: Option<u64>,
+    /// Optional per-upstream probe queries. When set, replaces the global
+    /// `[health].probes` list for this upstream only.
+    pub probes: Option<Vec<HealthProbe>>,
+    /// Optional required rcode for a probe to count as success (e.g.
+    /// "NOERROR"). When unset, both NOERROR and NXDOMAIN count as success.
+    pub expect_rcode: Option<String>,
 }
 
 impl Default for UpstreamConfig {
@@ -146,6 +158,10 @@ impl Default for UpstreamConfig {
             priority: 1,
             weight: 1,
             timeout_ms: None,
+            probe_interval_ms: None,
+            probe_timeout_ms: None,
+            probes: None,
+            expect_rcode: None,
         }
     }
 }
@@ -192,7 +208,136 @@ impl UpstreamConfig {
                 ));
             }
         }
+        if let Some(t) = self.probe_interval_ms {
+            if !(100..=600_000).contains(&t) {
+                return Err(format!(
+                    "upstream '{}' probe_interval_ms must be in 100..=600000",
+                    self.name
+                ));
+            }
+        }
+        if let Some(t) = self.probe_timeout_ms {
+            if t == 0 || t > 60_000 {
+                return Err(format!(
+                    "upstream '{}' probe_timeout_ms must be in 1..=60000",
+                    self.name
+                ));
+            }
+        }
+        if let Some(probes) = &self.probes {
+            if probes.is_empty() {
+                return Err(format!(
+                    "upstream '{}' probes must not be empty when set",
+                    self.name
+                ));
+            }
+            for p in probes {
+                crate::dns::msg::parse_record_type(&p.query_type).map_err(|e| {
+                    format!(
+                        "upstream '{}' probe type '{}': {e}",
+                        self.name, p.query_type
+                    )
+                })?;
+            }
+        }
+        if let Some(rc) = &self.expect_rcode {
+            if crate::dns::msg::parse_rcode(rc).is_none() {
+                return Err(format!(
+                    "upstream '{}' expect_rcode '{rc}' is not a known rcode (NOERROR, NXDOMAIN, SERVFAIL, REFUSED, ...)",
+                    self.name
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Effective probe list: per-upstream override, else the global default.
+    pub fn effective_probes(&self, global: &[HealthProbe]) -> Vec<HealthProbe> {
+        match &self.probes {
+            Some(p) if !p.is_empty() => p.clone(),
+            _ => global.to_vec(),
+        }
+    }
+
+    /// Effective probe interval: per-upstream override, else the global value.
+    pub fn effective_probe_interval_ms(&self, global_ms: u64) -> u64 {
+        self.probe_interval_ms.unwrap_or(global_ms)
+    }
+
+    /// Effective probe timeout: per-upstream override, else the global value.
+    pub fn effective_probe_timeout_ms(&self, global_ms: u64) -> u64 {
+        self.probe_timeout_ms.unwrap_or(global_ms)
+    }
+
+    /// Required rcode for probe success (`None` = NOERROR or NXDOMAIN).
+    pub fn expected_probe_rcode(&self) -> Option<crate::dns::msg::Rcode> {
+        self.expect_rcode
+            .as_deref()
+            .and_then(crate::dns::msg::parse_rcode)
+    }
+}
+
+/// Control-plane authentication policy (passwords themselves live in the
+/// environment or a mode-0600 credentials file — never in this struct's
+/// serialized form).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// Username of the full-privilege account.
+    pub username: String,
+    /// Username of the read-only account.
+    pub viewer_username: String,
+    /// Session lifetime; expired sessions are rejected and dropped.
+    #[serde(rename = "session_ttl", with = "duration_ms")]
+    pub session_ttl_ms: u64,
+    /// Failed logins per account within `lockout_window` before lockout.
+    pub max_failed_attempts: u32,
+    /// Sliding window over which failures are counted.
+    #[serde(rename = "lockout_window", with = "duration_ms")]
+    pub lockout_window_ms: u64,
+    /// How long a locked account rejects logins.
+    #[serde(rename = "lockout_duration", with = "duration_ms")]
+    pub lockout_duration_ms: u64,
+    /// Require authentication for the Prometheus /metrics endpoint (default:
+    /// open, since Prometheus scrapes without session cookies).
+    pub protect_metrics: bool,
+    /// Mark session/CSRF cookies `Secure` (HTTPS-only). Enable when the
+    /// management API is served over TLS; leave off for plain-HTTP LAN
+    /// deployments (a startup warning is emitted when auth is enabled on a
+    /// non-loopback address without this flag).
+    pub secure_cookies: bool,
+    /// Maximum login attempts per client IP per minute (0 disables the
+    /// per-IP limiter; per-username lockout still applies).
+    pub login_rate_limit_per_minute: u32,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            username: "admin".into(),
+            viewer_username: "viewer".into(),
+            session_ttl_ms: 12 * 60 * 60 * 1000,
+            max_failed_attempts: 5,
+            lockout_window_ms: 15 * 60 * 1000,
+            lockout_duration_ms: 15 * 60 * 1000,
+            protect_metrics: false,
+            secure_cookies: false,
+            login_rate_limit_per_minute: 30,
+        }
+    }
+}
+
+impl AuthConfig {
+    pub fn session_ttl(&self) -> Duration {
+        Duration::from_millis(self.session_ttl_ms)
+    }
+
+    pub fn lockout_window_ms_duration(&self) -> Duration {
+        Duration::from_millis(self.lockout_window_ms)
+    }
+
+    pub fn lockout_duration_ms_duration(&self) -> Duration {
+        Duration::from_millis(self.lockout_duration_ms)
     }
 }
 
@@ -251,6 +396,18 @@ impl Default for ServerConfig {
     }
 }
 
+/// Policy for `ANY` (type 255) questions. RFC 8482: a resolver may refuse
+/// `ANY` with NOTIMP or a minimal response instead of amplifying traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnyPolicy {
+    /// Forward `ANY` queries to upstreams like any other type (default).
+    #[default]
+    Forward,
+    /// Refuse `ANY` locally with NOTIMP (RFC 8482).
+    Refuse,
+}
+
 /// Query timeouts and attempt budget for one client request (§36: every
 /// attempt shares a single overall deadline).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +422,9 @@ pub struct QueryConfig {
     pub upstream_timeout_ms: u64,
     /// Maximum upstream attempts for one client query (including the first).
     pub max_attempts: u32,
+    /// How to handle `ANY` queries: forward them upstream (default) or refuse
+    /// locally with NOTIMP per RFC 8482 (anti-amplification).
+    pub any_policy: AnyPolicy,
 }
 
 impl Default for QueryConfig {
@@ -273,6 +433,7 @@ impl Default for QueryConfig {
             timeout_ms: 2_000,
             upstream_timeout_ms: 500,
             max_attempts: 3,
+            any_policy: AnyPolicy::Forward,
         }
     }
 }
@@ -317,9 +478,14 @@ pub struct HealthConfig {
     pub tcp_probes: bool,
     /// Probe queries, e.g. `A example.com`.
     pub probes: Vec<HealthProbe>,
+    /// Anti-flap: after a transition to a worse state, improvements are held
+    /// back for this long (probes still run, metrics still update). Worsening
+    /// transitions are never delayed. `0` disables the cooldown.
+    #[serde(rename = "dwell", with = "duration_ms")]
+    pub dwell_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HealthProbe {
     pub name: String,
@@ -360,6 +526,9 @@ impl Default for HealthConfig {
                     query_type: "NS".into(),
                 },
             ],
+            // Default anti-flap: hold improvements for 5s after a worsening
+            // transition; failures are never delayed.
+            dwell_ms: 5_000,
         }
     }
 }
@@ -417,6 +586,10 @@ pub struct SelectionConfig {
     pub lower_tier_share: f64,
     /// Degraded upstreams are always usable, or only a last resort.
     pub degraded_policy: DegradedPolicy,
+    /// Minimum completed health-check rounds before the probe success rate
+    /// enters the score. Below this the probe term is neutral (1.0) so a
+    /// freshly started upstream is not penalised for having no probe history.
+    pub min_probe_samples: u32,
 }
 
 impl Default for SelectionConfig {
@@ -427,6 +600,7 @@ impl Default for SelectionConfig {
             tier_policy: TierPolicy::Strict,
             lower_tier_share: 0.0,
             degraded_policy: DegradedPolicy::Usable,
+            min_probe_samples: 3,
         }
     }
 }
@@ -438,6 +612,10 @@ pub struct CacheConfig {
     pub enabled: bool,
     /// Hard cap on cached entries (bounded memory).
     pub max_entries: usize,
+    /// Hard cap on cached payload bytes (entries + per-entry overhead).
+    /// Count-only bounding cannot bound memory: `max_entries` × up-to-64KiB
+    /// responses could otherwise grow to hundreds of MiB.
+    pub max_memory_bytes: usize,
     /// Cacheability threshold: responses whose minimum TTL is *below* this
     /// value are not cached at all (TTLs are never extended upwards).
     pub min_ttl_secs: u64,
@@ -452,6 +630,7 @@ impl Default for CacheConfig {
         Self {
             enabled: true,
             max_entries: 4096,
+            max_memory_bytes: 33_554_432, // 32 MiB
             min_ttl_secs: 0,
             max_ttl_secs: 3600,
             negative_max_ttl_secs: 30,
@@ -593,6 +772,7 @@ impl MonitoringConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AppConfig {
     pub server: ServerConfig,
+    pub auth: AuthConfig,
     pub query: QueryConfig,
     pub acl: AclConfig,
     pub ratelimit: RateLimitConfig,
@@ -721,6 +901,16 @@ impl AppConfig {
         if self.server.max_tcp_connections == 0 {
             return Err("server.max_tcp_connections must be > 0".into());
         }
+        // Bounded scale: each upstream carries runtime state, probe tasks,
+        // metric vectors and selector entries — an accidental 10k-entry list
+        // (or a hostile config push) must fail validation, not OOM.
+        const MAX_UPSTREAMS: usize = 1024;
+        if self.upstreams.len() > MAX_UPSTREAMS {
+            return Err(format!(
+                "too many upstreams: {} (max {MAX_UPSTREAMS})",
+                self.upstreams.len()
+            ));
+        }
         // Port 0 is allowed: the OS assigns an ephemeral port (used by the
         // integration tests); the bound addresses are reported via /api/status.
         AclRules::parse(&self.acl)?;
@@ -756,25 +946,27 @@ impl AppConfig {
             return Err("query.timeout must be >= query.upstream_timeout".into());
         }
 
-        if self.health.enabled {
-            if self.health.interval_ms < 100 {
-                return Err("health.interval must be >= 100ms".into());
-            }
-            if self.health.timeout_ms == 0 {
-                return Err("health.timeout must be > 0".into());
-            }
-            if self.health.failure_threshold == 0 || self.health.recovery_threshold == 0 {
-                return Err("health failure/recovery thresholds must be >= 1".into());
-            }
-            if self.health.probes.is_empty() {
-                return Err(
-                    "health.probes must not be empty when health checks are enabled".into(),
-                );
-            }
-            for p in &self.health.probes {
-                crate::dns::msg::parse_record_type(&p.query_type)
-                    .map_err(|e| format!("health probe type '{}': {e}", p.query_type))?;
-            }
+        // Health bounds hold even while checks are off: nonsense must
+        // never be persisted, then bite the moment someone flips
+        // `enabled` (same reasoning as the cache bounds below).
+        if self.health.interval_ms < 100 {
+            return Err("health.interval must be >= 100ms".into());
+        }
+        if self.health.timeout_ms == 0 {
+            return Err("health.timeout must be > 0".into());
+        }
+        if self.health.failure_threshold == 0 || self.health.recovery_threshold == 0 {
+            return Err("health failure/recovery thresholds must be >= 1".into());
+        }
+        // Probe *types* are validated whenever probes are present; only
+        // the "non-empty" requirement depends on checks being enabled
+        // (a disabled section may legitimately have no probes).
+        for p in &self.health.probes {
+            crate::dns::msg::parse_record_type(&p.query_type)
+                .map_err(|e| format!("health probe type '{}': {e}", p.query_type))?;
+        }
+        if self.health.enabled && self.health.probes.is_empty() {
+            return Err("health.probes must not be empty when health checks are enabled".into());
         }
 
         if self.selection.latency_reference_ms <= 0.0 {
@@ -786,16 +978,23 @@ impl AppConfig {
             return Err("selection.lower_tier_share must be within 0.0..=1.0".into());
         }
 
-        if self.cache.enabled {
-            if self.cache.max_entries == 0 {
-                return Err("cache.max_entries must be > 0".into());
-            }
-            if self.cache.max_ttl_secs < self.cache.min_ttl_secs {
-                return Err("cache.max_ttl_secs must be >= min_ttl_secs".into());
-            }
-            if self.cache.negative_max_ttl_secs > 86_400 {
-                return Err("cache.negative_max_ttl_secs must be <= 86400".into());
-            }
+        // TTL bound consistency and a non-zero capacity are independent of
+        // `enabled`: nonsense must never be persisted, even if the cache is
+        // currently off.
+        if self.cache.max_ttl_secs < self.cache.min_ttl_secs {
+            return Err("cache.max_ttl_secs must be >= min_ttl_secs".into());
+        }
+        if self.cache.max_entries == 0 {
+            return Err("cache.max_entries must be > 0".into());
+        }
+        if self.cache.max_entries > 1_000_000 {
+            return Err("cache.max_entries must be <= 1000000".into());
+        }
+        if self.cache.max_memory_bytes == 0 {
+            return Err("cache.max_memory_bytes must be > 0".into());
+        }
+        if self.cache.negative_max_ttl_secs > 86_400 {
+            return Err("cache.negative_max_ttl_secs must be <= 86400".into());
         }
 
         let mut names = HashSet::new();
@@ -827,14 +1026,15 @@ impl AppConfig {
                 self.query.max_attempts, self.query.upstream_timeout_ms, self.query.timeout_ms
             ));
         }
-        let open = self.acl.allowed_cidrs.iter().any(|s| {
-            s.parse::<ipnet::IpNet>()
-                .map(|n| n.prefix_len() == 0)
-                .unwrap_or(false)
+        let open = self.acl.effective_entries().iter().any(|e| {
+            e.action == crate::acl::AclAction::Allow
+                && crate::acl::normalize_cidr(&e.cidr)
+                    .map(|n| n.prefix_len() == 0)
+                    .unwrap_or(false)
         });
         if open {
             out.push(
-                "acl.allowed_cidrs contains a /0 network: this gateway is an open resolver".into(),
+                "the ACL allow list contains a /0 network: this gateway is an open resolver".into(),
             );
         }
         if !self.health.enabled {
@@ -851,7 +1051,8 @@ impl AppConfig {
         if self.server.api_token.is_empty() {
             out.push(
                 "server.api_token is empty: configuration-changing API endpoints \
-                 (upstream create/update/delete/test, config import) are unauthenticated"
+                 (upstream create/update/delete/test, config import) are unauthenticated \
+                 unless password authentication is configured (RES_ADMIN_PASSWORD)"
                     .into(),
             );
         }
@@ -1021,7 +1222,7 @@ mod tests {
     fn rejects_bad_cidr() {
         let mut cfg = base();
         cfg.acl.allowed_cidrs = vec!["not-a-cidr".into()];
-        assert!(cfg.validate().unwrap_err().contains("invalid allowed CIDR"));
+        assert!(cfg.validate().unwrap_err().contains("invalid CIDR or IP"));
     }
 
     #[test]
@@ -1319,5 +1520,90 @@ mod tests {
         assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Full);
         let rt = RuntimeConfig::from_app(&base()).expect("runtime");
         assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Masked);
+    }
+
+    #[test]
+    fn per_upstream_probe_overrides_validate_and_resolve() {
+        let mut cfg = base();
+        cfg.upstreams[0].probe_interval_ms = Some(2_000);
+        cfg.upstreams[0].probe_timeout_ms = Some(1_000);
+        cfg.upstreams[0].probes = Some(vec![HealthProbe {
+            name: "health.example.".into(),
+            query_type: "A".into(),
+        }]);
+        cfg.upstreams[0].expect_rcode = Some("NOERROR".into());
+        cfg.validate().expect("valid per-upstream probes");
+
+        let up = &cfg.upstreams[0];
+        assert_eq!(up.effective_probe_interval_ms(5_000), 2_000);
+        assert_eq!(up.effective_probe_timeout_ms(2_000), 1_000);
+        assert_eq!(
+            up.expected_probe_rcode(),
+            Some(crate::dns::msg::Rcode::NoError)
+        );
+        let probes = up.effective_probes(&cfg.health.probes);
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].name, "health.example.");
+    }
+
+    #[test]
+    fn per_upstream_probe_overrides_fall_back_to_global() {
+        let cfg = base();
+        let up = &cfg.upstreams[0];
+        assert_eq!(up.effective_probe_interval_ms(5_000), 5_000);
+        assert_eq!(up.effective_probe_timeout_ms(2_000), 2_000);
+        assert_eq!(up.expected_probe_rcode(), None);
+        assert_eq!(up.effective_probes(&cfg.health.probes), cfg.health.probes);
+    }
+
+    #[test]
+    fn rejects_invalid_expect_rcode() {
+        let mut cfg = base();
+        cfg.upstreams[0].expect_rcode = Some("NOT_A_RCODE".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("expect_rcode"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_cache_memory_budget() {
+        let mut cfg = base();
+        cfg.cache.max_memory_bytes = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("max_memory_bytes"), "{err}");
+    }
+
+    #[test]
+    fn rejects_too_many_upstreams() {
+        let mut cfg = base();
+        let proto = cfg.upstreams[0].clone();
+        cfg.upstreams = (0..1025u32)
+            .map(|i| {
+                let mut u = proto.clone();
+                u.id = i64::from(i);
+                u.name = format!("up{i}");
+                u
+            })
+            .collect();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("too many upstreams"), "{err}");
+    }
+
+    #[test]
+    fn rejects_empty_per_upstream_probes() {
+        let mut cfg = base();
+        cfg.upstreams[0].probes = Some(vec![]);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("probes must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_per_upstream_probe_interval() {
+        let mut cfg = base();
+        cfg.upstreams[0].probe_interval_ms = Some(50);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("probe_interval_ms"), "{err}");
+        cfg.upstreams[0].probe_interval_ms = Some(600_001);
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("probe_interval_ms"), "{err}");
     }
 }

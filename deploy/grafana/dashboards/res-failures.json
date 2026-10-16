@@ -1209,7 +1209,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
-   "description": "1 when at least one upstream is configured but none is UP (clients are receiving SERVFAIL).",
+   "description": "1 when at least one upstream is configured but none is HEALTHY (clients are receiving SERVFAIL).",
    "id": 15,
    "gridPos": {
     "x": 0,

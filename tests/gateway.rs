@@ -571,7 +571,7 @@ async fn dns_service_metrics_report_real_traffic() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("upstreams json");
     let state = &v["state"];
     assert_eq!(state["total"].as_u64(), Some(1), "{body}");
-    assert_eq!(state["up"].as_u64(), Some(1), "{body}");
+    assert_eq!(state["healthy"].as_u64(), Some(1), "{body}");
     assert_eq!(state["emergency"].as_bool(), Some(false), "{body}");
     assert_eq!(
         state["eligible"].as_array().and_then(|a| a[0].as_str()),
@@ -749,18 +749,18 @@ async fn health_checker_marks_upstream_down_and_recovers() {
 
     // Both start healthy.
     assert!(
-        wait_for_health(api, "flaky", "up", Duration::from_secs(5)).await,
+        wait_for_health(api, "flaky", "healthy", Duration::from_secs(5)).await,
         "flaky should start healthy"
     );
     assert!(
-        wait_for_health(api, "stable", "up", Duration::from_secs(5)).await,
+        wait_for_health(api, "stable", "healthy", Duration::from_secs(5)).await,
         "stable should start healthy"
     );
 
     // Outage: flaky stops answering -> must be marked down.
     flaky.set_answering(false);
     assert!(
-        wait_for_health(api, "flaky", "down", Duration::from_secs(6)).await,
+        wait_for_health(api, "flaky", "unhealthy", Duration::from_secs(6)).await,
         "flaky upstream should be marked down"
     );
 
@@ -774,7 +774,7 @@ async fn health_checker_marks_upstream_down_and_recovers() {
     // Recovery: flaky answers again -> marked up.
     flaky.set_answering(true);
     assert!(
-        wait_for_health(api, "flaky", "up", Duration::from_secs(6)).await,
+        wait_for_health(api, "flaky", "healthy", Duration::from_secs(6)).await,
         "flaky upstream should recover"
     );
 
@@ -1066,7 +1066,7 @@ async fn diagnostics_and_emergency_visibility_when_all_upstreams_down() {
     let udp = gw.udp_addr().expect("udp addr");
 
     assert!(
-        wait_for_health(api, "only-dead", "down", Duration::from_secs(5)).await,
+        wait_for_health(api, "only-dead", "unhealthy", Duration::from_secs(5)).await,
         "single dead upstream should be marked down"
     );
 
@@ -1084,7 +1084,7 @@ async fn diagnostics_and_emergency_visibility_when_all_upstreams_down() {
     assert_eq!(d["emergency"]["no_healthy_upstreams"], true, "{body}");
     assert!(d["listeners"]["udp"].is_string(), "{body}");
     assert!(d["config"]["source"].is_string(), "{body}");
-    assert_eq!(d["upstreams"]["down"], 1, "{body}");
+    assert_eq!(d["upstreams"]["unhealthy"], 1, "{body}");
     assert!(
         d["upstreams"]["list"][0]["last_state_change_ago_secs"].is_number(),
         "{body}"
@@ -2168,4 +2168,1288 @@ async fn manual_upstream_test_reports_probe_result() {
 
     gw.shutdown().await;
     fake.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Auth integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_login_session_and_logout_flow() {
+    let cfg = base_config();
+    let gw = start_gateway_with_passwords(cfg, "s3cret-admin", Some("view-pw")).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Reads require authentication when password auth is enabled.
+    let (status, _) = http("GET", api, "/api/status", None).await;
+    assert_eq!(status, 401, "unauthenticated read must be 401");
+
+    // Login fails with wrong password (401, identical message).
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"wrong"}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("invalid username or password"), "{body}");
+
+    // Login succeeds and sets cookies.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"s3cret-admin"}"#),
+        &[],
+    )
+    .await;
+    assert!(raw.starts_with("HTTP/1.1 200"), "login must succeed: {raw}");
+    let session = set_cookie(&raw, "res_session").expect("session cookie");
+    let csrf = set_cookie(&raw, "res_csrf").expect("csrf cookie");
+    assert!(!session.is_empty());
+    assert!(!csrf.is_empty());
+
+    // Authenticated read works with the session cookie.
+    let (status, body) = http_headers(
+        "GET",
+        api,
+        "/api/status",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Mutation with cookie but without CSRF is forbidden.
+    let (status, body) = http_headers(
+        "POST",
+        api,
+        "/api/cache/clear",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 403, "CSRF required for cookie mutation: {body}");
+
+    // Mutation with cookie + CSRF succeeds.
+    let (status, body) = http_headers(
+        "POST",
+        api,
+        "/api/cache/clear",
+        None,
+        &[
+            ("Cookie".into(), format!("res_session={session}")),
+            ("X-CSRF-Token".into(), csrf.clone()),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Logout without CSRF is forbidden.
+    let (status, _) = http_headers(
+        "DELETE",
+        api,
+        "/api/auth/session",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 403, "logout must require CSRF");
+
+    // Logout with CSRF succeeds and invalidates the session.
+    let (status, _) = http_headers(
+        "DELETE",
+        api,
+        "/api/auth/session",
+        None,
+        &[
+            ("Cookie".into(), format!("res_session={session}")),
+            ("X-CSRF-Token".into(), csrf),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = http_headers(
+        "GET",
+        api,
+        "/api/status",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 401, "session must be dead after logout");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_lockout_returns_429_with_retry_after() {
+    let mut cfg = base_config();
+    cfg.auth.max_failed_attempts = 3;
+    let gw = start_gateway_with_passwords(cfg, "pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    for _ in 0..3 {
+        let (status, _) = http(
+            "POST",
+            api,
+            "/api/auth/login",
+            Some(r#"{"username":"admin","password":"bad"}"#),
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+
+    // Locked: even the correct password gets 429 + Retry-After.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"pw"}"#),
+        &[],
+    )
+    .await;
+    assert!(raw.starts_with("HTTP/1.1 429"), "expected 429, got: {raw}");
+    assert!(
+        raw.to_ascii_lowercase().contains("retry-after:"),
+        "Retry-After header required: {raw}"
+    );
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_login_rate_limit_returns_429() {
+    let mut cfg = base_config();
+    cfg.auth.login_rate_limit_per_minute = 3;
+    cfg.auth.max_failed_attempts = u32::MAX; // avoid per-username lockout
+    let gw = start_gateway_with_passwords(cfg, "pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // 3 attempts allowed (all fail with wrong password, but not locked).
+    for _ in 0..3 {
+        let (status, _) = http(
+            "POST",
+            api,
+            "/api/auth/login",
+            Some(r#"{"username":"admin","password":"bad"}"#),
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+    // 4th attempt from same IP is rate-limited.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"bad"}"#),
+        &[],
+    )
+    .await;
+    assert!(raw.starts_with("HTTP/1.1 429"), "expected 429, got: {raw}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_config_export_redacts_token_for_viewers() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit-token".into();
+    let gw = start_gateway_with_passwords(cfg, "admin-pw", Some("view-pw")).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Viewer login.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"viewer","password":"view-pw"}"#),
+        &[],
+    )
+    .await;
+    let session = set_cookie(&raw, "res_session").expect("session");
+
+    // Viewer export must not contain the api_token.
+    let (status, body) = http_headers(
+        "GET",
+        api,
+        "/api/config",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("sekrit-token"),
+        "viewer must not see api_token: {body}"
+    );
+    assert!(!body.contains("api_token"), "token field must be stripped");
+
+    // Admin (via bearer token) sees the full export.
+    let (status, body) = http_auth("GET", api, "/api/config", None, Some("sekrit-token")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("sekrit-token"), "admin keeps full export");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_rotate_password_invalidates_old_and_works_with_new() {
+    let cfg = base_config();
+    let gw = start_gateway_with_passwords(cfg, "old-pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Login with old password works.
+    let (status, _) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"old-pw"}"#),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Rotate via bearer-token auth (no cookie needed for rotation bootstrap).
+    // First we need a token; use the admin session for rotation instead.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"old-pw"}"#),
+        &[],
+    )
+    .await;
+    let session = set_cookie(&raw, "res_session").expect("session");
+    let csrf = set_cookie(&raw, "res_csrf").expect("csrf");
+
+    let (status, body) = http_headers(
+        "POST",
+        api,
+        "/api/auth/rotate-password",
+        Some(r#"{"account":"admin","new_password":"brand-new"}"#),
+        &[
+            ("Cookie".into(), format!("res_session={session}")),
+            ("X-CSRF-Token".into(), csrf),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Rotation is not just a hash swap: every pre-rotation session — the
+    // one that performed the rotation included — is revoked server-side.
+    let (status, _) = http_headers(
+        "GET",
+        api,
+        "/api/status",
+        None,
+        &[("Cookie".into(), format!("res_session={session}"))],
+    )
+    .await;
+    assert_eq!(status, 401, "pre-rotation session must be revoked");
+
+    // Old password no longer works.
+    let (status, _) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"old-pw"}"#),
+    )
+    .await;
+    assert_eq!(status, 401, "old password must be dead");
+
+    // New password works.
+    let (status, _) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"brand-new"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "new password must work");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_secure_cookies_flag_set_when_configured() {
+    let mut cfg = base_config();
+    cfg.auth.secure_cookies = true;
+    let gw = start_gateway_with_passwords(cfg, "pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"pw"}"#),
+        &[],
+    )
+    .await;
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(
+        raw.contains("Secure"),
+        "Secure flag expected on cookies: {raw}"
+    );
+
+    gw.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// ACL per-entry management: structured entries, bare IPs, enable/disable,
+// conflict rejection, per-entry CRUD.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_get_returns_entries_with_ids_and_legacy_view() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/acl", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let entries = v["entries"].as_array().expect("entries array");
+    assert!(
+        !entries.is_empty(),
+        "default allow list synthesised: {body}"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| !e["id"].as_str().unwrap_or("").is_empty()),
+        "every entry has an id: {body}"
+    );
+    // Legacy view is populated from enabled allow entries.
+    assert!(
+        v["allowed_cidrs"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "{body}"
+    );
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_put_accepts_structured_entries_and_bare_ips() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let put = r#"{
+        "entries": [
+            {"cidr": "192.0.2.10", "action": "allow", "enabled": true},
+            {"cidr": "192.0.2.0/24", "action": "deny", "enabled": true}
+        ]
+    }"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["entries"].as_array().expect("entries").len(), 2);
+    assert_eq!(v["denied_count"], 1, "{body}");
+
+    // GET reflects the new entry list.
+    let (status, body) = http("GET", api, "/api/acl", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["entries"].as_array().expect("entries").len(), 2);
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_put_rejects_duplicates_and_conflicts() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Duplicate allow entries.
+    let dup = r#"{"entries":[
+        {"cidr":"10.0.0.0/8","action":"allow"},
+        {"cidr":"10.0.0.0/8","action":"allow"}
+    ]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(dup), Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("duplicate"), "{body}");
+
+    // Same network in both allow and deny.
+    let conflict = r#"{"entries":[
+        {"cidr":"10.0.0.0/8","action":"allow"},
+        {"cidr":"10.0.0.0/8","action":"deny"}
+    ]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(conflict), Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("conflict"), "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_put_legacy_lists_still_work() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let put = r#"{"allowed_cidrs":["127.0.0.0/8"],"denied_cidrs":[]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["allowed_count"], 1, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_entry_crud_lifecycle() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Create a new entry (bare IP).
+    let create = r#"{"cidr":"203.0.113.99","action":"allow","enabled":true}"#;
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/acl/entries",
+        Some(create),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let entries = v["entries"].as_array().expect("entries");
+    let new_id = entries
+        .iter()
+        .find(|e| e["cidr"] == "203.0.113.99")
+        .and_then(|e| e["id"].as_str())
+        .expect("new entry id")
+        .to_string();
+
+    // Disable it via PATCH.
+    let (status, body) = http_auth(
+        "PATCH",
+        api,
+        &format!("/api/acl/entries/{new_id}"),
+        Some(r#"{"enabled":false}"#),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let disabled = v["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|e| e["id"] == new_id)
+        .expect("entry present");
+    assert_eq!(disabled["enabled"], false, "{body}");
+
+    // Delete it.
+    let (status, body) = http_auth(
+        "DELETE",
+        api,
+        &format!("/api/acl/entries/{new_id}"),
+        None,
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        !v["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|e| e["id"] == new_id),
+        "entry deleted: {body}"
+    );
+
+    // Deleting a missing entry is 404.
+    let (status, body) = http_auth(
+        "DELETE",
+        api,
+        &format!("/api/acl/entries/{new_id}"),
+        None,
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_entry_create_rejects_duplicate() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let create = r#"{"cidr":"192.0.2.0/24","action":"allow"}"#;
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/acl/entries",
+        Some(create),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    // Same network again → 409 conflict.
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/acl/entries",
+        Some(create),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("duplicate"), "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_put_empty_allow_needs_confirm() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let put = r#"{"entries":[]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("confirm"), "{body}");
+
+    // With confirm=true it goes through.
+    let put = r#"{"entries":[],"confirm":true}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+
+    gw.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Cache settings: hot-reloadable capacity / TTL bounds / enable flag,
+// memory accounting, clears counter.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_get_returns_settings_and_memory() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/cache", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["enabled"], true, "{body}");
+    assert!(v["max_entries"].as_u64().unwrap_or(0) > 0, "{body}");
+    assert!(v.get("memory_bytes").is_some(), "{body}");
+    assert!(v.get("min_ttl_secs").is_some(), "{body}");
+    assert!(v.get("max_ttl_secs").is_some(), "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_put_updates_settings_and_persists() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.server.api_token = "sekrit".into();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let put =
+        r#"{"max_entries":64,"min_ttl_secs":5,"max_ttl_secs":300,"negative_max_ttl_secs":10}"#;
+    let (status, body) = http_auth("PUT", api, "/api/cache", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["max_entries"], 64, "{body}");
+    assert_eq!(v["min_ttl_secs"], 5, "{body}");
+    assert_eq!(v["max_ttl_secs"], 300, "{body}");
+    assert_eq!(v["negative_max_ttl_secs"], 10, "{body}");
+
+    // Settings are live: GET reflects the new values.
+    let (status, body) = http("GET", api, "/api/cache", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["max_entries"], 64, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_put_invalid_settings_rejected() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // max_ttl < min_ttl is invalid.
+    let put = r#"{"min_ttl_secs":100,"max_ttl_secs":50}"#;
+    let (status, body) = http_auth("PUT", api, "/api/cache", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+
+    // max_entries = 0 is invalid.
+    let put = r#"{"max_entries":0}"#;
+    let (status, body) = http_auth("PUT", api, "/api/cache", Some(put), Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_disabling_via_put_clears_entries() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.server.api_token = "sekrit".into();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp");
+
+    // Populate the cache with a real query.
+    let resp = udp_query(udp, "warm.test").await.expect("response");
+    assert_eq!(answers_ip(&resp), Some(ANSWER));
+    // Second query should hit the cache (upstream hits stay at 1).
+    let _ = udp_query(udp, "warm.test").await.expect("response");
+    assert_eq!(fake.hits(), 1, "second query must be a cache hit");
+
+    let (status, body) = http("GET", api, "/api/cache", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(v["entries"].as_u64().unwrap_or(0) >= 1, "{body}");
+
+    // Disable the cache: replace_config clears resident entries.
+    let (status, body) = http_auth(
+        "PUT",
+        api,
+        "/api/cache",
+        Some(r#"{"enabled":false}"#),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["enabled"], false, "{body}");
+    assert_eq!(v["entries"], 0, "cache cleared on disable: {body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_clear_reports_memory_freed() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.server.api_token = "sekrit".into();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp");
+
+    let _ = udp_query(udp, "fill.test").await.expect("response");
+    let (status, body) = http_auth("POST", api, "/api/cache/clear", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(v["entries_dropped"].as_u64().unwrap_or(0) >= 1, "{body}");
+    assert!(v["memory_bytes_freed"].as_u64().unwrap_or(0) > 0, "{body}");
+
+    gw.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Upstream probe overrides + config rollback from backup.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_create_accepts_probe_overrides() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let create = r#"{
+        "name":"probe-up",
+        "address":"127.0.0.1",
+        "port": 53,
+        "probe_interval_ms": 2000,
+        "probe_timeout_ms": 800,
+        "probes": [{"name":"example.com.","type":"A"}]
+    }"#;
+    let (status, body) =
+        http_auth("POST", api, "/api/upstreams", Some(create), Some("sekrit")).await;
+    assert_eq!(status, 201, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let id = v["upstream"]["id"].as_i64().expect("id");
+
+    // Config export shows the probe overrides.
+    let (status, body) = http_auth("GET", api, "/api/config", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let toml = v["toml"].as_str().expect("toml");
+    assert!(toml.contains("probe_interval_ms = 2000"), "{toml}");
+    assert!(toml.contains("probe_timeout_ms = 800"), "{toml}");
+    assert!(toml.contains("example.com"), "{toml}");
+
+    // PATCH clears them. `clear_probes` only removes the probe *list* —
+    // the cadence overrides need their dedicated flags, so wiping the list
+    // can no longer silently delete a tuned interval/timeout (behaviour
+    // change: the old coupling was an audit finding).
+    let (status, body) = http_auth(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"clear_probes":true}"#),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_auth("GET", api, "/api/config", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let toml = v["toml"].as_str().expect("toml");
+    assert!(
+        toml.contains("probe_interval_ms = 2000"),
+        "clear_probes must not touch the cadence: {toml}"
+    );
+
+    let (status, body) = http_auth(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"clear_probe_interval_ms":true,"clear_probe_timeout_ms":true}"#),
+        Some("sekrit"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http_auth("GET", api, "/api/config", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let toml = v["toml"].as_str().expect("toml");
+    assert!(!toml.contains("probe_interval_ms = 2000"), "{toml}");
+    assert!(!toml.contains("probe_timeout_ms = 800"), "{toml}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_rollback_restores_backup() {
+    use std::path::PathBuf;
+
+    let fake = FakeUpstream::start().await;
+    let dir = std::env::temp_dir().join(format!("res-rollback-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path: PathBuf = dir.join("res.toml");
+    // Seed a config file that will become the backup after the first mutation.
+    let mut seed = base_config();
+    seed.server.api_token = "sekrit".into();
+    seed.upstreams.push(fake.config("primary"));
+    // Persist the seed as the initial primary so AppConfig::load works.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(seed.to_toml().unwrap().as_bytes())
+            .expect("write");
+    }
+    let gw = start_gateway_with_path(seed, path.clone()).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Mutate: create a new upstream (writes primary + backup of previous).
+    let create = r#"{"name":"added","address":"127.0.0.1","port":53}"#;
+    let (status, body) =
+        http_auth("POST", api, "/api/upstreams", Some(create), Some("sekrit")).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(path.exists());
+    let backup = res::config::backup_path(&path);
+    assert!(
+        backup.exists(),
+        "backup written by persist: {}",
+        backup.display()
+    );
+
+    // Rollback restores the backup (without "added").
+    let (status, body) = http_auth("POST", api, "/api/config/rollback", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["status"], "ok", "{body}");
+
+    let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let names: Vec<String> = v["upstreams"]
+        .as_array()
+        .expect("upstreams")
+        .iter()
+        .filter_map(|u| u["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(names.contains(&"primary".to_string()), "{body}");
+    assert!(!names.contains(&"added".to_string()), "rolled back: {body}");
+
+    gw.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn config_rollback_missing_backup_is_404() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    // No config_path set → rollback must refuse cleanly.
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http_auth("POST", api, "/api/config/rollback", None, Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_policy_refuse_returns_notimp_locally() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.query.any_policy = res::config::AnyPolicy::Refuse;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query_type(addr, "example.test", "ANY")
+        .await
+        .expect("NOTIMP reply");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+    assert_eq!(fake.hits(), 0, "ANY must not reach upstream");
+
+    // Normal A queries still work.
+    let ok = udp_query(addr, "example.test").await.expect("answer");
+    assert_eq!(ok.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(fake.hits(), 1);
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_policy_forward_default_reaches_upstream() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    // Default is Forward: the ANY query is passed upstream (fake answers
+    // with an A record regardless of type, which is fine for this check).
+    let resp = udp_query_type(addr, "example.test", "ANY")
+        .await
+        .expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        fake.hits() >= 1,
+        "ANY must reach upstream under forward policy"
+    );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Audit Batch 1: dashboard-shaped payloads, ACL source, health/selection
+// endpoints, hardened dashboard fallback, login caps, cache byte cap.
+// ---------------------------------------------------------------------------
+
+/// The panel sends `confirm` on every write (umgSubmit). `deny_unknown_fields`
+/// used to turn that into a 422 and break "Add upstream" outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_create_upstream_accepts_dashboard_shaped_payload() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("seed"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http(
+        "POST",
+        api,
+        "/api/upstreams",
+        Some(
+            r#"{"name":"panel-created","address":"127.0.0.1","port":5355,
+                "confirm":true,"expect_rcode":"NOERROR","priority":2,
+                "probe_interval_ms":9000,"probe_timeout_ms":4000,
+                "probes":[{"type":"A","name":"example.com"}]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "dashboard-shaped create must be accepted: {body}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let id = created["upstream"]["id"].as_i64().expect("id");
+
+    // expect_rcode round-trips through create, and clear_expect_rcode works.
+    assert_eq!(created["upstream"]["expect_rcode"], "NOERROR");
+    assert_eq!(created["upstream"]["probe_interval_ms"], 9000);
+    assert_eq!(created["upstream"]["probes"][0]["type"], "A");
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"clear_expect_rcode":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "clear_expect_rcode patch: {body}");
+    let after: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        after["upstream"]["expect_rcode"].is_null(),
+        "expect_rcode must be cleared: {body}"
+    );
+
+    // clear_probes wipes ONLY the probe list; the cadence overrides keep
+    // their values unless the dedicated clear flags are sent.
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"clear_probes":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "clear_probes patch: {body}");
+    let after: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(after["upstream"]["probes"].is_null(), "{body}");
+    assert_eq!(
+        after["upstream"]["probe_interval_ms"], 9000,
+        "clear_probes must not wipe the probe interval: {body}"
+    );
+    assert_eq!(after["upstream"]["probe_timeout_ms"], 4000, "{body}");
+
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"clear_probe_interval_ms":true,"clear_timeout":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "clear interval patch: {body}");
+    let after: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(after["upstream"]["probe_interval_ms"].is_null(), "{body}");
+    assert!(after["upstream"]["timeout_ms"].is_null(), "{body}");
+    assert_eq!(
+        after["upstream"]["probe_timeout_ms"], 4000,
+        "interval clear must not touch the probe timeout: {body}"
+    );
+
+    let (status, _) = http("DELETE", api, &format!("/api/upstreams/{id}"), None).await;
+    assert!(status == 200 || status == 204);
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+/// ACL entries report where they came from: `config` for file-structured
+/// entries, `legacy` for ones synthesised from the flat allow/deny lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_acl_reports_entry_source() {
+    let cfg = base_config();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // Empty structured section → legacy synthesised view.
+    let (status, body) = http("GET", api, "/api/acl", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let entries = v["entries"].as_array().expect("entries array");
+    assert!(!entries.is_empty(), "{body}");
+    assert!(
+        entries.iter().all(|e| e["source"] == "legacy"),
+        "every synthesised entry must be marked legacy: {body}"
+    );
+
+    // Structured PUT → source becomes `config`.
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/acl",
+        Some(
+            r#"{"entries":[{"cidr":"10.9.0.0/16","action":"deny","enabled":true}],"confirm":true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "acl put: {body}");
+    let (status, body) = http("GET", api, "/api/acl", None).await;
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["entries"][0]["source"], "config", "{body}");
+
+    gw.shutdown().await;
+}
+
+/// GET/PUT round trip for the health-check section, including generation
+/// guarding and validation of nonsense values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_health_config_roundtrip_and_guards() {
+    let cfg = base_config();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/health/config", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let gen = v["generation"].as_u64().expect("generation");
+    assert!(v["health"]["enabled"].is_boolean(), "{body}");
+    assert!(v["health"]["probes"].is_array(), "{body}");
+
+    // Valid update with the current generation succeeds and bumps it.
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/health/config",
+        Some(&format!(r#"{{"enabled":false,"generation":{gen}}}"#)),
+    )
+    .await;
+    assert_eq!(status, 200, "health put: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["health"]["enabled"], false);
+    assert!(v["generation"].as_u64() > Some(gen), "{body}");
+
+    // The stale generation is refused with 409.
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/health/config",
+        Some(&format!(r#"{{"enabled":true,"generation":{gen}}}"#)),
+    )
+    .await;
+    assert_eq!(status, 409, "stale generation must conflict: {body}");
+
+    // Nonsense values never persist (validation runs before the swap).
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/health/config",
+        Some(r#"{"interval_ms":50}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "interval below 100ms must be rejected: {body}");
+
+    // Unknown fields are refused, not silently ignored.
+    let (status, _) = http(
+        "PUT",
+        api,
+        "/api/health/config",
+        Some(r#"{"bogus_field":1}"#),
+    )
+    .await;
+    assert_eq!(status, 422);
+
+    gw.shutdown().await;
+}
+
+/// GET/PUT round trip for the selection policy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_selection_roundtrip_and_guards() {
+    let cfg = base_config();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/selection", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(v["selection"]["strategy"].is_string(), "{body}");
+    let gen = v["generation"].as_u64().expect("generation");
+
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/selection",
+        Some(&format!(
+            r#"{{"strategy":"best_score","min_probe_samples":5,"generation":{gen}}}"#
+        )),
+    )
+    .await;
+    assert_eq!(status, 200, "selection put: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["selection"]["strategy"], "best_score");
+    assert_eq!(v["selection"]["min_probe_samples"], 5);
+
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/selection",
+        Some(r#"{"lower_tier_share":2.0}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "share outside 0..=1 must be rejected: {body}");
+
+    gw.shutdown().await;
+}
+
+/// Login input length caps: oversized credentials are refused before any
+/// argon2 work or rate-limit state is touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_login_rejects_oversized_credentials() {
+    let gw = start_gateway_with_passwords(base_config(), "pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let long_user = "u".repeat(65);
+    let (status, _) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(&format!(r#"{{"username":"{long_user}","password":"pw"}}"#)),
+    )
+    .await;
+    assert_eq!(status, 400, "65-char username must be refused");
+
+    let long_pw = "p".repeat(1025);
+    let (status, _) = http(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(&format!(r#"{{"username":"admin","password":"{long_pw}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, 400, "1025-char password must be refused");
+
+    gw.shutdown().await;
+}
+
+/// The cache byte-cap knob is exposed and validated end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_cache_reports_and_updates_byte_cap() {
+    let cfg = base_config();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/cache", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(v["max_memory_bytes"].as_u64().unwrap_or(0) > 0, "{body}");
+
+    let (status, body) = http(
+        "PUT",
+        api,
+        "/api/cache",
+        Some(r#"{"max_memory_bytes":1048576}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "cache put: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["max_memory_bytes"], 1048576, "{body}");
+
+    let (status, body) = http("PUT", api, "/api/cache", Some(r#"{"max_memory_bytes":0}"#)).await;
+    assert_eq!(status, 400, "zero byte cap must be rejected: {body}");
+
+    gw.shutdown().await;
+}
+
+/// Hardened dashboard fallback: JSON 404 for unknown API paths, SPA index
+/// for clean routes, real 404 for missing assets, dotfiles and `..` never
+/// served, security headers on every response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_fallback_is_hardened() {
+    let dash = std::env::current_dir().expect("cwd").join("dashboard");
+    assert!(
+        dash.join("index.html").exists(),
+        "repo dashboard must exist"
+    );
+    let mut cfg = base_config();
+    cfg.server.dashboard_dir = Some(dash);
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // The SPA entry is served with the right type.
+    let raw = http_raw("GET", api, "/", None, &[]).await;
+    let head = raw.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
+    assert!(
+        raw.contains(" 200"),
+        "GET / must be 200: {}",
+        &raw[..raw.len().min(200)]
+    );
+    assert!(head.contains("content-type: text/html"), "{head}");
+    // Security headers on static responses (L10).
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+    assert!(head.contains("x-frame-options: deny"), "{head}");
+    assert!(head.contains("referrer-policy: no-referrer"), "{head}");
+    assert!(
+        raw.contains("res · Observability"),
+        "index body must be served"
+    );
+
+    // Fonts still resolve with their MIME type.
+    let (status, body) = http("GET", api, "/fonts/Shabnam.ttf", None).await;
+    assert_eq!(status, 200, "font must be served");
+    assert!(
+        body.starts_with("\u{0}\x01\x00\x00"),
+        "must be raw ttf bytes"
+    );
+
+    // Unknown /api paths answer JSON 404, never the HTML page with 200.
+    let raw = http_raw("GET", api, "/api/definitely-not-a-route", None, &[]).await;
+    assert!(raw.contains(" 404"), "unknown api path must 404");
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    let v: serde_json::Value = serde_json::from_str(body).expect("json 404, not HTML");
+    assert!(v["error"].is_string(), "{body}");
+
+    // Extensionless unknown paths get the SPA entry (deep links).
+    let (status, body) = http("GET", api, "/some/spa/route", None).await;
+    assert_eq!(status, 200, "SPA route must fall back to index");
+    assert!(body.contains("res · Observability"));
+
+    // A missing *asset* stays a visible 404 instead of a lying 200.
+    let (status, _) = http("GET", api, "/missing-asset.js", None).await;
+    assert_eq!(status, 404, "missing assets must not serve index.html");
+
+    // Dotfiles are never served.
+    let (status, _) = http("GET", api, "/.res.toml", None).await;
+    assert_eq!(status, 404, "dotfiles must not be served");
+
+    // `..` traversal segments are refused before touching the filesystem.
+    let (status, _) = http("GET", api, "/../src/main.rs", None).await;
+    assert_eq!(status, 404, "traversal must not be served");
+
+    // POST to static content is refused.
+    let (status, _) = http("POST", api, "/", Some("{}")).await;
+    assert_eq!(status, 405, "static serving must be read-only");
+
+    gw.shutdown().await;
+}
+
+/// Security headers are present on API responses too, not just static ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_responses_carry_security_headers() {
+    let cfg = base_config();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let raw = http_raw("GET", api, "/api/health", None, &[]).await;
+    let head = raw.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+    assert!(head.contains("x-frame-options: deny"), "{head}");
+    assert!(head.contains("referrer-policy: no-referrer"), "{head}");
+
+    // Even the JSON 404 fallback carries them (layer wraps the fallback).
+    let raw = http_raw("GET", api, "/api/nope", None, &[]).await;
+    let head = raw.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+
+    gw.shutdown().await;
 }

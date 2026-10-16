@@ -26,22 +26,36 @@ impl PromClient {
     pub fn new(base_url: &str) -> Result<Self, String> {
         let url = base_url.trim().trim_end_matches('/');
         let rest = url.strip_prefix("http://").ok_or_else(|| {
-            format!("unsupported Prometheus URL '{base_url}' (only plain http:// is supported)")
+            format!(
+                "unsupported Prometheus URL '{}' (only plain http:// is supported)",
+                redact_url(base_url)
+            )
         })?;
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
         };
+        // This client sends no Authorization header, so `user:pass@host`
+        // would be both useless and a leak vector (the authority lands in
+        // connect/DNS error strings that reach API responses and events).
+        // Refuse it instead of silently ignoring it — and never echo the
+        // credentials back (audit L8).
+        if authority.contains('@') {
+            return Err(format!(
+                "Prometheus URL must not contain credentials (found userinfo in '{}')",
+                redact_url(base_url)
+            ));
+        }
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
                 p.parse::<u16>()
-                    .map_err(|_| format!("invalid port in '{base_url}'"))?,
+                    .map_err(|_| format!("invalid port in '{}'", redact_url(base_url)))?,
             ),
             None => (authority.to_string(), 80),
         };
         if host.is_empty() {
-            return Err(format!("missing host in '{base_url}'"));
+            return Err(format!("missing host in '{}'", redact_url(base_url)));
         }
         Ok(Self {
             host,
@@ -221,6 +235,22 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Percent-encode everything outside the unreserved set (safe inside a query
 /// parameter value: braces, quotes, operators and spaces all get encoded).
+/// Replace the `user:password@` part of a URL with `***@` so error strings,
+/// events and API responses can quote the configured value without leaking
+/// credentials (audit L8). Only the authority segment is considered: an `@`
+/// in the path (e.g. `http://host/a@b`) is left alone.
+fn redact_url(u: &str) -> String {
+    let (scheme, rest) = match u.find("://") {
+        Some(i) => (&u[..i + 3], &u[i + 3..]),
+        None => ("", u),
+    };
+    let limit = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..limit].rfind('@') {
+        Some(at) => format!("{scheme}***@{}", &rest[at + 1..]),
+        None => u.to_string(),
+    }
+}
+
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -262,8 +292,11 @@ pub const GLOBAL_SERIES: &[&str] = &[
     "fds",
     "healthy",
     "degraded",
+    "recovering",
     "down",
     "cache_entries",
+    "cache_capacity",
+    "cache_memory_bytes",
     "tcp_conn_per_min",
     "queries",
     "packets_in",
@@ -375,8 +408,14 @@ pub fn global_exprs(w: &str) -> Vec<(&'static str, String)> {
             "degraded",
             "sum(res_upstream_state == 1) or vector(0)".into(),
         ),
+        (
+            "recovering",
+            "sum(res_upstream_state == 3) or vector(0)".into(),
+        ),
         ("down", "sum(res_upstream_state == 0) or vector(0)".into()),
         ("cache_entries", "res_cache_entries".into()),
+        ("cache_capacity", "res_cache_capacity".into()),
+        ("cache_memory_bytes", "res_cache_memory_bytes".into()),
         (
             "tcp_conn_per_min",
             format!("60 * rate(res_tcp_connections_total[{w}])"),
@@ -554,6 +593,29 @@ mod tests {
         assert_eq!(c.port, 80);
         assert!(PromClient::new("https://prom:9090").is_err());
         assert!(PromClient::new("").is_err());
+    }
+
+    /// Credentials in a configured Prometheus URL are rejected and never
+    /// echoed back in the error text (audit L8).
+    #[test]
+    fn rejects_userinfo_without_echoing_credentials() {
+        let err = PromClient::new("http://admin:s3cr3t@prometheus:9090").unwrap_err();
+        assert!(!err.contains("s3cr3t"), "credentials leaked: {err}");
+        assert!(!err.contains("admin"), "userinfo leaked: {err}");
+        assert!(err.contains("***@"));
+        // No scheme: still must not echo the userinfo half.
+        let err = PromClient::new("admin:s3cr3t@prometheus").unwrap_err();
+        assert!(!err.contains("s3cr3t"), "credentials leaked: {err}");
+    }
+
+    #[test]
+    fn redacts_only_the_authority_segment() {
+        assert_eq!(
+            redact_url("http://user:pw@host:9090/path"),
+            "http://***@host:9090/path"
+        );
+        assert_eq!(redact_url("http://host/a@b"), "http://host/a@b");
+        assert_eq!(redact_url("host:9090"), "host:9090");
     }
 
     #[test]

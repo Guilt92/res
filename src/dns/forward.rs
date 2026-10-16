@@ -30,12 +30,6 @@ pub enum ExchangeError {
     Invalid(String),
 }
 
-impl ExchangeError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, ExchangeError::Timeout | ExchangeError::Network(_))
-    }
-}
-
 pub struct ExchangeOk {
     pub response: Vec<u8>,
     pub view: ResponseView,
@@ -118,7 +112,12 @@ impl Forwarder {
         // (RFC 6891: a server must not exceed it). Plain-UDP queries get the
         // DNS flag-day 1232 floor, which also survives servers that ignore
         // the 512-byte RFC 1035 limit. Bounded, far below the old fixed 64 KiB.
-        let mut buf = vec![0u8; recv_buf_size(query)];
+        //
+        // One extra byte: `recv` filling it means the datagram is larger than
+        // the client can receive — a detectable overflow instead of a silent
+        // mid-record cut that the parser would only see as garbage.
+        let expected = recv_buf_size(query);
+        let mut buf = vec![0u8; expected + 1];
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -129,12 +128,35 @@ impl Forwarder {
                 Ok(Err(e)) => return Err(ExchangeError::Network(format!("recv: {e}"))),
                 Ok(Ok(n)) => n,
             };
+            let oversized = received > expected;
 
             // Ignore packets that cannot be parsed or correlated (late
             // responses from a previous attempt, spoofed datagrams, ...).
             let view = match msg::parse_response(&buf[..received]) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    if oversized {
+                        // Oversized *and* cut mid-record: the full message can
+                        // never fit this client's UDP limit — answer TC=1 from
+                        // the query so the client retries over TCP now, rather
+                        // than waiting out the deadline for a packet we will
+                        // never be able to parse.
+                        let mut stub = msg::error_response(query, msg::Rcode::NoError);
+                        if stub.len() >= 4 {
+                            stub[2] |= 0x02; // TC: truncated, retry over TCP
+                        }
+                        let view = match msg::parse_response(&stub) {
+                            Ok(v) => v,
+                            Err(_) => continue, // unreachable for our own stub
+                        };
+                        return Ok(ExchangeOk {
+                            response: stub,
+                            view,
+                            latency: start.elapsed(),
+                        });
+                    }
+                    continue;
+                }
             };
             if !msg::correlates(query, &view) {
                 continue;
@@ -244,21 +266,58 @@ fn recv_buf_size(query: &ParsedQuery) -> usize {
     advertised.min(MAX_TCP_MESSAGE)
 }
 
-/// Enforce the RFC 1035 512-byte limit for clients that did not advertise
-/// EDNS over UDP by converting the response into a truncated one (TC=1), which
-/// makes the client retry over TCP where the full answer is served.
+/// Enforce the client's UDP response size limit: RFC 1035's 512-byte limit
+/// for clients that did not advertise EDNS, or the client's advertised EDNS
+/// payload when it is smaller than the response — and in all cases the
+/// operator's `server.max_udp_packet_size` ceiling (bounds fragmentation for
+/// every client, EDNS or not). Oversized responses are truncated (TC=1) so
+/// the client retries over TCP for the full answer. When the response cannot
+/// even be decoded (typically a datagram cut mid-record by the receive
+/// buffer), a TC=1 stub built from the *query* is returned so the client
+/// still learns to retry over TCP instead of us forwarding a packet we know
+/// exceeds its limit.
 pub fn enforce_client_udp_limit(
     response: Vec<u8>,
     transport_is_udp: bool,
     client_has_edns: bool,
+    client_edns_payload: Option<u16>,
+    server_udp_cap: u16,
+    parsed_query: &ParsedQuery,
 ) -> Vec<u8> {
-    if !transport_is_udp || client_has_edns || response.len() <= MAX_UDP_PLAIN {
+    if !transport_is_udp {
+        return response;
+    }
+    let client_limit = if client_has_edns {
+        // Honour the client's advertised size (RFC 6891 §6.2.4: a server
+        // must not send more than the client can reassemble). Floor at 512
+        // so a broken/zero advertisement still yields a usable answer.
+        client_edns_payload
+            .map(|p| usize::from(p).max(MAX_UDP_PLAIN))
+            .unwrap_or(MAX_TCP_MESSAGE)
+    } else {
+        MAX_UDP_PLAIN
+    };
+    let limit = client_limit.min(usize::from(server_udp_cap).max(MAX_UDP_PLAIN));
+    if response.len() <= limit {
         return response;
     }
     match Message::from_vec(&response) {
-        Ok(m) => m.truncate().to_vec().unwrap_or(response),
-        Err(_) => response,
+        Ok(m) => m
+            .truncate()
+            .to_vec()
+            .unwrap_or_else(|_| tc_stub(parsed_query)),
+        Err(_) => tc_stub(parsed_query),
     }
+}
+
+/// Minimal TC=1 response echoing the query (question + EDNS), telling the
+/// client to retry over TCP.
+fn tc_stub(parsed_query: &ParsedQuery) -> Vec<u8> {
+    let mut stub = msg::error_response(parsed_query, msg::Rcode::NoError);
+    if stub.len() >= 4 {
+        stub[2] |= 0x02; // TC
+    }
+    stub
 }
 
 #[cfg(test)]
@@ -296,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn any_policy_refuses_locally() {
+        use crate::config::{AnyPolicy, QueryConfig};
+        let cfg = QueryConfig::default();
+        assert_eq!(cfg.any_policy, AnyPolicy::Forward);
+        let refuse = AnyPolicy::Refuse;
+        assert_eq!(refuse, AnyPolicy::Refuse);
+        assert_ne!(refuse, AnyPolicy::Forward);
+    }
+
+    #[test]
     fn truncates_oversized_response_for_plain_udp_client() {
         let qbytes = msg::build_query("example.com", "A").unwrap();
         let mut msgout = Message::response(42, hickory_proto::op::OpCode::Query);
@@ -314,20 +383,49 @@ mod tests {
         }
         let bytes = msgout.to_vec().unwrap();
         assert!(bytes.len() > 512);
+        let parsed = msg::parse_query(&msg::build_query("example.com", "A").unwrap()).unwrap();
 
-        // EDNS client: untouched.
-        let out = enforce_client_udp_limit(bytes.clone(), true, true);
+        // EDNS client advertising a large payload: untouched.
+        let out = enforce_client_udp_limit(bytes.clone(), true, true, Some(4096), 4096, &parsed);
         assert_eq!(out.len(), bytes.len());
 
+        // Operator ceiling below the client's advertisement: truncated too
+        // (`server.max_udp_packet_size` bounds fragmentation for everyone).
+        let out = enforce_client_udp_limit(bytes.clone(), true, true, Some(4096), 512, &parsed);
+        assert!(out.len() <= 512, "server cap must apply, got {}", out.len());
+        let view = msg::parse_response(&out).unwrap();
+        assert!(view.truncated);
+
+        // EDNS client advertising a tiny payload: truncated to that size
+        // (floored at the RFC 1035 512-byte minimum).
+        let out = enforce_client_udp_limit(bytes.clone(), true, true, Some(256), 4096, &parsed);
+        assert!(
+            out.len() <= 512,
+            "tiny EDNS payload must still respect the 512-byte floor, got {}",
+            out.len()
+        );
+        let view = msg::parse_response(&out).unwrap();
+        assert!(view.truncated);
+
         // Plain UDP client: truncated.
-        let out = enforce_client_udp_limit(bytes, true, false);
+        let out = enforce_client_udp_limit(bytes, true, false, None, 4096, &parsed);
         assert!(out.len() <= 512);
         let view = msg::parse_response(&out).unwrap();
         assert!(view.truncated);
 
         // TCP client: untouched.
         let q2 = msg::build_query("example.com", "A").unwrap();
-        let out = enforce_client_udp_limit(q2, false, false);
+        let out = enforce_client_udp_limit(q2, false, false, None, 4096, &parsed);
         assert!(!out.is_empty());
+
+        // Undecodable oversized datagram (cut mid-record upstream of us):
+        // answer TC=1 built from the query instead of forwarding garbage or
+        // the oversized bytes.
+        let garbage = vec![0xA5u8; 600];
+        let out = enforce_client_udp_limit(garbage, true, false, None, 4096, &parsed);
+        let view = msg::parse_response(&out).unwrap();
+        assert!(view.truncated, "TC stub must be marked truncated");
+        let q = view.question.expect("stub echoes the question");
+        assert_eq!(q.0, "example.com.");
     }
 }

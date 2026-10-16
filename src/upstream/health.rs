@@ -7,12 +7,14 @@
 //! State machine (see `Hysteresis`):
 //!
 //! ```text
-//! UP --first failed round--> DEGRADED --failure_threshold--> DOWN
-//! UP/DEGRADED/DOWN --recovery_threshold consecutive successes--> UP
+//! HEALTHY --first failed round--> DEGRADED --failure_threshold--> UNHEALTHY
+//! UNHEALTHY/DEGRADED --first success--> RECOVERING
+//! RECOVERING --recovery_threshold consecutive successes--> HEALTHY
+//! RECOVERING --failed round--> UNHEALTHY
 //! ```
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -40,10 +42,15 @@ pub struct Step {
 
 /// Pure hysteresis transition function (unit tested independently).
 ///
-/// * a failed round from `UP` moves to `DEGRADED` immediately (fast protection),
-/// * further consecutive failures up to `failure_threshold` move to `DOWN`,
-/// * `recovery_threshold` consecutive successful rounds are required to return
-///   to `UP` from any degraded/down state.
+/// * a failed round from `HEALTHY` moves to `DEGRADED` immediately (fast
+///   protection),
+/// * further consecutive failures up to `failure_threshold` move to
+///   `UNHEALTHY`,
+/// * the first success from `DEGRADED`/`UNHEALTHY` enters `RECOVERING`
+///   (still usable, but scored below healthy),
+/// * `recovery_threshold` consecutive successful rounds are required to
+///   return to `HEALTHY` from `RECOVERING`,
+/// * a failed round while `RECOVERING` drops straight back to `UNHEALTHY`.
 pub fn step(
     state: HealthStatus,
     consec_failures: u32,
@@ -53,10 +60,11 @@ pub fn step(
 ) -> Step {
     if ok {
         let successes = consec_successes.saturating_add(1);
-        let status = if state != HealthStatus::Up && successes >= hyst.recovery_threshold {
-            HealthStatus::Up
-        } else {
-            state
+        let status = match state {
+            HealthStatus::Healthy => HealthStatus::Healthy,
+            _ if successes >= hyst.recovery_threshold => HealthStatus::Healthy,
+            // Any non-healthy state with a fresh success is recovering.
+            _ => HealthStatus::Recovering,
         };
         Step {
             status,
@@ -66,9 +74,11 @@ pub fn step(
     } else {
         let failures = consec_failures.saturating_add(1);
         let status = match state {
-            HealthStatus::Up => HealthStatus::Degraded,
-            HealthStatus::Degraded if failures >= hyst.failure_threshold => HealthStatus::Down,
-            other => other,
+            HealthStatus::Healthy => HealthStatus::Degraded,
+            HealthStatus::Degraded if failures >= hyst.failure_threshold => HealthStatus::Unhealthy,
+            HealthStatus::Degraded => HealthStatus::Degraded,
+            // A failed probe while recovering means it is down again.
+            HealthStatus::Recovering | HealthStatus::Unhealthy => HealthStatus::Unhealthy,
         };
         Step {
             status,
@@ -86,11 +96,24 @@ pub async fn run_health_checker(
 ) {
     tracing::debug!(event = "health_checker_started");
     loop {
-        let hc: HealthConfig = shared.app.load().health.clone();
-        let base = hc.interval_ms.max(100);
-        // +/-10% jitter so many gateway instances do not synchronise.
+        let app = shared.app.load();
+        let hc: HealthConfig = app.health.clone();
+        // Tick at the minimum of the global interval and any per-upstream
+        // overrides so a fast-probing upstream is not delayed by a slow
+        // global interval.
+        let base = app
+            .upstreams
+            .iter()
+            .filter(|u| u.enabled)
+            .map(|u| u.effective_probe_interval_ms(hc.interval_ms))
+            .min()
+            .unwrap_or(hc.interval_ms)
+            .max(100);
+        // Up to +10% jitter (never sooner than configured) so many gateway
+        // instances do not synchronise their probe storms.
         let jitter_ms = fastrand::u64(0..(base / 10).max(1));
         let sleep = Duration::from_millis(base + jitter_ms);
+        drop(app);
 
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -107,11 +130,28 @@ pub async fn run_health_checker(
 }
 
 async fn run_round(shared: &Arc<Shared>, forwarder: &Forwarder, hc: &HealthConfig) {
+    let now = Instant::now();
     let upstreams: Vec<Arc<UpstreamRuntime>> = shared
         .registry
         .snapshot()
         .into_iter()
-        .filter(|u| u.config().enabled)
+        .filter(|u| {
+            let cfg = u.config();
+            if !cfg.enabled {
+                return false;
+            }
+            // Per-upstream interval: skip if not due yet. Upstreams without
+            // an override follow the global interval (the loop itself ticks
+            // at the global cadence, so they are always due here).
+            match u.last_health_check() {
+                Some(prev) => {
+                    let interval =
+                        Duration::from_millis(cfg.effective_probe_interval_ms(hc.interval_ms));
+                    now.saturating_duration_since(prev) >= interval
+                }
+                None => true,
+            }
+        })
         .collect();
     if upstreams.is_empty() {
         return;
@@ -146,19 +186,24 @@ async fn check_upstream(
     hyst: &Hysteresis,
 ) {
     let cfg = up.config();
-    let timeout = Duration::from_millis(hc.timeout_ms);
+    let timeout = Duration::from_millis(cfg.effective_probe_timeout_ms(hc.timeout_ms).max(500));
+    let probes = cfg.effective_probes(&hc.probes);
+    let expect = cfg.expected_probe_rcode();
     let pre_state = up.health_status();
 
     let mut successes = 0usize;
     let mut attempts = 0usize;
     let mut latencies: Vec<Duration> = Vec::new();
     let mut last_error: Option<String> = None;
+    // Bounded failure-reason label for the metric (never free-form client data).
+    let mut fail_reason: &'static str = "no_probe";
 
-    'probes: for probe in &hc.probes {
+    'probes: for probe in &probes {
         let raw = match msg::build_query(&probe.name, &probe.query_type) {
             Ok(r) => r,
             Err(e) => {
                 last_error = Some(format!("probe build failed: {e}"));
+                fail_reason = "build_error";
                 continue;
             }
         };
@@ -166,6 +211,7 @@ async fn check_upstream(
             Ok(p) => p,
             Err(e) => {
                 last_error = Some(format!("probe parse failed: {e:?}"));
+                fail_reason = "parse_error";
                 continue;
             }
         };
@@ -181,16 +227,27 @@ async fn check_upstream(
                 .exchange_with(&cfg, &parsed, &raw, timeout, proto)
                 .await
             {
-                Ok(ok) => match ok.view.rcode {
-                    Rcode::NoError | Rcode::NXDomain => {
+                Ok(ok) => {
+                    let ok_rcode = match expect {
+                        Some(want) => ok.view.rcode == want,
+                        None => matches!(ok.view.rcode, Rcode::NoError | Rcode::NXDomain),
+                    };
+                    if ok_rcode {
                         successes += 1;
                         latencies.push(ok.latency);
+                    } else {
+                        last_error = Some(format!("rcode {}", ok.view.rcode.as_str()));
+                        fail_reason = "rcode";
                     }
-                    other => {
-                        last_error = Some(format!("rcode {}", other.as_str()));
-                    }
-                },
-                Err(e) => last_error = Some(e.to_string()),
+                }
+                Err(e) => {
+                    last_error = Some(e.to_string());
+                    fail_reason = match e {
+                        crate::dns::forward::ExchangeError::Timeout => "timeout",
+                        crate::dns::forward::ExchangeError::Network(_) => "network",
+                        crate::dns::forward::ExchangeError::Invalid(_) => "invalid",
+                    };
+                }
             }
             if successes >= hc.min_successes {
                 break 'probes;
@@ -211,20 +268,35 @@ async fn check_upstream(
         last_error.or_else(|| Some("no successful probe".into()))
     };
 
-    let transition = up.record_health_round(ok, latency, error.clone(), hyst);
+    let transition = up.record_health_round(
+        ok,
+        latency,
+        error.clone(),
+        hyst,
+        Duration::from_millis(hc.dwell_ms),
+    );
     record_check_metrics(shared, &cfg.name, ok, latency, transition.is_some());
+    if !ok {
+        shared
+            .metrics
+            .healthcheck_reason_total
+            .with_label_values(&[&cfg.name, fail_reason])
+            .inc();
+    }
 
     if let Some(t) = &transition {
         log_transition(&cfg.name, *t, &error);
-        shared
-            .metrics
-            .set_upstream_health(&cfg.name, t.to == HealthStatus::Up, t.to.state_value());
+        shared.metrics.set_upstream_health(
+            &cfg.name,
+            t.to == HealthStatus::Healthy,
+            t.to.state_value(),
+        );
     }
 
     // Record: state transitions, plus failed rounds while the upstream is
-    // still in play (bounded volume; steady-state DOWN failures are not
+    // still in play (bounded volume; steady-state UNHEALTHY failures are not
     // recorded every round).
-    let should_record = transition.is_some() || (!ok && pre_state != HealthStatus::Down);
+    let should_record = transition.is_some() || (!ok && pre_state != HealthStatus::Unhealthy);
     if should_record {
         shared.record_health_event(
             if transition.is_some() {
@@ -248,9 +320,10 @@ async fn check_upstream(
 
 fn state_str(s: HealthStatus) -> &'static str {
     match s {
-        HealthStatus::Up => "up",
+        HealthStatus::Healthy => "healthy",
         HealthStatus::Degraded => "degraded",
-        HealthStatus::Down => "down",
+        HealthStatus::Recovering => "recovering",
+        HealthStatus::Unhealthy => "unhealthy",
     }
 }
 
@@ -292,8 +365,8 @@ fn log_transition(name: &str, t: HealthTransition, error: &Option<String>) {
     let from = state_str(t.from);
     let to = state_str(t.to);
     match t.to {
-        HealthStatus::Down => tracing::warn!(
-            event = "upstream_marked_down",
+        HealthStatus::Unhealthy => tracing::warn!(
+            event = "upstream_marked_unhealthy",
             upstream = %name,
             from,
             to,
@@ -306,7 +379,13 @@ fn log_transition(name: &str, t: HealthTransition, error: &Option<String>) {
             to,
             error = error.as_deref().unwrap_or(""),
         ),
-        HealthStatus::Up => tracing::info!(
+        HealthStatus::Recovering => tracing::info!(
+            event = "upstream_recovering",
+            upstream = %name,
+            from,
+            to,
+        ),
+        HealthStatus::Healthy => tracing::info!(
             event = "upstream_recovered",
             upstream = %name,
             from,
@@ -328,10 +407,14 @@ pub fn refresh_gauges(shared: &Arc<Shared>, metrics: &Arc<Metrics>) {
             active += 1;
         }
         let status = up.health_status();
-        if status == HealthStatus::Up {
+        if status == HealthStatus::Healthy {
             healthy += 1;
         }
-        metrics.set_upstream_health(&cfg.name, status == HealthStatus::Up, status.state_value());
+        metrics.set_upstream_health(
+            &cfg.name,
+            status == HealthStatus::Healthy,
+            status.state_value(),
+        );
     }
     metrics.active_upstreams.set(active);
     metrics.healthy_upstreams.set(healthy);
@@ -378,9 +461,11 @@ pub async fn probe_once(
     let app = shared.app.load();
     let hc = app.health.clone();
     let cfg = up.config();
-    let timeout = Duration::from_millis(hc.timeout_ms.max(500));
+    let timeout = Duration::from_millis(cfg.effective_probe_timeout_ms(hc.timeout_ms).max(500));
 
-    let probe = hc.probes.first().cloned().unwrap_or_default();
+    let probes = cfg.effective_probes(&hc.probes);
+    let probe = probes.first().cloned().unwrap_or_default();
+    let expect = cfg.expected_probe_rcode();
     let started = std::time::Instant::now();
     let raw = match msg::build_query(&probe.name, &probe.query_type) {
         Ok(r) => r,
@@ -399,7 +484,10 @@ pub async fn probe_once(
     let out = match result {
         Ok(ok) => {
             let rcode = ok.view.rcode;
-            let success = matches!(rcode, Rcode::NoError | Rcode::NXDomain);
+            let success = match expect {
+                Some(want) => rcode == want,
+                None => matches!(rcode, Rcode::NoError | Rcode::NXDomain),
+            };
             ProbeResult {
                 success,
                 latency_ms: Some(ok.latency.as_secs_f64() * 1000.0),
@@ -431,6 +519,7 @@ pub async fn probe_once(
         out.latency_ms.map(|ms| Duration::from_millis(ms as u64)),
         out.error.clone(),
         &hyst,
+        Duration::from_millis(hc.dwell_ms),
     );
     record_check_metrics(
         shared,
@@ -441,9 +530,11 @@ pub async fn probe_once(
     );
     if let Some(t) = &transition {
         log_transition(&cfg.name, *t, &out.error);
-        shared
-            .metrics
-            .set_upstream_health(&cfg.name, t.to == HealthStatus::Up, t.to.state_value());
+        shared.metrics.set_upstream_health(
+            &cfg.name,
+            t.to == HealthStatus::Healthy,
+            t.to.state_value(),
+        );
     }
     shared.record_health_event(
         "probe",
@@ -492,16 +583,16 @@ mod tests {
     #[test]
     fn first_failure_degrades_immediately() {
         let h = hyst(3, 2);
-        let s = step(HealthStatus::Up, 0, 5, false, &h);
+        let s = step(HealthStatus::Healthy, 0, 5, false, &h);
         assert_eq!(s.status, HealthStatus::Degraded);
         assert_eq!(s.consec_failures, 1);
         assert_eq!(s.consec_successes, 0);
     }
 
     #[test]
-    fn failure_threshold_takes_it_down() {
+    fn failure_threshold_takes_it_unhealthy() {
         let h = hyst(3, 2);
-        let mut state = HealthStatus::Up;
+        let mut state = HealthStatus::Healthy;
         let mut f = 0;
         let mut s = 0;
         for i in 1..=3 {
@@ -513,38 +604,42 @@ mod tests {
                 assert_eq!(state, HealthStatus::Degraded);
             }
         }
-        assert_eq!(state, HealthStatus::Down);
-        // Stays down on further failures.
+        assert_eq!(state, HealthStatus::Unhealthy);
+        // Stays unhealthy on further failures.
         let st = step(state, f, s, false, &h);
-        assert_eq!(st.status, HealthStatus::Down);
+        assert_eq!(st.status, HealthStatus::Unhealthy);
         assert_eq!(st.consec_failures, 4);
     }
 
     #[test]
-    fn recovery_requires_threshold_consecutive_successes() {
+    fn recovery_passes_through_recovering() {
         let h = hyst(3, 2);
-        let mut state = HealthStatus::Down;
+        let mut state = HealthStatus::Unhealthy;
         let mut f = 5;
         let mut s = 0;
 
         let st = step(state, f, s, true, &h);
-        assert_eq!(st.status, HealthStatus::Down, "one success is not enough");
+        assert_eq!(
+            st.status,
+            HealthStatus::Recovering,
+            "first success enters Recovering"
+        );
         state = st.status;
         f = st.consec_failures;
         s = st.consec_successes;
 
         let st = step(state, f, s, true, &h);
-        assert_eq!(st.status, HealthStatus::Up, "two successes recover");
+        assert_eq!(st.status, HealthStatus::Healthy, "two successes recover");
         assert_eq!(st.consec_failures, 0);
     }
 
     #[test]
-    fn failure_resets_recovery_progress() {
+    fn failure_while_recovering_goes_unhealthy() {
         let h = hyst(3, 2);
-        let st = step(HealthStatus::Down, 4, 0, true, &h);
-        assert_eq!(st.status, HealthStatus::Down);
+        let st = step(HealthStatus::Unhealthy, 4, 0, true, &h);
+        assert_eq!(st.status, HealthStatus::Recovering);
         assert_eq!(st.consec_successes, 1);
-        // A failure wipes the success streak.
+        // A failure while recovering wipes the streak and drops to unhealthy.
         let st2 = step(
             st.status,
             st.consec_failures,
@@ -553,23 +648,32 @@ mod tests {
             &h,
         );
         assert_eq!(st2.consec_successes, 0);
-        assert_eq!(st2.status, HealthStatus::Down);
+        assert_eq!(st2.status, HealthStatus::Unhealthy);
     }
 
     #[test]
-    fn success_while_up_keeps_up_and_resets_failures() {
+    fn success_while_healthy_keeps_healthy_and_resets_failures() {
         let h = hyst(3, 2);
-        let st = step(HealthStatus::Up, 2, 0, true, &h);
-        assert_eq!(st.status, HealthStatus::Up);
+        let st = step(HealthStatus::Healthy, 2, 0, true, &h);
+        assert_eq!(st.status, HealthStatus::Healthy);
         assert_eq!(st.consec_failures, 0);
     }
 
     #[test]
-    fn degraded_recovered_after_threshold() {
+    fn degraded_recovers_via_recovering_after_threshold() {
         let h = hyst(3, 2);
         let st = step(HealthStatus::Degraded, 1, 0, true, &h);
-        assert_eq!(st.status, HealthStatus::Degraded);
+        assert_eq!(st.status, HealthStatus::Recovering);
         let st = step(st.status, st.consec_failures, st.consec_successes, true, &h);
-        assert_eq!(st.status, HealthStatus::Up);
+        assert_eq!(st.status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn recovering_is_usable() {
+        assert!(HealthStatus::Recovering.is_usable());
+        assert!(!HealthStatus::Unhealthy.is_usable());
+        assert_eq!(HealthStatus::Recovering.state_value(), 3);
+        assert_eq!(HealthStatus::Unhealthy.state_value(), 0);
+        assert_eq!(HealthStatus::Healthy.state_value(), 2);
     }
 }

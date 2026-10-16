@@ -10,7 +10,7 @@
  "panels": [
   {
    "type": "stat",
-   "title": "Upstreams UP",
+   "title": "Usable upstreams",
    "fieldConfig": {
     "defaults": {
      "noValue": "No data",
@@ -50,6 +50,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
+   "description": "HEALTHY (2) or RECOVERING (3) \u2014 both are selected for queries.",
    "id": 1,
    "gridPos": {
     "x": 0,
@@ -69,7 +70,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "sum(res_upstream_state == 2)",
+     "expr": "sum(res_upstream_state >= 2)",
      "instant": true,
      "range": false
     }
@@ -797,7 +798,7 @@
   },
   {
    "type": "state-timeline",
-   "title": "Upstream health state (0=DOWN, 1=DEGRADED, 2=UP)",
+   "title": "Upstream health state (0=UNHEALTHY, 1=DEGRADED, 2=HEALTHY, 3=RECOVERING)",
    "fieldConfig": {
     "defaults": {
      "noValue": "No data",
@@ -806,7 +807,7 @@
        "type": "value",
        "options": {
         "0": {
-         "text": "DOWN",
+         "text": "UNHEALTHY",
          "color": "red"
         },
         "1": {
@@ -814,8 +815,12 @@
          "color": "yellow"
         },
         "2": {
-         "text": "UP",
+         "text": "HEALTHY",
          "color": "green"
+        },
+        "3": {
+         "text": "RECOVERING",
+         "color": "blue"
         }
        }
       }
@@ -834,6 +839,10 @@
        {
         "color": "green",
         "value": 2
+       },
+       {
+        "color": "blue",
+        "value": 3
        }
       ]
      },

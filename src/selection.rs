@@ -6,17 +6,23 @@
 //! remaining candidate gets a score:
 //!
 //! ```text
-//! health_factor   = 1.0 if UP, 0.4 if DEGRADED
+//! health_factor   = 1.0 if UP, 0.7 if RECOVERING, 0.4 if DEGRADED
 //! reliability     = (successes + 1) / (samples + 2)        // Laplace smoothed,
-//!                                                           // rolling window
+//!                                                           // rolling window;
+//!                                                           // 0.5 with no samples
 //! latency_factor  = ref / (ref + p95_ms)                   // ref = 50ms default
-//! score           = health_factor * reliability * latency_factor * weight
+//! probe_factor    = (rounds - failures) / rounds           // 1.0 until
+//!                                                           // min_probe_samples
+//! score           = health_factor * reliability * latency_factor * probe_factor
+//!                   * weight
 //! ```
 //!
 //! Reliability dominates deliberately: an upstream with 5 ms latency and a 20%
 //! failure rate must not win over one with 12 ms latency and ~0% failures.
 //! Latency only breaks ties between similarly reliable upstreams, and `weight`
-//! sets the long-run traffic share inside a tier.
+//! sets the long-run traffic share inside a tier. The probe term only enters
+//! after `selection.min_probe_samples` completed health rounds so a freshly
+//! started upstream is not penalised for having no probe history.
 //!
 //! # Tier / degraded policies (`[selection]`)
 //!
@@ -50,11 +56,14 @@ pub struct StateView {
     pub p95_ms: f64,
     pub avg_ms: f64,
     pub has_latency: bool,
+    /// Probe success rate over completed health rounds; `None` while below
+    /// `min_probe_samples` (score uses a neutral 1.0).
+    pub probe_success: Option<f64>,
 }
 
 impl StateView {
-    pub fn from_runtime(rt: &UpstreamRuntime) -> Self {
-        let v: ViewInputs = rt.view_inputs();
+    pub fn from_runtime(rt: &UpstreamRuntime, min_probe_samples: u32) -> Self {
+        let v: ViewInputs = rt.view_inputs(min_probe_samples);
         Self {
             id: rt.id(),
             health: v.status,
@@ -64,15 +73,18 @@ impl StateView {
             p95_ms: v.p95_ms,
             avg_ms: v.avg_ms,
             has_latency: v.has_latency,
+            probe_success: v.probe_success,
         }
     }
 
     /// Composite score for this candidate (see module docs).
     pub fn score(&self, latency_reference_ms: f64) -> f64 {
         let health_factor = match self.health {
-            HealthStatus::Up => 1.0,
+            HealthStatus::Healthy => 1.0,
+            // Recovering: answering again but not yet fully trusted.
+            HealthStatus::Recovering => 0.7,
             HealthStatus::Degraded => 0.4,
-            HealthStatus::Down => 0.0,
+            HealthStatus::Unhealthy => 0.0,
         };
         let latency = if self.has_latency {
             self.p95_ms.max(self.avg_ms)
@@ -81,7 +93,8 @@ impl StateView {
             latency_reference_ms
         };
         let latency_factor = latency_reference_ms / (latency_reference_ms + latency);
-        health_factor * self.reliability * latency_factor * self.weight as f64
+        let probe_factor = self.probe_success.unwrap_or(1.0);
+        health_factor * self.reliability * latency_factor * probe_factor * self.weight as f64
     }
 }
 
@@ -143,10 +156,15 @@ fn eligible(candidates: &[StateView], p: &Policies) -> Vec<StateView> {
     let usable = match p.degraded_policy {
         DegradedPolicy::Usable => usable,
         DegradedPolicy::LastResort => {
-            if usable.iter().any(|c| c.health == HealthStatus::Up) {
+            if usable
+                .iter()
+                .any(|c| matches!(c.health, HealthStatus::Healthy | HealthStatus::Recovering))
+            {
                 usable
                     .into_iter()
-                    .filter(|c| c.health == HealthStatus::Up)
+                    .filter(|c| {
+                        matches!(c.health, HealthStatus::Healthy | HealthStatus::Recovering)
+                    })
                     .collect()
             } else {
                 usable
@@ -299,7 +317,33 @@ mod tests {
             p95_ms: p95,
             avg_ms: p95,
             has_latency: p95 > 0.0,
+            probe_success: None,
         }
+    }
+
+    fn view_with_probe(
+        id: i64,
+        health: HealthStatus,
+        priority: u32,
+        weight: u32,
+        rel: f64,
+        p95: f64,
+        probe: f64,
+    ) -> StateView {
+        StateView {
+            probe_success: Some(probe),
+            ..view(id, health, priority, weight, rel, p95)
+        }
+    }
+
+    #[test]
+    fn probe_factor_penalises_failing_probes_when_enough_samples() {
+        let a = view_with_probe(1, HealthStatus::Healthy, 1, 1, 1.0, 10.0, 1.0);
+        let b = view_with_probe(2, HealthStatus::Healthy, 1, 1, 1.0, 10.0, 0.4);
+        assert!(a.score(50.0) > b.score(50.0), "probe success must win");
+        // Neutral probe (None) scores the same as probe=1.0.
+        let neutral = view(3, HealthStatus::Healthy, 1, 1, 1.0, 10.0);
+        assert!((a.score(50.0) - neutral.score(50.0)).abs() < 1e-9);
     }
 
     fn strict() -> Policies {
@@ -328,13 +372,13 @@ mod tests {
     fn down_upstreams_are_never_selected() {
         let sel = weighted(strict());
         let cands = vec![
-            view(1, HealthStatus::Down, 1, 1, 0.9, 5.0),
-            view(2, HealthStatus::Up, 1, 1, 0.9, 5.0),
+            view(1, HealthStatus::Unhealthy, 1, 1, 0.9, 5.0),
+            view(2, HealthStatus::Healthy, 1, 1, 0.9, 5.0),
         ];
         for _ in 0..50 {
             assert_eq!(sel.select(&cands), Some(2));
         }
-        let all_down = vec![view(1, HealthStatus::Down, 1, 1, 0.9, 5.0)];
+        let all_down = vec![view(1, HealthStatus::Unhealthy, 1, 1, 0.9, 5.0)];
         assert_eq!(sel.select(&all_down), None);
     }
 
@@ -344,7 +388,7 @@ mod tests {
         // Tier 1 is degraded and slow; tier 2 is perfect. Tier 1 must win.
         let cands = vec![
             view(1, HealthStatus::Degraded, 2, 1, 1.0, 1.0),
-            view(2, HealthStatus::Up, 1, 1, 0.5, 100.0),
+            view(2, HealthStatus::Healthy, 1, 1, 0.5, 100.0),
         ];
         assert_eq!(sel.select(&cands), Some(2));
     }
@@ -352,15 +396,15 @@ mod tests {
     #[test]
     fn reliability_beats_latency() {
         // A: 5 ms but 60% reliable. B: 12 ms but ~100% reliable.
-        let a = view(1, HealthStatus::Up, 1, 1, 0.6, 5.0);
-        let b = view(2, HealthStatus::Up, 1, 1, 0.99, 12.0);
+        let a = view(1, HealthStatus::Healthy, 1, 1, 0.6, 5.0);
+        let b = view(2, HealthStatus::Healthy, 1, 1, 0.99, 12.0);
         let score_ref = 50.0;
         assert!(b.score(score_ref) > a.score(score_ref));
     }
 
     #[test]
     fn degraded_is_penalised_but_usable() {
-        let up = view(1, HealthStatus::Up, 1, 1, 0.9, 10.0);
+        let up = view(1, HealthStatus::Healthy, 1, 1, 0.9, 10.0);
         let deg = view(2, HealthStatus::Degraded, 1, 1, 0.9, 10.0);
         assert!(up.score(50.0) > deg.score(50.0));
         // Degraded is still a valid fallback when it is alone.
@@ -377,7 +421,7 @@ mod tests {
         let sel = weighted(p);
         let mixed = vec![
             view(1, HealthStatus::Degraded, 1, 1, 1.0, 1.0),
-            view(2, HealthStatus::Up, 1, 1, 0.5, 100.0),
+            view(2, HealthStatus::Healthy, 1, 1, 0.5, 100.0),
         ];
         for _ in 0..100 {
             assert_eq!(sel.select(&mixed), Some(2), "degraded must not be used");
@@ -410,8 +454,8 @@ mod tests {
         let sel = weighted(p);
         // Identical scores, different tiers: ~10% of picks land on tier 2.
         let cands = vec![
-            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
-            view(2, HealthStatus::Up, 2, 1, 1.0, 10.0),
+            view(1, HealthStatus::Healthy, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Healthy, 2, 1, 1.0, 10.0),
         ];
         let mut lower = 0u32;
         let n = 3000u32;
@@ -437,8 +481,8 @@ mod tests {
         };
         let sel = weighted(p);
         let cands = vec![
-            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
-            view(2, HealthStatus::Up, 2, 1, 1.0, 10.0),
+            view(1, HealthStatus::Healthy, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Healthy, 2, 1, 1.0, 10.0),
         ];
         for _ in 0..200 {
             assert_eq!(sel.select(&cands), Some(1));
@@ -450,8 +494,8 @@ mod tests {
         fastrand::seed(42);
         let sel = weighted(strict());
         let cands = vec![
-            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
-            view(2, HealthStatus::Up, 1, 9, 1.0, 10.0),
+            view(1, HealthStatus::Healthy, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Healthy, 1, 9, 1.0, 10.0),
         ];
         let mut wins = [0u32; 2];
         for _ in 0..2000 {
@@ -468,8 +512,8 @@ mod tests {
         fastrand::seed(7);
         let sel = weighted(strict());
         let cands = vec![
-            view(1, HealthStatus::Up, 1, 1, 1.0, 10.0),
-            view(2, HealthStatus::Up, 1, 1, 1.0, 10.0),
+            view(1, HealthStatus::Healthy, 1, 1, 1.0, 10.0),
+            view(2, HealthStatus::Healthy, 1, 1, 1.0, 10.0),
         ];
         let mut wins = [0u32; 2];
         for _ in 0..1000 {
@@ -481,7 +525,7 @@ mod tests {
 
     #[test]
     fn no_latency_is_neutral() {
-        let fresh = view(1, HealthStatus::Up, 1, 1, 0.9, 0.0);
+        let fresh = view(1, HealthStatus::Healthy, 1, 1, 0.9, 0.0);
         assert!(!fresh.has_latency);
         let s = fresh.score(50.0);
         // reliability * 0.5 * weight

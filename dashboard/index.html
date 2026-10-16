@@ -175,9 +175,10 @@ td.num,th.num{text-align:right;font-family:var(--mono)}
 .state{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;
   font-weight:600;text-transform:uppercase;letter-spacing:.05em}
 .state .d{width:8px;height:8px;border-radius:50%}
-.state.up{color:#7ee787}.state.up .d{background:var(--ok);box-shadow:0 0 5px var(--ok)}
+.state.healthy{color:#7ee787}.state.healthy .d{background:var(--ok);box-shadow:0 0 5px var(--ok)}
 .state.degraded{color:#e3b341}.state.degraded .d{background:var(--warn)}
-.state.down{color:#ff7b72}.state.down .d{background:var(--crit)}
+.state.recovering{color:#79c0ff}.state.recovering .d{background:#388bfd}
+.state.unhealthy{color:#ff7b72}.state.unhealthy .d{background:var(--crit)}
 .state.disabled{color:var(--faint)}.state.disabled .d{background:#484f58}
 .tag{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:4px;
   border:1px solid var(--line2);color:var(--dim)}
@@ -255,6 +256,27 @@ button.ghost{background:var(--panel2);border:1px solid var(--line2);color:var(--
 footer{margin-top:34px;color:var(--faint);font-size:11px;border-top:1px solid var(--line);
   padding-top:10px;display:flex;gap:18px;flex-wrap:wrap}
 #js-errors{display:none}
+
+/* ---------- login overlay ---------- */
+#login-ov{position:fixed;inset:0;z-index:100;background:rgba(6,9,13,.86);
+  backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center}
+#login-ov.on{display:flex}
+#login-box{background:var(--panel);border:1px solid var(--line2);border-radius:10px;
+  padding:26px 28px;width:min(360px,92vw);box-shadow:0 18px 50px #000a}
+#login-box h3{margin:0 0 4px;font-size:15px;color:#e6edf3}
+#login-box .sub{color:var(--dim);font-size:12px;margin-bottom:16px}
+#login-box label{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--faint);margin:12px 0 4px}
+#login-box input{width:100%;background:var(--panel2);color:var(--fg);border:1px solid var(--line2);
+  border-radius:6px;padding:8px 10px;font-size:13px;font-family:var(--sans);outline:none}
+#login-box input:focus{border-color:#3b4a61}
+#login-box .row{display:flex;gap:8px;align-items:center;margin-top:18px}
+#login-box button{background:#1f6feb;border:0;color:#fff;border-radius:6px;padding:8px 18px;
+  font-size:13px;font-weight:600;cursor:pointer;font-family:var(--sans)}
+#login-box button:hover{background:#388bfd}
+#login-box button.ghost{background:transparent;border:1px solid var(--line2);color:var(--dim);font-weight:400}
+#login-msg{font-size:12px;min-height:16px;margin-top:10px;color:#ff7b72}
+#login-msg.ok{color:#7ee787}
 </style>
 <script>
 /* Headless-CI error probe: any uncaught error/rejection is mirrored into the
@@ -275,6 +297,27 @@ window.addEventListener('unhandledrejection', function(e){
 </head>
 <body>
 <div id="js-errors"></div>
+
+<!-- Login overlay: shown when the gateway requires password auth and no
+     live session exists. Session cookie is HttpOnly; nothing is stored in
+     localStorage. -->
+<div id="login-ov" role="dialog" aria-modal="true" aria-labelledby="login-title">
+  <div id="login-box">
+    <h3 id="login-title">Sign in to res</h3>
+    <div class="sub">The gateway requires a password. Use the admin or viewer
+      account configured via <span class="mono">RES_ADMIN_PASSWORD</span> /
+      <span class="mono">RES_VIEWER_PASSWORD</span>.</div>
+    <label for="login-user">Username</label>
+    <input id="login-user" autocomplete="username" value="admin">
+    <label for="login-pass">Password</label>
+    <input id="login-pass" type="password" autocomplete="current-password">
+    <div class="row">
+      <button id="login-go">Sign in</button>
+      <button class="ghost" id="login-cancel">Read-only status</button>
+    </div>
+    <div id="login-msg"></div>
+  </div>
+</div>
 
 <header>
   <div class="hbar">
@@ -302,6 +345,7 @@ window.addEventListener('unhandledrejection', function(e){
       </label>
       <label title="Auto-refresh the live section and history"><input type="checkbox" id="auto-chk" checked> auto</label>
       <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
+      <span class="chip" id="auth-chip" title="Session status">…</span>
       <span id="updated">connecting…</span>
     </span>
   </div>
@@ -436,7 +480,7 @@ window.addEventListener('unhandledrejection', function(e){
     <div class="tpanel">
       <div class="tptitle">Eligible for selection</div>
       <div class="barlist" id="up-eligible"><div class="empty">loading…</div></div>
-      <div class="tpsub">Avoided (down while others are healthy)</div>
+      <div class="tpsub">Avoided (unhealthy while others are healthy)</div>
       <div class="barlist" id="up-avoided"><div class="empty">—</div></div>
     </div>
     <div class="tpanel">
@@ -474,10 +518,10 @@ window.addEventListener('unhandledrejection', function(e){
       <th class="num">QPS</th><th class="num">Attempts</th><th class="num">OK</th><th class="num">Failed</th><th class="num">Timeouts</th>
       <th class="num">Success</th><th class="num">Failure</th><th class="num">Timeout</th>
       <th class="num">Avg</th><th class="num">P50</th><th class="num">P95</th><th class="num">P99</th>
-      <th class="num">Failovers</th>
+      <th class="num">Failovers</th><th class="num">Score</th><th class="num">Rank</th><th class="num">Rounds</th>
       <th>Last success</th><th>Last failure</th><th>State changed</th><th>Last check</th><th>Check result</th><th>Last error</th>
     </tr></thead>
-    <tbody id="up-rows"><tr><td colspan="24" class="empty">loading…</td></tr></tbody>
+    <tbody id="up-rows"><tr><td colspan="27" class="empty">loading…</td></tr></tbody>
   </table>
   </div>
 
@@ -510,6 +554,15 @@ window.addEventListener('unhandledrejection', function(e){
       <label>Priority <input id="umg-priority" type="number" min="1" value="1"></label>
       <label>Weight <input id="umg-weight" type="number" min="1" value="1"></label>
       <label>Timeout ms <input id="umg-timeout" type="number" min="1" max="60000" placeholder="inherit"></label>
+      <label>Probe interval ms <input id="umg-probe-interval" type="number" min="100" max="600000" placeholder="inherit"
+        title="Per-upstream health-check interval override; empty inherits [health].interval"></label>
+      <label>Probe timeout ms <input id="umg-probe-timeout" type="number" min="1" max="60000" placeholder="inherit"
+        title="Per-upstream health-check timeout override; empty inherits [health].timeout"></label>
+      <label>Expected rcode <input id="umg-expect-rcode" maxlength="32" placeholder="any (e.g. NOERROR)"
+        title="Health probes pass only when the upstream answers with this rcode; empty = accept any. Clearing a previously saved value removes the expectation."></label>
+      <label>Probes <textarea id="umg-probes" rows="3" spellcheck="false"
+        placeholder="inherit global [health].probes — override with one per line:&#10;A example.com&#10;AAAA example.com&#10;NS ."
+        title="Per-upstream probe list. One per line, 'TYPE name'. Empty = inherit global probes; on edit, emptying a previously saved list clears the override."></textarea></label>
       <label class="chk"><input type="checkbox" id="umg-enabled" checked> enabled</label>
       <label class="chk" title="Required by the gateway when the change would leave zero enabled upstreams"><input type="checkbox" id="umg-confirm"> confirm if last enabled upstream</label>
       <div class="umg-actions">
@@ -535,6 +588,137 @@ window.addEventListener('unhandledrejection', function(e){
     <div id="umg-cfgmeta"></div>
     <pre id="umg-cfgtext">loading…</pre>
   </details>
+
+  <!-- ============ ACL MANAGEMENT ============ -->
+  <h2>Client ACL <span class="sub">allow/deny entries applied at runtime — application-layer only, not a firewall</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Add entry</div>
+      <div class="umg-form" style="padding:8px 12px 12px">
+        <label>IP or CIDR <input id="acl-cidr" placeholder="192.0.2.10, 198.51.100.0/24, 2001:db8::/48"></label>
+        <label>Action <select id="acl-action"><option value="allow">allow</option><option value="deny">deny</option></select></label>
+        <label class="chk"><input type="checkbox" id="acl-enabled" checked> enabled</label>
+        <div class="umg-actions">
+          <button class="primary" id="acl-add">Add entry</button>
+          <button class="ghost" id="acl-reload">Reload</button>
+        </div>
+      </div>
+      <div id="acl-msg" style="padding:0 12px 10px"></div>
+      <div class="tpsub" style="padding:0 12px 6px">Precedence: <b>deny</b> is evaluated first and wins over any
+        matching allow. If no allow matches (or the allow list is empty) the client is refused — fail-closed, so an
+        unconfigured gateway is never an open resolver. Bare IPs become /32 or /128; IPv4-mapped IPv6 clients are
+        matched against both v6 and embedded-v4 rules. Disabled entries are kept but never evaluated.</div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Current effective policy</div>
+      <div class="stats" id="acl-summary" style="padding:8px 12px 0"><div class="empty" style="padding:6px 0">loading…</div></div>
+    </div>
+  </div>
+  <div style="overflow-x:auto;margin-top:10px">
+  <table id="acl-table">
+    <thead><tr>
+      <th>ID</th><th>Entry (IP / CIDR)</th><th>Action</th><th>Enabled</th><th>Source</th><th>Actions</th>
+    </tr></thead>
+    <tbody id="acl-rows"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+  </table>
+  </div>
+
+  <!-- ============ CACHE MANAGEMENT ============ -->
+  <h2>Cache <span class="sub">TTL policy, live settings and clear — the runtime cache itself, not a page refresh</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Current usage</div>
+      <div class="stats" id="cache-stats" style="padding:8px 12px 4px"><div class="empty" style="padding:6px 0">loading…</div></div>
+      <div style="padding:4px 12px 10px;display:flex;gap:8px">
+        <button class="danger" id="cache-clear">Clear cache</button>
+        <button class="ghost" id="cache-reload">Reload settings</button>
+      </div>
+      <div id="cache-msg" style="padding:0 12px 10px"></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Settings (applied at runtime)</div>
+      <div class="umg-form" style="padding:8px 12px 12px">
+        <label class="chk"><input type="checkbox" id="cache-enabled"> caching enabled</label>
+        <label>Min TTL secs <input id="cache-min" type="number" min="0" max="86400"
+          title="Skip threshold: answers with a shorter TTL are not cached (never extended)"></label>
+        <label>Max TTL secs <input id="cache-max" type="number" min="1" max="604800"
+          title="Upper cap; never extends an authoritative TTL. Default ≥ 300s (5 min)."></label>
+        <label>Negative max TTL <input id="cache-negmax" type="number" min="0" max="86400"></label>
+        <label>Max entries <input id="cache-maxent" type="number" min="1" max="1000000"></label>
+        <label>Max memory bytes <input id="cache-maxmem" type="number" min="1" max="1073741824"
+          title="Hard cap on cached payload bytes (entries + per-entry overhead); the count cap alone cannot bound memory"></label>
+        <div class="umg-actions">
+          <button class="primary" id="cache-save">Apply settings</button>
+        </div>
+      </div>
+      <div class="tpsub" style="padding:0 12px 8px">min_ttl acts as a cacheability threshold only — the gateway never
+        extends a record's remaining TTL. max_ttl only caps longer TTLs downwards.</div>
+    </div>
+  </div>
+
+  <!-- ============ HEALTH CHECKS & SELECTION ============ -->
+  <h2>Health checks &amp; selection <span class="sub">probing cadence, recovery policy and traffic selection — applied at runtime, no restart</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Health checks</div>
+      <div class="umg-form" style="padding:8px 12px 12px">
+        <label class="chk"><input type="checkbox" id="hlt-enabled"> active probing enabled</label>
+        <label>Interval ms <input id="hlt-interval" type="number" min="100" max="600000"
+          title="Interval between probe rounds (min 100ms)"></label>
+        <label>Timeout ms <input id="hlt-timeout" type="number" min="1" max="60000"></label>
+        <label>Fail after <input id="hlt-fail" type="number" min="1" max="100"
+          title="Consecutive failed rounds before an upstream is DOWN"></label>
+        <label>Recover after <input id="hlt-rec" type="number" min="1" max="100"
+          title="Consecutive successful rounds required to return to UP"></label>
+        <label>Min successes <input id="hlt-minsucc" type="number" min="0" max="100"
+          title="Minimum probes in a round that must succeed"></label>
+        <label class="chk" title="Also probe TCP when the upstream protocol is UDP"><input type="checkbox" id="hlt-tcp"> also probe TCP</label>
+        <label>Dwell ms <input id="hlt-dwell" type="number" min="0" max="600000"
+          title="Anti-flap: improvements after a worsening transition are held back this long (0 disables). Worsening is never delayed."></label>
+        <label>Probes <textarea id="hlt-probes" rows="4" spellcheck="false"
+          placeholder="one per line:&#10;A example.com&#10;AAAA example.com&#10;NS ."
+          title="Global probe queries, one per line: 'TYPE name'. Empty is rejected while probing is enabled."></textarea></label>
+        <div class="umg-actions">
+          <button class="primary" id="hlt-save">Apply health settings</button>
+          <button class="ghost" id="hlt-reload">Reload</button>
+        </div>
+      </div>
+      <div id="hlt-msg" style="padding:0 12px 10px"></div>
+      <div class="tpsub" style="padding:0 12px 8px">Thresholds and intervals are validated even while probing is
+        off — nonsense never persists and then bites when re-enabled.</div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Selection policy</div>
+      <div class="umg-form" style="padding:8px 12px 12px">
+        <label>Strategy <select id="sel-strategy">
+          <option value="weighted_reliability">weighted_reliability</option>
+          <option value="best_score">best_score</option>
+          <option value="random_healthy">random_healthy</option>
+        </select></label>
+        <label>Latency reference ms <input id="sel-latref" type="number" min="1" step="0.1"
+          title="A candidate at exactly this latency scores 0.5 on the latency term"></label>
+        <label>Tier policy <select id="sel-tier">
+          <option value="strict">strict</option>
+          <option value="shared">shared</option>
+        </select></label>
+        <label>Lower tier share <input id="sel-lshare" type="number" min="0" max="1" step="0.01"
+          title="Approximate traffic share for lower tiers when tier policy is shared (0.05 ≈ 5%)"></label>
+        <label>Degraded upstreams <select id="sel-degraded">
+          <option value="usable">usable (scored 0.4×)</option>
+          <option value="last_resort">last resort only</option>
+        </select></label>
+        <label>Min probe samples <input id="sel-minsamples" type="number" min="0" max="1000"
+          title="Rounds before probe success enters the score; below this the probe term is neutral"></label>
+        <div class="umg-actions">
+          <button class="primary" id="sel-save">Apply selection</button>
+          <button class="ghost" id="sel-reload">Reload</button>
+        </div>
+      </div>
+      <div id="sel-msg" style="padding:0 12px 10px"></div>
+      <div class="tpsub" style="padding:0 12px 8px">Changes take effect on the next query — in-flight queries keep
+        the snapshot they started with.</div>
+    </div>
+  </div>
 
   <!-- ============ TIMELINE ============ -->
   <h2>Incident timeline <span class="sub">health transitions, failovers, config changes and system events (bounded in-memory rings)</span></h2>
@@ -636,7 +820,8 @@ const META = {
   fds:            ["FDs","","#e3b341"],
   healthy:        ["Healthy","","#7ee787"],
   degraded:       ["Degraded","","#e3b341"],
-  down:           ["Down","","#ff7b72"],
+  recovering:     ["Recovering","","#388bfd"],
+  down:           ["Unhealthy","","#ff7b72"],
   cache_entries:  ["Entries","","#7ee787"],
   tcp_conn_per_min:["TCP accepts","/min","#79c0ff"],
 };
@@ -653,7 +838,7 @@ const CHARTS = [
   {id:"ch-rcodes",   keys:["servfail_pct","nxdomain_pct","refused_pct"]},
   {id:"ch-failovers",keys:["failover_per_min"]},
   {id:"ch-policy",   keys:["rate_limited_per_min","acl_denied_per_min","overload_per_min","malformed_per_min"]},
-  {id:"ch-avail",    keys:["healthy","degraded","down"], step:true},
+  {id:"ch-avail",    keys:["healthy","degraded","recovering","down"], step:true},
   {id:"ch-uplat",    up:"p95_ms"},
   {id:"ch-uptimeout",up:"timeout_pct"},
   {id:"ch-upqps",    up:"qps"},
@@ -671,10 +856,115 @@ async function getJSON(path, timeoutMs=6000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(path, {signal: ctl.signal, cache: "no-store"});
+    const r = await fetch(path, {signal: ctl.signal, cache: "no-store", credentials: "same-origin"});
+    if (r.status === 401) {
+      authNeeded();
+      const j = await r.json().catch(() => ({}));
+      const e = new Error(j.error || "authentication required");
+      e.status = 401;
+      throw e;
+    }
     if (!r.ok) throw new Error("HTTP " + r.status + " for " + path);
     return await r.json();
   } finally { clearTimeout(t); }
+}
+
+/* ---------- session / login ---------- */
+const AUTH = { needed: false, role: null, user: null, dismissReadonly: false };
+function authNeeded(){
+  AUTH.needed = true;
+  if (!AUTH.dismissReadonly) $("login-ov").classList.add("on");
+}
+async function checkSession(){
+  try {
+    const r = await fetch("/api/auth/session", {cache:"no-store", credentials:"same-origin"});
+    if (r.ok){
+      const j = await r.json().catch(() => ({}));
+      AUTH.needed = false; AUTH.role = j.role || null; AUTH.user = j.username || null;
+      $("login-ov").classList.remove("on");
+      renderAuthChip();
+      return true;
+    }
+    if (r.status === 401){ authNeeded(); renderAuthChip(); return false; }
+    // Route unavailable/disabled auth: assume open mode.
+    AUTH.needed = false; renderAuthChip(); return true;
+  } catch(_){ AUTH.needed = false; renderAuthChip(); return true; }
+}
+async function doLogin(){
+  const msg = $("login-msg");
+  msg.textContent = "signing in…"; msg.className = "ok";
+  try {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      credentials: "same-origin",
+      body: JSON.stringify({
+        username: $("login-user").value.trim(),
+        password: $("login-pass").value,
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok){
+      msg.className = "";
+      msg.textContent = j.error || ("login failed (HTTP " + r.status + ")");
+      if (r.status === 429 && j.error) msg.textContent = j.error;
+      return;
+    }
+    AUTH.needed = false; AUTH.dismissReadonly = false;
+    AUTH.role = j.role || null; AUTH.user = j.username || null;
+    $("login-pass").value = "";
+    $("login-ov").classList.remove("on");
+    renderAuthChip();
+    await Promise.all([fetchCurrent(), fetchMonitoring(), fetchHistory(), loadConfig()]);
+    await Promise.all([loadAcl(), loadCache()]);
+    setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
+    setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
+    setInterval(() => { if (state.auto && AUTH.role) { loadAcl(); loadCache(); } }, 15000);
+    scheduleHistory();
+  } catch(e){
+    msg.className = "";
+    msg.textContent = "login failed: " + e.message;
+  }
+}
+async function doLogout(){
+  try {
+    await fetch("/api/auth/session", {method:"DELETE", credentials:"same-origin", headers: csrfHeaders()});
+  } catch(_){}
+  AUTH.needed = true; AUTH.role = null; AUTH.user = null;
+  renderAuthChip();
+  $("login-ov").classList.add("on");
+}
+function renderAuthChip(){
+  const el = $("auth-chip");
+  if (!el) return;
+  if (AUTH.needed && !AUTH.role){
+    el.textContent = "not signed in";
+    el.title = "Click to sign in";
+    el.style.color = "#e3b341";
+    el.style.cursor = "pointer";
+  } else if (AUTH.role){
+    el.textContent = AUTH.user ? (AUTH.user + " · " + AUTH.role) : AUTH.role;
+    el.title = "Signed in — click to sign out";
+    el.style.color = "#7ee787";
+    el.style.cursor = "pointer";
+  } else {
+    el.textContent = "no auth";
+    el.title = "";
+    el.style.color = "var(--faint)";
+    el.style.cursor = "";
+  }
+}
+/* Double-submit CSRF: read the csrf cookie (set alongside the session) and
+   echo it in the X-CSRF-Token header on every state-changing request. */
+function csrfToken(){
+  const m = document.cookie.match(/(?:^|;\s*)res_csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : "";
+}
+function csrfHeaders(){
+  const h = {};
+  const t = csrfToken();
+  if (t) h["X-CSRF-Token"] = t;
+  return h;
 }
 
 const pad = n => String(n).padStart(2, "0");
@@ -1004,7 +1294,7 @@ function renderKpis(){
   const infra = [
     {k:"Upstreams", v:st.upstreams.healthy+" <small>/</small> "+st.upstreams.total,
       cls: st.upstreams.healthy===0?"bad":st.upstreams.degraded>0?"":"good",
-      t:{txt:st.upstreams.down+" down · "+st.upstreams.degraded+" degr", cls: st.upstreams.down?"dn":"flat"}},
+      t:{txt:(st.upstreams.unhealthy||0)+" unhe · "+(st.upstreams.recovering||0)+" recov · "+st.upstreams.degraded+" degr", cls: (st.upstreams.unhealthy||st.upstreams.down)?"dn":"flat"}},
     {k:"In-flight", v:st.inflight.udp, t:{txt:st.inflight.tcp_connections+" tcp", cls:"flat"}},
     {k:"CPU", v:s.resources_cpu!=null?s.resources_cpu+"%":"N/A", t:{txt:"of one core", cls:"flat"}},
     {k:"Memory", v:(s.resources_rss!=null?(s.resources_rss/1048576).toFixed(0)+" <small>MB</small>":"N/A")},
@@ -1287,14 +1577,15 @@ function renderUpState(){
   if (!st) return;
   $("up-state").innerHTML = statRows([
     {k:"Total upstreams", v:String(intOf(st.total))},
-    {k:"UP", v:String(intOf(st.up)), cls:intOf(st.up)?"good":"bad"},
+    {k:"Healthy", v:String(intOf(st.healthy)), cls:intOf(st.healthy)?"good":"bad"},
     {k:"Degraded", v:String(intOf(st.degraded)), cls:intOf(st.degraded)?"bad":""},
-    {k:"DOWN", v:String(intOf(st.down)), cls:intOf(st.down)?"bad":""},
+    {k:"Recovering", v:String(intOf(st.recovering)), cls:intOf(st.recovering)?"":""},
+    {k:"Unhealthy", v:String(intOf(st.unhealthy)), cls:intOf(st.unhealthy)?"bad":""},
     {k:"Disabled", v:String(intOf(st.disabled))},
     {k:"Eligible for selection", v:String((st.eligible||[]).length)},
     {k:"Receiving traffic now", v:String((st.in_use||[]).length)},
     {k:"Eligible but idle", v:String((st.idle||[]).length)},
-    {k:"Avoided (down, others healthy)", v:String((st.avoided||[]).length),
+    {k:"Avoided (unhealthy, others healthy)", v:String((st.avoided||[]).length),
       cls:intOf(st.avoided)?"bad":""},
     {k:"Pool rate", v:fmtVal(st.total_qps,"qps")},
     {k:"Emergency", v: st.emergency ? "YES — all SERVFAIL" : "no",
@@ -1523,6 +1814,19 @@ function stateChip(u){
   return '<span class="state '+u.health+'"><span class="d"></span>'+u.health+'</span>';
 }
 function renderUpstreams(){
+  // Score rank + human-readable "why" (reason) for the Score column: the
+  // selection algorithm is multiplicative, so quote its actual factors.
+  const ranked = state.upstreams.slice().sort((a,b) =>
+    ((b.score && b.score.score) || 0) - ((a.score && a.score.score) || 0));
+  const rankOf = {};
+  ranked.forEach((u,i) => { rankOf[u.id] = i + 1; });
+  const scoreReason = u => {
+    const s = u.score;
+    if (!s) return "no score yet";
+    return "health "+s.health_factor+" × reliability "+s.reliability+
+      " × latency "+s.latency_factor+" × probes "+s.probe_factor+
+      " × weight "+s.weight+" = "+s.score;
+  };
   const rows = state.upstreams.map((u,i) => {
     const color = state.upColors[u.name] || PALETTE[i%PALETTE.length];
     const hc = u.last_health_ok==null ? '<span class="tag">no probe yet</span>'
@@ -1554,6 +1858,11 @@ function renderUpstreams(){
       '<td class="num">'+fmtVal(u.latency.p95_ms,"ms")+'</td>'+
       '<td class="num">'+fmtVal(u.latency.p99_ms,"ms")+'</td>'+
       '<td class="num" style="color:'+(u.failovers>0?"#e3b341":"inherit")+'">'+u.failovers+'</td>'+
+      '<td class="num mono" title="'+escapeHtml(scoreReason(u))+'" style="color:'+
+        ((u.score&&u.score.score||0)>0?"#7ee787":"var(--dim)")+'">'+
+        (u.score ? u.score.score.toFixed(3) : "—")+'</td>'+
+      '<td class="num">'+(rankOf[u.id]||"—")+'</td>'+
+      '<td class="num" title="completed health-check rounds">'+u.health_rounds+'</td>'+
       '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_success_ago_secs)+'</td>'+
       '<td class="mono" style="color:'+(u.last_failure_ago_secs!=null&&u.last_failure_ago_secs<30?"#e3b341":"var(--dim)")+'">'+fmtAgo(u.last_failure_ago_secs)+'</td>'+
       '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_state_change_ago_secs)+'</td>'+
@@ -1564,7 +1873,7 @@ function renderUpstreams(){
   });
   $("up-rows").innerHTML = rows.length
     ? rows.join("")
-    : '<tr><td colspan="24" class="empty">no upstreams configured</td></tr>';
+    : '<tr><td colspan="27" class="empty">no upstreams configured</td></tr>';
   for (const tr of $("up-rows").querySelectorAll("tr[data-up]")){
     tr.addEventListener("click", () => {
       const n = tr.getAttribute("data-up");
@@ -1585,9 +1894,9 @@ function eventSeverity(e){
     : e.action==="all_upstreams_recovered" ? "ok"
     : e.action==="overload_dropped" ? "crit"
     : e.action==="query_deadline" || e.action==="rate_limited" ? "warn" : "info";
-  if (e.kind==="health") return e.action==="transition" && e.to==="down" ? "crit"
-    : (e.action==="round_failed" || (e.action==="probe" && e.to==="down")) ? "warn"
-    : e.action==="transition" && e.to==="up" ? "ok" : "info";
+  if (e.kind==="health") return e.action==="transition" && e.to==="unhealthy" ? "crit"
+    : (e.action==="round_failed" || (e.action==="probe" && e.to==="unhealthy")) ? "warn"
+    : e.action==="transition" && (e.to==="healthy" || e.to==="recovering") ? "ok" : "info";
   if (e.kind==="failover") return "warn";
   return "info";
 }
@@ -1755,7 +2064,7 @@ async function fetchCurrent(){
     state.stats = stats;
     state.upstreams = ups.upstreams || [];
     state.upState = ups.state || null;
-    state.generation = (ups.generation != null) ? ups.generation : null;
+    syncGeneration(ups.generation);
     state.clients = cl;
     state.events = ev.events || [];
     state.upstreams.forEach((u,i) => {
@@ -1818,17 +2127,49 @@ function maskTokenLine(toml){
 async function applyConfig(){
   const msg = $("cfg-msg");
   msg.textContent = "applying…"; msg.className = "";
-  try {
-    const r = await fetch("/api/config", {
+  const toml = $("cfg-text").value;
+  const doPut = async (confirmFlag) => {
+    const qs = [];
+    if (state.generation != null) qs.push("generation=" + state.generation);
+    if (confirmFlag) qs.push("confirm=true");
+    const url = qs.length ? "/api/config?" + qs.join("&") : "/api/config";
+    const r = await fetch(url, {
       method: "PUT",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({toml: $("cfg-text").value, persist: true}),
+      headers: Object.assign({"Content-Type":"application/json"}, csrfHeaders()),
+      credentials: "same-origin",
+      body: JSON.stringify({toml, persist: true}),
     });
     const j = await r.json().catch(()=>({}));
-    if (!r.ok) throw new Error(j.error || ("HTTP "+r.status));
+    if (!r.ok){
+      const err = new Error(j.error || ("HTTP "+r.status));
+      err.code = j.code || ""; err.status = r.status;
+      throw err;
+    }
+    return j;
+  };
+  try {
+    let j;
+    try {
+      j = await doPut(false);
+    } catch (e){
+      if (e.code === "confirm_required"){
+        // Guardrail: the import would leave zero enabled upstreams.
+        if (!window.confirm("Import refused by guardrails:\n\n"+e.message+"\n\nApply anyway?")){
+          msg.textContent = "cancelled — "+e.message; msg.className = "warn"; return;
+        }
+        j = await doPut(true);
+      } else if (e.status === 409){
+        // Optimistic concurrency: someone changed the config since we loaded it.
+        msg.textContent = "Configuration changed elsewhere — reloading; review and re-apply. ("+e.message+")";
+        msg.className = "warn";
+        await loadConfig(); await fetchCurrent();
+        return;
+      } else throw e;
+    }
     msg.textContent = "applied"+(j.persisted?" + persisted":" (memory only)")+
       (j.persist_error?" — persist error: "+j.persist_error:"");
     msg.className = j.persist_error ? "err" : "ok";
+    if (j.generation != null) syncGeneration(j.generation);
     await loadConfig(); await fetchCurrent();
   } catch (e){
     msg.textContent = "rejected: "+e.message; msg.className = "err";
@@ -1845,12 +2186,13 @@ function umgSetToken(t){
 }
 function umgMsg(text, cls){ const m = $("umg-msg"); m.textContent = text || ""; m.className = cls || ""; }
 async function umgApi(method, path, body){
-  const h = {};
+  const h = csrfHeaders();
   if (body != null) h["Content-Type"] = "application/json";
   const tok = umgToken();
   if (tok) h["Authorization"] = "Bearer " + tok;
-  const r = await fetch(path, {method, headers: h, body: body != null ? JSON.stringify(body) : undefined});
+  const r = await fetch(path, {method, headers: h, credentials:"same-origin", body: body != null ? JSON.stringify(body) : undefined});
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401){ authNeeded(); }
   if (!r.ok){
     const err = new Error(j.error || ("HTTP " + r.status));
     err.code = j.code || ""; err.status = r.status;
@@ -1934,6 +2276,19 @@ function umgOpenForm(id){
   $("umg-priority").value = u ? u.priority : 1;
   $("umg-weight").value = u ? u.weight : 1;
   $("umg-timeout").value = (u && u.timeout_ms != null) ? u.timeout_ms : "";
+  $("umg-probe-interval").value = (u && u.probe_interval_ms != null) ? u.probe_interval_ms : "";
+  $("umg-probe-timeout").value = (u && u.probe_timeout_ms != null) ? u.probe_timeout_ms : "";
+  $("umg-expect-rcode").value = (u && u.expect_rcode) ? u.expect_rcode : "";
+  $("umg-probes").value = (u && u.probes && u.probes.length)
+    ? u.probes.map(p => (p.type || "?") + " " + (p.name || "")).join("\n")
+    : "";
+  // Remember what the server had so an emptied field can *clear* the
+  // override instead of silently leaving the old value in place.
+  umg.origExpectRcode = !!(u && u.expect_rcode);
+  umg.origProbes = !!(u && u.probes && u.probes.length);
+  umg.origTimeoutMs = (u && u.timeout_ms != null) ? u.timeout_ms : null;
+  umg.origProbeIntervalMs = (u && u.probe_interval_ms != null) ? u.probe_interval_ms : null;
+  umg.origProbeTimeoutMs = (u && u.probe_timeout_ms != null) ? u.probe_timeout_ms : null;
   $("umg-enabled").checked = u ? !!u.enabled : true;
   $("umg-confirm").checked = false;
   $("umg-form-d").open = true;
@@ -1960,6 +2315,32 @@ async function umgSubmit(){
   };
   const t = $("umg-timeout").value.trim();
   if (t) body.timeout_ms = parseInt(t, 10);
+  else if (umg.editId != null && umg.origTimeoutMs != null) body.clear_timeout = true;
+  const pi = $("umg-probe-interval").value.trim();
+  if (pi) body.probe_interval_ms = parseInt(pi, 10);
+  else if (umg.editId != null && umg.origProbeIntervalMs != null) body.clear_probe_interval_ms = true;
+  const pt = $("umg-probe-timeout").value.trim();
+  if (pt) body.probe_timeout_ms = parseInt(pt, 10);
+  else if (umg.editId != null && umg.origProbeTimeoutMs != null) body.clear_probe_timeout_ms = true;
+  const er = $("umg-expect-rcode").value.trim().toUpperCase();
+  if (er) body.expect_rcode = er;
+  else if (umg.editId != null && umg.origExpectRcode) body.clear_expect_rcode = true;
+  const probesText = $("umg-probes").value.trim();
+  if (probesText){
+    const probes = [];
+    let bad = "";
+    for (const line of probesText.split("\n")){
+      const s = line.trim();
+      if (!s) continue;
+      const parts = s.split(/\s+/);
+      if (parts.length !== 2){ bad = s; break; }
+      probes.push({type: parts[0], name: parts[1]});
+    }
+    if (bad){ umgMsg("probes: each line must be 'TYPE name' (e.g. 'A example.com') — offending line: "+bad, "err"); return; }
+    body.probes = probes;
+  } else if (umg.editId != null && umg.origProbes){
+    body.clear_probes = true;
+  }
   if (state.generation != null) body.generation = state.generation;
   const what = umg.editId != null ? "update" : "create";
   try {
@@ -2057,6 +2438,295 @@ async function umgViewConfig(){
 }
 
 /* =========================================================================
+ * ACL management (live add/toggle/remove, applied at runtime)
+ * ====================================================================== */
+const aclState = { entries: [], generation: null };
+/* One global config generation behind both trackers (upstreams + ACL/cache):
+ * every API response that carries a generation refreshes both, so a mutation
+ * in one section is never rejected as stale against a snapshot from another. */
+function syncGeneration(g){
+  if (g == null) return;
+  state.generation = g;
+  aclState.generation = g;
+}
+function aclMsg(text, cls){ const m = $("acl-msg"); m.textContent = text || ""; m.className = cls || ""; }
+/* Run an ACL mutation; when the gateway answers confirm_required (409)
+ * present the guardrail text and retry once with confirm:true. Returns the
+ * API result, or null when the operator cancelled. */
+async function aclSend(what, send){
+  try {
+    return await send(false);
+  } catch(e){
+    if (e.code === "confirm_required"){
+      if (window.confirm(what+" refused by guardrails:\n\n"+e.message+"\n\nApply anyway?")){
+        return await send(true);
+      }
+      aclMsg(what+" cancelled — "+e.message, "warn");
+      return null;
+    }
+    throw e;
+  }
+}
+async function loadAcl(){
+  try {
+    const j = await getJSON("/api/acl");
+    aclState.entries = j.entries || [];
+    syncGeneration(j.generation);
+    renderAcl(j);
+  } catch(e){
+    if (e.status !== 401) aclMsg("load failed: "+e.message, "err");
+  }
+}
+function renderAcl(j){
+  const rows = aclState.entries.map(e =>
+    '<tr data-id="'+escapeHtml(e.id)+'">'+
+      '<td class="mono" style="color:var(--faint)">'+escapeHtml(e.id)+'</td>'+
+      '<td class="mono">'+escapeHtml(e.cidr)+'</td>'+
+      '<td><span class="tag '+(e.action==="deny"?"bad":"ok")+'">'+escapeHtml(e.action)+'</span></td>'+
+      '<td>'+(e.enabled?'<span class="tag ok">on</span>':'<span class="tag">off</span>')+'</td>'+
+      '<td style="color:var(--faint)">'+(e.source?escapeHtml(e.source):"—")+'</td>'+
+      '<td><div class="uact">'+
+        '<button data-act="acl-toggle">'+(e.enabled?"Disable":"Enable")+'</button>'+
+        '<button class="danger" data-act="acl-remove">Remove</button>'+
+      '</div></td>'+
+    '</tr>');
+  $("acl-rows").innerHTML = rows.length
+    ? rows.join("")
+    : '<tr><td colspan="6" class="empty">no entries — fail-closed (every query refused)</td></tr>';
+  const s = $("acl-summary");
+  if (j){
+    s.innerHTML =
+      '<div class="sr"><span class="k">effective allow rules</span><span class="v'+(j.allowed_count?"":" na")+'">'+(j.allowed_count ?? "—")+'</span></div>'+
+      '<div class="sr"><span class="k">effective deny rules</span><span class="v'+(j.denied_count?"":" na")+'">'+(j.denied_count ?? "—")+'</span></div>'+
+      '<div class="sr"><span class="k">total entries (incl. disabled)</span><span class="v">'+aclState.entries.length+'</span></div>'+
+      '<div class="sr"><span class="k">config generation</span><span class="v">'+(j.generation ?? "—")+'</span></div>'+
+      '<div class="sr"><span class="k">posture</span><span class="v '+(j.allowed_count?"good":"bad")+'">'+(j.allowed_count?"restricted":"FAIL-CLOSED")+'</span></div>';
+  }
+}
+async function aclAdd(){
+  aclMsg("adding…","");
+  try {
+    const r = await aclSend("add entry", confirmFlag => umgApi("POST", "/api/acl/entries", {
+      cidr: $("acl-cidr").value.trim(),
+      action: $("acl-action").value,
+      enabled: $("acl-enabled").checked,
+      generation: aclState.generation,
+      confirm: confirmFlag,
+    }));
+    if (r === null) return;
+    aclMsg("entry added and applied", "ok");
+    $("acl-cidr").value = "";
+    await loadAcl();
+  } catch(e){ aclMsg("rejected: "+e.message, "err"); }
+}
+async function aclRowAction(id, act){
+  const e = aclState.entries.find(x => x.id === id);
+  if (!e) return;
+  try {
+    if (act === "acl-toggle"){
+      const r = await aclSend((e.enabled?"disable ":"enable ")+e.cidr, confirmFlag =>
+        umgApi("PATCH", "/api/acl/entries/"+encodeURIComponent(id), {
+          enabled: !e.enabled, generation: aclState.generation, confirm: confirmFlag,
+        }));
+      if (r === null) return;
+      aclMsg((e.enabled?"disabled ":"enabled ")+e.cidr+" (applied)", "ok");
+    } else if (act === "acl-remove"){
+      const r = await aclSend("remove "+e.cidr, confirmFlag =>
+        umgApi("DELETE", "/api/acl/entries/"+encodeURIComponent(id)+"?generation="+aclState.generation+
+          (confirmFlag?"&confirm=true":"")));
+      if (r === null) return;
+      aclMsg("removed "+e.cidr+" (applied)", "ok");
+    }
+    await loadAcl();
+  } catch(err){ aclMsg("rejected: "+err.message, "err"); }
+}
+
+/* =========================================================================
+ * Cache management (live settings + clear of the runtime cache)
+ * ====================================================================== */
+function cacheMsg(text, cls){ const m = $("cache-msg"); m.textContent = text || ""; m.className = cls || ""; }
+async function loadCache(){
+  try {
+    const j = await getJSON("/api/cache");
+    renderCache(j);
+  } catch(e){ if (e.status !== 401) cacheMsg("load failed: "+e.message, "err"); }
+}
+function renderCache(j){
+  const cs = (state.stats && state.stats.cache) || null;
+  const hit = cs ? cs.hit_ratio : null;
+  const hits = cs ? cs.hits : null;
+  const misses = cs ? cs.misses : null;
+  $("cache-stats").innerHTML =
+    '<div class="sr"><span class="k">enabled</span><span class="v '+(j.enabled?"good":"bad")+'">'+(j.enabled?"yes":"no")+'</span></div>'+
+    '<div class="sr"><span class="k">entries / capacity</span><span class="v">'+j.entries+' / '+j.max_entries+'</span></div>'+
+    '<div class="sr"><span class="k">approx. memory</span><span class="v'+(j.memory_bytes?"":" na")+'">'+fmtBytes(j.memory_bytes||0)+' / '+fmtBytes(j.max_memory_bytes||0)+'</span></div>'+
+    '<div class="sr"><span class="k">hits / misses</span><span class="v'+(hits==null?" na":"")+'">'+(hits==null?"N/A":hits+" / "+misses)+'</span></div>'+
+    '<div class="sr"><span class="k">hit ratio</span><span class="v'+(hit==null?" na":"")+'">'+(hit==null?"N/A":(hit*100).toFixed(1)+"%")+'</span></div>'+
+    '<div class="sr"><span class="k">evictions</span><span class="v'+(cs&&cs.evictions!=null?"":" na")+'">'+(cs&&cs.evictions!=null?cs.evictions:"N/A")+'</span></div>'+
+    '<div class="sr"><span class="k">min TTL (skip threshold)</span><span class="v">'+j.min_ttl_secs+'s</span></div>'+
+    '<div class="sr"><span class="k">max TTL (cap)</span><span class="v">'+j.max_ttl_secs+'s</span></div>'+
+    '<div class="sr"><span class="k">negative max TTL</span><span class="v">'+j.negative_max_ttl_secs+'s</span></div>'+
+    '<div class="sr"><span class="k">generation</span><span class="v">'+(j.generation ?? "—")+'</span></div>';
+  $("cache-enabled").checked = !!j.enabled;
+  $("cache-min").value = j.min_ttl_secs;
+  $("cache-max").value = j.max_ttl_secs;
+  $("cache-negmax").value = j.negative_max_ttl_secs;
+  $("cache-maxent").value = j.max_entries;
+  $("cache-maxmem").value = j.max_memory_bytes;
+  syncGeneration(j.generation);
+}
+async function cacheSave(){
+  cacheMsg("applying…","");
+  try {
+    const j = await umgApi("PUT", "/api/cache", {
+      enabled: $("cache-enabled").checked,
+      min_ttl_secs: parseInt($("cache-min").value, 10),
+      max_ttl_secs: parseInt($("cache-max").value, 10),
+      negative_max_ttl_secs: parseInt($("cache-negmax").value, 10),
+      max_entries: parseInt($("cache-maxent").value, 10),
+      max_memory_bytes: parseInt($("cache-maxmem").value, 10),
+      generation: aclState.generation,
+    });
+    renderCache(j);
+    cacheMsg("settings applied"+(j.persisted?" + persisted":"")+
+      (j.persist_error?" — persist error: "+j.persist_error:""),
+      j.persist_error ? "err" : "ok");
+  } catch(e){ cacheMsg("rejected: "+e.message, "err"); }
+}
+async function cacheClear(){
+  if (!confirm("Clear the runtime DNS cache? Active entries will be dropped; the next queries miss upstream.")) return;
+  cacheMsg("clearing…","");
+  try {
+    const j = await umgApi("POST", "/api/cache/clear", {});
+    cacheMsg("cleared "+j.entries_dropped+" entries ("+fmtBytes(j.memory_bytes_freed||0)+" freed)", "ok");
+    await loadCache();
+  } catch(e){ cacheMsg("rejected: "+e.message, "err"); }
+}
+
+/* =========================================================================
+ * Health-check + selection policy (GET/PUT /api/health/config, /api/selection)
+ * ====================================================================== */
+function hltMsg(text, cls){ const m = $("hlt-msg"); m.textContent = text || ""; m.className = cls || ""; }
+function selMsg(text, cls){ const m = $("sel-msg"); m.textContent = text || ""; m.className = cls || ""; }
+/* `duration_ms` serialises as "5m" / "2s" / "1500ms" (one exact unit, or a
+ * bare integer in ms); the PUT API takes plain millisecond numbers. */
+function parseDurMs(s){
+  if (typeof s === "number" && isFinite(s)) return s;
+  const str = String(s == null ? "" : s).trim();
+  if (!str) return null;
+  if (/^\d+$/.test(str)) return parseInt(str, 10);
+  const parts = str.match(/\d+(ms|s|m)/g);
+  if (!parts || parts.join("") !== str) return null;
+  let total = 0;
+  for (const p of parts){
+    const n = parseInt(p, 10);
+    total += p.endsWith("ms") ? n : p.endsWith("m") ? n * 60000 : n * 1000;
+  }
+  return total;
+}
+function probesToLines(probes){
+  return (probes || []).map(p => (p.type || "?") + " " + (p.name || "")).join("\n");
+}
+function parseProbeLines(text){
+  const out = [];
+  for (const raw of String(text || "").split("\n")){
+    const line = raw.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length !== 2) return null;
+    out.push({type: parts[0], name: parts[1]});
+  }
+  return out;
+}
+async function loadHealthSelection(){
+  try {
+    const h = await getJSON("/api/health/config");
+    const hc = h.health || {};
+    $("hlt-enabled").checked = !!hc.enabled;
+    $("hlt-interval").value = parseDurMs(hc.interval) ?? "";
+    $("hlt-timeout").value = parseDurMs(hc.timeout) ?? "";
+    $("hlt-fail").value = hc.failure_threshold;
+    $("hlt-rec").value = hc.recovery_threshold;
+    $("hlt-minsucc").value = hc.min_successes;
+    $("hlt-tcp").checked = !!hc.tcp_probes;
+    $("hlt-dwell").value = parseDurMs(hc.dwell) ?? 0;
+    $("hlt-probes").value = probesToLines(hc.probes);
+    syncGeneration(h.generation);
+  } catch(e){ if (e.status !== 401) hltMsg("load failed: "+e.message, "err"); }
+  try {
+    const s = await getJSON("/api/selection");
+    const sc = s.selection || {};
+    if (sc.strategy) $("sel-strategy").value = sc.strategy;
+    $("sel-latref").value = sc.latency_reference_ms;
+    if (sc.tier_policy) $("sel-tier").value = sc.tier_policy;
+    $("sel-lshare").value = sc.lower_tier_share;
+    if (sc.degraded_policy) $("sel-degraded").value = sc.degraded_policy;
+    $("sel-minsamples").value = sc.min_probe_samples;
+    syncGeneration(s.generation);
+  } catch(e){ if (e.status !== 401) selMsg("load failed: "+e.message, "err"); }
+}
+async function saveHealth(){
+  hltMsg("applying…","");
+  const probes = parseProbeLines($("hlt-probes").value);
+  if (probes === null){
+    hltMsg("probes: each line must be 'TYPE name' (e.g. 'A example.com')", "err"); return;
+  }
+  const body = {
+    enabled: $("hlt-enabled").checked,
+    interval_ms: parseInt($("hlt-interval").value, 10),
+    timeout_ms: parseInt($("hlt-timeout").value, 10),
+    failure_threshold: parseInt($("hlt-fail").value, 10),
+    recovery_threshold: parseInt($("hlt-rec").value, 10),
+    min_successes: parseInt($("hlt-minsucc").value, 10),
+    tcp_probes: $("hlt-tcp").checked,
+    dwell_ms: parseInt($("hlt-dwell").value, 10) || 0,
+    probes,
+    generation: aclState.generation,
+  };
+  if (Object.values(body).some(v => typeof v === "number" && !isFinite(v))){
+    hltMsg("one of the numeric fields is missing or invalid", "err"); return;
+  }
+  try {
+    const j = await umgApi("PUT", "/api/health/config", body);
+    syncGeneration(j.generation);
+    await loadHealthSelection();
+    hltMsg("health settings applied"+(j.persisted?" + persisted":"")+
+      (j.persist_error?" — persist error: "+j.persist_error:""),
+      j.persist_error ? "err" : "ok");
+  } catch(e){
+    if (e.status === 409){ hltMsg("Configuration changed elsewhere; reloaded — review and re-apply. ("+e.message+")", "warn"); loadHealthSelection(); }
+    else hltMsg("rejected: "+e.message, "err");
+  }
+}
+async function saveSelection(){
+  selMsg("applying…","");
+  const body = {
+    strategy: $("sel-strategy").value,
+    latency_reference_ms: parseFloat($("sel-latref").value),
+    tier_policy: $("sel-tier").value,
+    lower_tier_share: parseFloat($("sel-lshare").value),
+    degraded_policy: $("sel-degraded").value,
+    min_probe_samples: parseInt($("sel-minsamples").value, 10),
+    generation: aclState.generation,
+  };
+  if (Object.values(body).some(v => typeof v === "number" && !isFinite(v))){
+    selMsg("one of the numeric fields is missing or invalid", "err"); return;
+  }
+  try {
+    const j = await umgApi("PUT", "/api/selection", body);
+    syncGeneration(j.generation);
+    await loadHealthSelection();
+    selMsg("selection policy applied"+(j.persisted?" + persisted":"")+
+      (j.persist_error?" — persist error: "+j.persist_error:""),
+      j.persist_error ? "err" : "ok");
+    await fetchCurrent();
+  } catch(e){
+    if (e.status === 409){ selMsg("Configuration changed elsewhere; reloaded — review and re-apply. ("+e.message+")", "warn"); loadHealthSelection(); }
+    else selMsg("rejected: "+e.message, "err");
+  }
+}
+
+/* =========================================================================
  * Wiring
  * ====================================================================== */
 function wire(){
@@ -2107,17 +2777,59 @@ function wire(){
     if (!tr) return;
     umgRowAction(parseInt(tr.getAttribute("data-id"), 10), b.getAttribute("data-act"));
   });
+  // ACL
+  $("acl-add").addEventListener("click", aclAdd);
+  $("acl-reload").addEventListener("click", loadAcl);
+  $("acl-cidr").addEventListener("keydown", e => { if (e.key === "Enter") aclAdd(); });
+  $("acl-rows").addEventListener("click", e => {
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const tr = b.closest("tr[data-id]");
+    if (!tr) return;
+    aclRowAction(tr.getAttribute("data-id"), b.getAttribute("data-act"));
+  });
+  // Cache
+  $("cache-clear").addEventListener("click", cacheClear);
+  $("cache-reload").addEventListener("click", loadCache);
+  $("cache-save").addEventListener("click", cacheSave);
+  // Health checks & selection
+  $("hlt-save").addEventListener("click", saveHealth);
+  $("hlt-reload").addEventListener("click", loadHealthSelection);
+  $("sel-save").addEventListener("click", saveSelection);
+  $("sel-reload").addEventListener("click", loadHealthSelection);
+  // Login / session
+  $("login-go").addEventListener("click", doLogin);
+  $("login-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  $("login-user").addEventListener("keydown", e => { if (e.key === "Enter") $("login-pass").focus(); });
+  $("login-cancel").addEventListener("click", () => {
+    AUTH.dismissReadonly = true;
+    $("login-ov").classList.remove("on");
+  });
+  $("auth-chip").addEventListener("click", () => {
+    if (AUTH.role) doLogout();
+    else { AUTH.dismissReadonly = false; $("login-ov").classList.add("on"); $("login-pass").focus(); }
+  });
   window.addEventListener("resize", () => drawAllCharts());
 }
 
 async function main(){
   wire();
-  await Promise.all([fetchCurrent(), fetchMonitoring()]);
-  await fetchHistory();
-  await loadConfig();
-  setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
-  setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
-  scheduleHistory();
+  const authed = await checkSession();
+  if (authed || AUTH.dismissReadonly){
+    await Promise.all([fetchCurrent(), fetchMonitoring()]);
+    await fetchHistory();
+    await loadConfig();
+    await Promise.all([loadAcl(), loadCache(), loadHealthSelection()]);
+    setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
+    setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
+    // ACL/cache/health views refresh less often to keep browser load low.
+    setInterval(() => { if (state.auto && AUTH.role) { loadAcl(); loadCache(); loadHealthSelection(); } }, 15000);
+    scheduleHistory();
+  } else {
+    // Auth required and overlay is up: keep probing the session so a login
+    // from another tab (or an expired overlay dismissal) recovers cleanly.
+    setInterval(checkSession, 15000);
+  }
   // Canvas axis labels use Shabnam: re-paint once the webfont has loaded.
   if (document.fonts && document.fonts.ready){
     document.fonts.ready.then(() => { if (state.hist) drawAllCharts(); }).catch(() => {});

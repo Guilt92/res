@@ -246,15 +246,17 @@ class Dashboard:
                     "mappings": [{
                         "type": "value",
                         "options": {
-                            "0": {"text": "DOWN", "color": "red"},
+                            "0": {"text": "UNHEALTHY", "color": "red"},
                             "1": {"text": "DEGRADED", "color": "yellow"},
-                            "2": {"text": "UP", "color": "green"},
+                            "2": {"text": "HEALTHY", "color": "green"},
+                            "3": {"text": "RECOVERING", "color": "blue"},
                         },
                     }],
                     "thresholds": {"mode": "absolute", "steps": [
                         {"color": "red", "value": None},
                         {"color": "yellow", "value": 1},
                         {"color": "green", "value": 2},
+                        {"color": "blue", "value": 3},
                     ]},
                     "color": {"mode": "thresholds"},
                     "custom": {"hideFrom": {"legend": False, "tooltip": False, "viz": False}},
@@ -530,10 +532,11 @@ def upstreams():
         ["res", "dns", "upstreams"],
     )
 
-    d.stat("Upstreams UP", "sum(res_upstream_state == 2)",
+    d.stat("Usable upstreams", "sum(res_upstream_state >= 2)",
            0, 0, 4, 2, unit="short",
            thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 1}],
-           instant=True)
+           instant=True,
+           description="HEALTHY (2) or RECOVERING (3) — both are selected for queries.")
     d.stat("Active upstreams", "res_active_upstreams",
            4, 0, 4, 2, unit="short", thresholds=GREEN, instant=True)
     d.stat("Availability (5m, UP=100%)",
@@ -591,7 +594,7 @@ def upstreams():
     )
 
     d.state_timeline(
-        "Upstream health state (0=DOWN, 1=DEGRADED, 2=UP)",
+        "Upstream health state (0=UNHEALTHY, 1=DEGRADED, 2=HEALTHY, 3=RECOVERING)",
         "res_upstream_state", 0, 20, 12, 8,
     )
     d.timeseries(
@@ -790,7 +793,7 @@ def failures():
             "0": {"text": "OK", "color": "green"},
             "1": {"text": "EMERGENCY", "color": "red"}}}],
         thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
-        description="1 when at least one upstream is configured but none is UP "
+        description="1 when at least one upstream is configured but none is HEALTHY "
                     "(clients are receiving SERVFAIL).",
     )
     d.stat("Unhealthy upstreams", "sum(res_active_upstreams) - sum(res_healthy_upstreams)",

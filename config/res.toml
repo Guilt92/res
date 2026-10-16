@@ -1,10 +1,3 @@
-# res production configuration.
-#
-# Single source of truth: a human-readable TOML file, written atomically by
-# the API (temp file + fsync + rename). The previous valid version is kept
-# next to it as `res.toml.backup` and used automatically when the primary
-# file fails to load. There is no database anywhere in the stack.
-
 [server]
 udp_addr = "0.0.0.0:53"
 tcp_addr = "0.0.0.0:53"
@@ -18,28 +11,68 @@ tcp_idle_timeout_ms = 10000
 upstream_tcp_fallback = true
 shutdown_grace_ms = 5000
 
-# Overall deadline for one client query across all attempts, plus the cap for
-# a single upstream attempt and the failover budget. Keep
-# `max_attempts * upstream_timeout <= timeout`, otherwise later attempts are
-# cut short by the deadline before they can run.
+[auth]
+username = "admin"
+viewer_username = "viewer"
+session_ttl = "720m"
+max_failed_attempts = 5
+lockout_window = "15m"
+lockout_duration = "15m"
+protect_metrics = false
+secure_cookies = false
+login_rate_limit_per_minute = 30
+
 [query]
 timeout = "2s"
 upstream_timeout = "500ms"
 max_attempts = 3
+any_policy = "forward"
 
-# Fail-closed: only these networks may use the resolver.
-# Add your customer networks here (public CIDRs are fine).
 [acl]
-allowed_cidrs = [
-  "127.0.0.0/8",
-  "::1/128",
-  "10.0.0.0/8",
-  "172.16.0.0/12",
-  "192.168.0.0/16",
-  "169.254.0.0/16",
-  "fc00::/7",
-]
+allowed_cidrs = []
 denied_cidrs = []
+
+[[acl.entries]]
+id = "allow:127.0.0.0/8"
+cidr = "127.0.0.0/8"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:::1/128"
+cidr = "::1/128"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:10.0.0.0/8"
+cidr = "10.0.0.0/8"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:172.16.0.0/12"
+cidr = "172.16.0.0/12"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:192.168.0.0/16"
+cidr = "192.168.0.0/16"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:169.254.0.0/16"
+cidr = "169.254.0.0/16"
+action = "allow"
+enabled = true
+
+[[acl.entries]]
+id = "allow:fc00::/7"
+cidr = "fc00::/7"
+action = "allow"
+enabled = true
 
 [ratelimit]
 enabled = true
@@ -50,8 +83,6 @@ global_qps = 50000.0
 global_burst = 100000
 
 [failover]
-# SERVFAIL is a valid DNS response; only retry it when you know your
-# upstreams produce spurious SERVFAILs.
 retry_on_servfail = false
 
 [health]
@@ -62,32 +93,32 @@ failure_threshold = 3
 recovery_threshold = 2
 min_successes = 1
 tcp_probes = false
-probes = [
-  { name = "example.com", type = "A" },
-  { name = "example.com", type = "AAAA" },
-  { name = ".", type = "NS" },
-]
+dwell = "5s"
+
+[[health.probes]]
+name = "example.com"
+type = "A"
+
+[[health.probes]]
+name = "example.com"
+type = "AAAA"
+
+[[health.probes]]
+name = "."
+type = "NS"
 
 [selection]
-strategy = "weighted_reliability" # weighted_reliability | best_score | random_healthy
+strategy = "weighted_reliability"
 latency_reference_ms = 50.0
-# "strict" (default): only the best priority tier with usable upstreams
-# receives traffic. "shared": lower tiers also receive ~lower_tier_share of
-# selections, keeping their measurements warm for instant failover.
 tier_policy = "strict"
 lower_tier_share = 0.0
-# "usable" (default): DEGRADED upstreams are scored 0.4x and selectable at
-# any time. "last_resort": they are used only when no UP upstream exists.
 degraded_policy = "usable"
+min_probe_samples = 4
 
 [cache]
-# Response cache (enabled by default). TTLs are never extended beyond what
-# the upstream advertised; min_ttl_secs is a cacheability *threshold*
-# (responses below it are not cached at all), max_ttl_secs caps longer TTLs.
-# NXDOMAIN / NODATA are cached per RFC 2308 using the SOA MINIMUM field,
-# capped by negative_max_ttl_secs.
 enabled = true
 max_entries = 4096
+max_memory_bytes = 33554432
 min_ttl_secs = 0
 max_ttl_secs = 3600
 negative_max_ttl_secs = 30
@@ -98,32 +129,14 @@ filter = "info"
 servfail_sample_every = 0
 
 [monitoring]
-# Prometheus base URL used by the dashboard time-series proxy
-# (GET /api/timeseries?source=prometheus|auto). Empty = gateway-native
-# history only. The RES_PROMETHEUS_URL environment variable overrides
-# this value.
-prometheus_url = ""
-
-# Client-address exposure in events, logs, API and dashboard:
-#   "masked" (default) -> network prefix only (10.x.x.x / 2001:db8:1::x)
-#   "full"             -> complete address
-#   "off"              -> client addresses are not tracked or exposed at all
+prometheus_url = "http://prometheus:9090"
 client_ip_privacy = "masked"
-
-# Bounded top-N traffic tables (hard memory cap; tables prune their tail
-# instead of growing). 0 disables a table. Values > 1000000 are rejected.
 top_clients_max = 4096
 top_domains_max = 8192
-
-# How many top clients are exported as Prometheus series
-# (res_client_*; labels follow client_ip_privacy — masked by default).
-# 0 disables the per-client metrics export. Values > 10000 are rejected.
 client_metrics_max = 100
 
-# Upstream pool. `priority` orders tiers (lower is better); with the default
-# `tier_policy = "strict"` selection never crosses a tier boundary while a
-# better tier has usable upstreams. `weight` splits traffic inside a tier.
 [[upstreams]]
+id = 1
 name = "cloudflare-1"
 address = "1.1.1.1"
 port = 53
@@ -133,6 +146,7 @@ priority = 1
 weight = 1
 
 [[upstreams]]
+id = 2
 name = "cloudflare-2"
 address = "1.0.0.1"
 port = 53
@@ -142,6 +156,7 @@ priority = 1
 weight = 1
 
 [[upstreams]]
+id = 3
 name = "google-1"
 address = "8.8.8.8"
 port = 53
@@ -151,6 +166,7 @@ priority = 2
 weight = 1
 
 [[upstreams]]
+id = 4
 name = "google-2"
 address = "8.8.4.4"
 port = 53
@@ -160,6 +176,7 @@ priority = 2
 weight = 1
 
 [[upstreams]]
+id = 5
 name = "quad9-1"
 address = "9.9.9.9"
 port = 53
@@ -169,6 +186,7 @@ priority = 3
 weight = 1
 
 [[upstreams]]
+id = 6
 name = "quad9-2"
 address = "149.112.112.112"
 port = 53

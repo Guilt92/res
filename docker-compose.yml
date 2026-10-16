@@ -1,24 +1,23 @@
 # res full stack: gateway + Prometheus + Grafana. No database.
 #
-# Credentials (all optional at start; nothing is hardcoded):
-#   RES_ADMIN_PASSWORD      control-plane login (user "admin") for :8080
-#   RES_VIEWER_PASSWORD     optional read-only login (user "viewer")
-#   GRAFANA_ADMIN_PASSWORD  Grafana admin login for :3000
-# First run without env vars works: the gateway and Grafana each generate a
-# one-time random password and print it to their logs (docker logs res-res-1
-# / res-grafana-1). Passwords are persisted hashed (res) or in Grafana's DB.
-# For real deployments set the variables explicitly (or --env-file 0600).
+# Credentials are PLAIN TEXT in this file — intentional for this deployment
+# (no secrets manager). Set in one place, enforced by each application:
+#   RES_ADMIN_PASSWORD / RES_VIEWER_PASSWORD   dashboard users "admin"/"viewer" :8080
+#   GF_SECURITY_ADMIN_PASSWORD                 Grafana user "admin"             :3000
+#   deploy/prometheus/web.config.yml           Prometheus user "prom"           :9090
+# The gateway's Prometheus proxy authenticates with RES_PROMETHEUS_USERNAME/
+# RES_PROMETHEUS_PASSWORD, and the Grafana datasource carries the same user
+# (deploy/grafana/provisioning/datasources/prometheus.yml).
 #
 # Start:   docker compose up -d --build
-#          (or RES_ADMIN_PASSWORD=... GRAFANA_ADMIN_PASSWORD=... docker compose up -d --build)
 # DNS:     dig @127.0.0.1 example.com          (host port 53 -> container 53)
 #          If something on the host already owns :53 (systemd-resolved,
 #          another resolver), override the publish port without editing
 #          this file:  RES_DNS_PUBLISH=5353 docker compose up -d
 #          then:        dig @127.0.0.1 -p 5353 example.com
-# API:     http://localhost:8080/  (dashboard; log in as admin)
-# Metrics: http://localhost:9090/  (Prometheus; localhost-only in this file)
-# Charts:  http://localhost:3000/  (Grafana; log in as admin)
+# API:     http://localhost:8080/  (dashboard; admin / RES_ADMIN_PASSWORD)
+# Metrics: http://localhost:9090/  (Prometheus; prompt for prom / web.config.yml)
+# Charts:  http://localhost:3000/  (Grafana; admin / GF_SECURITY_ADMIN_PASSWORD)
 
 services:
   res:
@@ -36,12 +35,16 @@ services:
       # Dashboard time-series proxy: query Prometheus directly by its
       # in-network DNS name (overrides [monitoring].prometheus_url).
       RES_PROMETHEUS_URL: http://prometheus:9090
-      # Control-plane credentials (hashed with argon2 at startup; never
-      # written to the TOML config). The password file is created next to
-      # the config with mode 0600. Optional: the image entrypoint generates
-      # a one-time random password when neither env nor file exists.
-      RES_ADMIN_PASSWORD: ${RES_ADMIN_PASSWORD:-}
-      RES_VIEWER_PASSWORD: ${RES_VIEWER_PASSWORD:-}
+      # Prometheus enforces HTTP basic auth (deploy/prometheus/web.config.yml);
+      # the gateway proxy authenticates its queries with these credentials.
+      RES_PROMETHEUS_USERNAME: "prom"
+      RES_PROMETHEUS_PASSWORD: "res-prometheus-pw"
+      # Control-plane credentials (plain text by request for this deployment;
+      # hashed with argon2 at startup, never written to the TOML config —
+      # only argon2 hashes land in config/res.credentials, mode 0600).
+      # Users: "admin" (full access) and "viewer" (read-only).
+      RES_ADMIN_PASSWORD: "res-dashboard-pw"
+      RES_VIEWER_PASSWORD: "res-viewer-pw"
     volumes:
       # Whole directory (rw): the gateway rewrites the config atomically via
       # temp-file + fsync + rename and keeps a .backup next to it.
@@ -65,9 +68,14 @@ services:
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=15d"
       - "--storage.tsdb.retention.size=2GB"
+      # HTTP basic auth for Prometheus' own endpoints (UI/API/metrics).
+      # Prometheus has no native env-var auth: this web config file is the
+      # thing that actually enforces the username/password.
+      - "--web.config.file=/etc/prometheus/web.config.yml"
     volumes:
       - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./deploy/prometheus/web.config.yml:/etc/prometheus/web.config.yml:ro
       # Persistent metrics store (retention flags above; 15 days / 2 GB).
       # Named volume survives restarts without polluting the repo tree.
       - prom-data:/prometheus
@@ -79,29 +87,12 @@ services:
 
   grafana:
     image: grafana/grafana:11.1.4
-    # First-boot password bootstrap: an explicit GRAFANA_ADMIN_PASSWORD wins;
-    # otherwise (fresh database only) generate a one-time password and print
-    # it to the logs. With an existing grafana.db the stored password is
-    # kept and the env var is left unset so Grafana cannot reset it to "".
-    entrypoint: ["/bin/sh", "-ec"]
-    command:
-      - |
-        if [ -n "$${GRAFANA_ADMIN_PASSWORD:-}" ]; then
-          export GF_SECURITY_ADMIN_PASSWORD="$$GRAFANA_ADMIN_PASSWORD"
-          exec /run.sh
-        fi
-        unset GF_SECURITY_ADMIN_PASSWORD GRAFANA_ADMIN_PASSWORD
-        if [ ! -f /var/lib/grafana/grafana.db ]; then
-          PW=$$(head -c 24 /dev/urandom | base64 | tr -d '\n')
-          echo "grafana-entrypoint: no GRAFANA_ADMIN_PASSWORD configured; generated one-time admin password: $$PW" >&2
-          export GF_SECURITY_ADMIN_PASSWORD="$$PW"
-        fi
-        exec /run.sh
     environment:
+      # Plain text by request for this deployment (see header comment).
+      # Grafana applies this admin password on every start (existing or
+      # fresh database), so the value in this file is always authoritative.
       GF_SECURITY_ADMIN_USER: admin
-      # Optional (see entrypoint above). Passed through as-is: empty means
-      # "unset", never a blank admin password.
-      GRAFANA_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_SECURITY_ADMIN_PASSWORD: "res-grafana-pw"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"

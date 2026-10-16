@@ -5,6 +5,12 @@ datasources:
     type: prometheus
     access: proxy
     url: http://prometheus:9090
+    # Prometheus requires HTTP basic auth on every endpoint (see
+    # deploy/prometheus/web.config.yml); the datasource must send it.
+    basicAuth: true
+    basicAuthUser: prom
+    secureJsonData:
+      basicAuthPassword: res-prometheus-pw
     isDefault: true
     editable: false
     uid: prometheus

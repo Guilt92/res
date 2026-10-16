@@ -15,5 +15,12 @@ scrape_configs:
       - targets: ["res:8080"]
 
   - job_name: prometheus
+    # The self-scrape must authenticate too: the server enforces HTTP basic
+    # auth on every endpoint (deploy/prometheus/web.config.yml). Plaintext
+    # password here (client-side basic_auth); same user as
+    # RES_PROMETHEUS_PASSWORD in docker-compose.yml.
+    basic_auth:
+      username: prom
+      password: res-prometheus-pw
     static_configs:
       - targets: ["localhost:9090"]

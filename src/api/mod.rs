@@ -1741,7 +1741,7 @@ async fn monitoring_info(State(st): State<ApiState>) -> Json<Value> {
             "prometheus": { "configured": false, "url": Value::Null, "reachable": false },
         }));
     }
-    let (reachable, error) = cached_probe(&st, &cfg.prometheus_url).await;
+    let (reachable, error) = cached_probe(&st, &cfg).await;
     Json(json!({
         "prometheus": {
             "configured": true,
@@ -2428,8 +2428,12 @@ async fn put_selection(
     })))
 }
 
-async fn cached_probe(st: &ApiState, url: &str) -> (bool, Option<String>) {
+async fn cached_probe(
+    st: &ApiState,
+    cfg: &crate::config::MonitoringConfig,
+) -> (bool, Option<String>) {
     const TTL: Duration = Duration::from_secs(10);
+    let url = cfg.prometheus_url.as_str();
     {
         let g = st.probe.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.as_ref() {
@@ -2439,7 +2443,11 @@ async fn cached_probe(st: &ApiState, url: &str) -> (bool, Option<String>) {
         }
     }
     let (reachable, error) = match prom::PromClient::new(url) {
-        Ok(c) => match c.probe().await {
+        Ok(c) => match c
+            .with_basic_auth(&cfg.prometheus_username, &cfg.prometheus_password)
+            .probe()
+            .await
+        {
             Ok(()) => (true, None),
             Err(e) => (false, Some(e)),
         },
@@ -2458,12 +2466,15 @@ async fn cached_probe(st: &ApiState, url: &str) -> (bool, Option<String>) {
 /// Fetch every canonical series from Prometheus in parallel and normalize
 /// into the same payload shape as the native history endpoint.
 async fn fetch_prometheus(st: &ApiState, range: &str) -> Result<Value, String> {
-    let url = st.shared.app.load().monitoring.prometheus_url.clone();
-    let url = url.trim().to_string();
+    let monitoring = st.shared.app.load().monitoring.clone();
+    let url = monitoring.prometheus_url.trim().to_string();
     if url.is_empty() {
         return Err("prometheus not configured".into());
     }
-    let client = prom::PromClient::new(&url)?;
+    let client = prom::PromClient::new(&url)?.with_basic_auth(
+        &monitoring.prometheus_username,
+        &monitoring.prometheus_password,
+    );
     let range_secs = crate::history::range_secs(range)?;
 
     let step = (range_secs / 300).max(5);

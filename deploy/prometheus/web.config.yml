@@ -1,0 +1,11 @@
+# HTTP basic authentication for Prometheus' own endpoints (web UI, REST API,
+# /metrics, /-/ready). Prometheus does NOT read credentials from environment
+# variables — enforcement comes exclusively from this file via
+# --web.config.file (exporter-toolkit), mounted in docker-compose.yml.
+#
+# Values under `basic_auth_users` MUST be bcrypt hashes (the web server
+# validates them at startup and refuses to start on a plaintext password).
+# Hash below = bcrypt of `res-prometheus-pw` (user `prom`), matching
+# RES_PROMETHEUS_PASSWORD in docker-compose.yml and the Grafana datasource.
+basic_auth_users:
+  prom: $2b$12$cQRDbTWwEmEWe5zZ2SNvGOQZhN8X6n88iHCF1En3FIzK/.DvL4Kae

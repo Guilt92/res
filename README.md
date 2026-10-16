@@ -66,29 +66,23 @@ $ dig @127.0.0.1 -p 53 example.com
 $ open http://localhost:8080/        # log in as admin (password below)
 ```
 
-No credentials are hardcoded anywhere, and none are required to start: on a
-first run with no password configured, the gateway and Grafana each
-**generate a one-time random password and print it to their logs**:
+All credentials are plain text in `docker-compose.yml` — intentional for
+this deployment (no secrets manager), defined in exactly one place:
 
-```console
-$ docker logs res-res-1     | grep 'generated one-time admin password'   # control plane (:8080)
-$ docker logs res-grafana-1 | grep 'generated one-time admin password'   # Grafana   (:3000)
-```
+| Service | URL | User | Password (in the file named below) |
+|---|---|---|---|
+| Dashboard/API | `:8080` | `admin` (full), `viewer` (read-only) | `RES_ADMIN_PASSWORD` / `RES_VIEWER_PASSWORD` (`docker-compose.yml`) |
+| Grafana | `:3000` | `admin` | `GF_SECURITY_ADMIN_PASSWORD` (`docker-compose.yml`) |
+| Prometheus | `:9090` | `prom` | `deploy/prometheus/web.config.yml` (`--web.config.file`) |
 
-The gateway persists only argon2 hashes in `config/res.credentials`
-(mode `0600`, gitignored), so that generated password keeps working across
-restarts and `down --volumes`; Grafana keeps it in its database. For real
-deployments choose your own instead (they always win, on every start) and
-keep them in an environment file outside the repo, e.g.
-`--env-file /etc/res/stack.env` (mode `0600`):
-
-```console
-$ RES_ADMIN_PASSWORD=<new-password> \
-  GRAFANA_ADMIN_PASSWORD=<new-password> \
-  docker compose up -d --build
-```
-
-Optionally set `RES_VIEWER_PASSWORD` for a read-only dashboard login.
+Each application enforces its own credential: the gateway rejects
+unauthenticated API requests with `401` (viewer mutations: `403`) and stores
+only argon2 hashes in `config/res.credentials` (mode `0600`, gitignored);
+Grafana applies its admin password on every start; Prometheus does **not**
+read auth from environment variables — HTTP basic auth comes from the web
+config file mounted in compose, so unauthenticated `/api/v1/*` and UI
+requests get `401`. The gateway's Prometheus proxy and the Grafana datasource
+both send the `prom` credentials automatically.
 
 If the host already owns port 53 (systemd-resolved, another resolver),
 do not edit the compose file — override the published port:
@@ -120,13 +114,17 @@ Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
 * The config directory must be writable: the API rewrites the file
   atomically (temp + fsync + rename) and keeps `res.toml.backup` as the last
   valid version, which is loaded automatically if the primary file is broken.
-* `RES_PROMETHEUS_URL` overrides `[monitoring].prometheus_url`.
+* `RES_PROMETHEUS_URL` overrides `[monitoring].prometheus_url`;
+  `RES_PROMETHEUS_USERNAME` / `RES_PROMETHEUS_PASSWORD` (env-only, never in
+  the TOML) are sent as HTTP basic auth on every proxy query when the
+  Prometheus server requires it.
 * Directories mounted into containers must be directory mounts (compose uses
   `./config:/etc/res:rw`).
 
 ### Authentication (dashboard & API)
 
-Set by environment, hashed with argon2id at startup and persisted in
+Set by environment (`docker-compose.yml` sets them in plain text for this
+deployment), hashed with argon2id at startup and persisted in
 `res.credentials` (mode `0600`, next to the TOML config) — never written
 into the TOML itself:
 
@@ -213,10 +211,14 @@ Safety properties:
   outcome.
 
 Prometheus scrapes `res:8080/metrics` every 5 s (`deploy/prometheus.yml`,
-15 days / 2 GB retention). Grafana (`:3000`) requires `admin` and
-`GRAFANA_ADMIN_PASSWORD` (or the one-time password printed to its log on
-first run); anonymous access and sign-ups are disabled. Six dashboards are
-provisioned in folder `res` from
+15 days / 2 GB retention). Prometheus' own endpoints require HTTP basic auth
+(user `prom`, from `deploy/prometheus/web.config.yml` mounted via
+`--web.config.file` — Prometheus has no environment-variable auth;
+unauthenticated API/UI requests get `401`). Grafana (`:3000`) requires
+`admin` / `GF_SECURITY_ADMIN_PASSWORD`; anonymous access and sign-ups are
+disabled, and its Prometheus datasource sends the same `prom` credentials
+(`deploy/grafana/provisioning/datasources/prometheus.yml`). Six dashboards
+are provisioned in folder `res` from
 `deploy/grafana/dashboards/` every 30 s; regenerate the JSON with:
 
 ```console
@@ -242,6 +244,10 @@ it (hover the score).
 
 Deliberate scope decisions, so nothing here surprises an operator:
 
+* **Compose credentials are plain text** — intentionally, per this
+  deployment's requirement (no secrets manager). The gateway still stores
+  only argon2 hashes at runtime; change the values by editing
+  `docker-compose.yml` and `deploy/prometheus/web.config.yml` together.
 * **No TLS in the binary** — plain HTTP/UDP/TCP; terminate HTTPS at a
   reverse proxy (see above) and set `secure_cookies`.
 * **ACL is application-layer only** — pair it with a host firewall.

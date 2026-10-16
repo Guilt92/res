@@ -19,6 +19,10 @@ pub struct PromClient {
     port: u16,
     base_path: String,
     timeout: Duration,
+    /// Pre-encoded `Authorization` header value (`Basic …`), sent with every
+    /// request when the Prometheus server enforces basic auth
+    /// (`--web.config.file`).
+    authorization: Option<String>,
 }
 
 impl PromClient {
@@ -62,7 +66,22 @@ impl PromClient {
             port,
             base_path: path.trim_end_matches('/').to_string(),
             timeout: Duration::from_secs(5),
+            authorization: None,
         })
+    }
+
+    /// Send HTTP basic auth with every request (`username:password`, base64).
+    /// With both values empty this is a no-op: no `Authorization` header is
+    /// added, matching an unauthenticated Prometheus.
+    pub fn with_basic_auth(mut self, username: &str, password: &str) -> Self {
+        if username.is_empty() && password.is_empty() {
+            return self;
+        }
+        use base64::Engine as _;
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        self.authorization = Some(format!("Basic {token}"));
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -121,20 +140,30 @@ impl PromClient {
         format!("{}/api/v1", self.base_path)
     }
 
+    /// Build the raw HTTP/1.1 GET (kept separate from I/O so the header
+    /// contract — including the optional Authorization — is unit-testable).
+    fn build_request(&self, path_and_query: &str) -> String {
+        let auth = match &self.authorization {
+            Some(a) => format!("Authorization: {a}\r\n"),
+            None => String::new(),
+        };
+        format!(
+            "GET {path_and_query} HTTP/1.1\r\nHost: {}\r\nUser-Agent: res/{}\r\nAccept: application/json\r\n{auth}Connection: close\r\n\r\n",
+            if self.port == 80 {
+                self.host.clone()
+            } else {
+                format!("{}:{}", self.host, self.port)
+            },
+            env!("CARGO_PKG_VERSION"),
+        )
+    }
+
     async fn get(&self, path_and_query: &str) -> Result<Vec<u8>, String> {
         let fut = async {
             let mut stream = tokio::net::TcpStream::connect((self.host.as_str(), self.port))
                 .await
                 .map_err(|e| format!("connect to {}: {e}", self.endpoint()))?;
-            let req = format!(
-                "GET {path_and_query} HTTP/1.1\r\nHost: {}\r\nUser-Agent: res/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-                if self.port == 80 {
-                    self.host.clone()
-                } else {
-                    format!("{}:{}", self.host, self.port)
-                },
-                env!("CARGO_PKG_VERSION"),
-            );
+            let req = self.build_request(path_and_query);
             stream
                 .write_all(req.as_bytes())
                 .await
@@ -582,6 +611,36 @@ pub fn step_axis(start_s: f64, end_s: f64, step: u64) -> Vec<u64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn basic_auth_header_is_sent_only_when_configured() {
+        let plain = PromClient::new("http://prometheus:9090").unwrap();
+        assert!(
+            !plain
+                .build_request("/api/v1/query?query=1")
+                .contains("Authorization:"),
+            "no credentials configured -> no Authorization header"
+        );
+        let authed = PromClient::new("http://prometheus:9090")
+            .unwrap()
+            .with_basic_auth("prom", "s3cr3t");
+        let req = authed.build_request("/api/v1/query?query=1");
+        let line = req
+            .lines()
+            .find(|l| l.starts_with("Authorization: Basic "))
+            .expect("Authorization header present");
+        let token = line.trim_start_matches("Authorization: Basic ");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(token)
+            .expect("valid base64");
+        assert_eq!(decoded, b"prom:s3cr3t");
+        // Empty credentials keep the header off entirely.
+        let noop = PromClient::new("http://p:9090")
+            .unwrap()
+            .with_basic_auth("", "");
+        assert!(!noop.build_request("/x").contains("Authorization:"));
+    }
 
     #[test]
     fn parses_base_urls() {

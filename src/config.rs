@@ -708,6 +708,17 @@ pub struct MonitoringConfig {
     /// The `RES_PROMETHEUS_URL` environment variable overrides this
     /// value (applied on every parse).
     pub prometheus_url: String,
+    /// Username for HTTP basic auth when the Prometheus server enforces it
+    /// (`--web.config.file` `basic_auth`). Empty (default) sends no
+    /// `Authorization` header. `RES_PROMETHEUS_USERNAME` overrides this.
+    pub prometheus_username: String,
+    /// Password for HTTP basic auth against Prometheus. Environment-only
+    /// (`RES_PROMETHEUS_PASSWORD`): `#[serde(skip)]` keeps it out of the
+    /// TOML file entirely — it can neither be loaded from nor persisted or
+    /// serialized back into the config (same rule as the dashboard
+    /// credentials, which never live in the TOML either).
+    #[serde(skip)]
+    pub prometheus_password: String,
     /// Client-address exposure (see [`ClientIpPrivacy`]). `off` disables the
     /// top-client table entirely.
     pub client_ip_privacy: ClientIpPrivacy,
@@ -725,6 +736,8 @@ impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
             prometheus_url: String::new(),
+            prometheus_username: String::new(),
+            prometheus_password: String::new(),
             client_ip_privacy: ClientIpPrivacy::default(),
             top_clients_max: 4_096,
             top_domains_max: 8_192,
@@ -818,6 +831,16 @@ impl AppConfig {
         if let Ok(v) = std::env::var("RES_PROMETHEUS_URL") {
             if !v.trim().is_empty() {
                 self.monitoring.prometheus_url = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("RES_PROMETHEUS_USERNAME") {
+            if !v.trim().is_empty() {
+                self.monitoring.prometheus_username = v.trim().to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("RES_PROMETHEUS_PASSWORD") {
+            if !v.is_empty() {
+                self.monitoring.prometheus_password = v;
             }
         }
         if let Ok(v) = std::env::var("RES_API_TOKEN") {
@@ -1382,6 +1405,39 @@ mod tests {
         cfg.query.upstream_timeout_ms = 1_000;
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("query.timeout"), "{err}");
+    }
+
+    /// The Prometheus basic-auth password is environment-only: `serde(skip)`
+    /// keeps it out of every serialization (persistence, config export), and
+    /// a stray TOML key is rejected loudly by `deny_unknown_fields` instead
+    /// of being silently accepted into the file-backed config.
+    #[test]
+    fn prometheus_password_is_env_only() {
+        let m = MonitoringConfig {
+            prometheus_url: "http://prometheus:9090".into(),
+            prometheus_username: "prom".into(),
+            prometheus_password: "sekrit".into(),
+            ..Default::default()
+        };
+        let out = toml::to_string(&m).expect("serialize");
+        assert!(!out.contains("sekrit"), "password leaked: {out}");
+        assert!(
+            out.contains("prometheus_username"),
+            "username is allowed in TOML: {out}"
+        );
+
+        // Username round-trips from TOML (non-secret) …
+        let m: MonitoringConfig =
+            toml::from_str("prometheus_url = \"http://p:9090\"\nprometheus_username = \"prom\"")
+                .expect("username + url parse");
+        assert_eq!(m.prometheus_username, "prom");
+        assert_eq!(m.prometheus_password, "");
+
+        // … but the password may not appear in TOML at all.
+        let err = toml::from_str::<MonitoringConfig>("prometheus_password = \"x\"")
+            .expect_err("password key must be rejected")
+            .to_string();
+        assert!(err.contains("prometheus_password"), "{err}");
     }
 
     #[test]

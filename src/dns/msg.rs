@@ -81,6 +81,10 @@ pub struct ParsedQuery {
     pub checking_disabled: bool,
     /// EDNS advertised UDP payload size, when the client sent an OPT record.
     pub edns_payload: Option<u16>,
+    /// True when the query carries any EDNS option (ECS, COOKIE, ...).
+    /// Such queries bypass the shared cache: their responses may be specific
+    /// to the requesting client and must never be served to another one.
+    pub has_edns_options: bool,
     pub queries: Vec<Query>,
 }
 
@@ -128,6 +132,11 @@ pub fn parse_query(bytes: &[u8]) -> Result<ParsedQuery, QueryReject> {
         .map(|e| e.flags().dnssec_ok)
         .unwrap_or(false);
     let edns_payload = msg.edns.as_ref().map(|e| e.max_payload());
+    let has_edns_options = msg
+        .edns
+        .as_ref()
+        .map(|e| !e.options().options.is_empty())
+        .unwrap_or(false);
     Ok(ParsedQuery {
         id: msg.metadata.id,
         op_code: msg.metadata.op_code,
@@ -136,6 +145,7 @@ pub fn parse_query(bytes: &[u8]) -> Result<ParsedQuery, QueryReject> {
         dnssec_ok,
         checking_disabled: msg.metadata.checking_disabled,
         edns_payload,
+        has_edns_options,
         queries: msg.queries,
     })
 }
@@ -338,13 +348,18 @@ pub fn parse_rcode(s: &str) -> Option<Rcode> {
     }
 }
 
-/// Question key used by the cache (lowercased name, type, class, CD bit).
-pub fn question_key(q: &Query, checking_disabled: bool) -> crate::cache::CacheKey {
+/// Question key used by the cache (lowercased name, type, class, RD, CD).
+pub fn question_key(
+    q: &Query,
+    checking_disabled: bool,
+    recursion_desired: bool,
+) -> crate::cache::CacheKey {
     crate::cache::CacheKey {
         name: q.name().to_ascii().to_lowercase(),
         qtype: u16::from(q.query_type()),
         qclass: u16::from(q.query_class()),
         cd: checking_disabled,
+        rd: recursion_desired,
     }
 }
 
@@ -791,6 +806,8 @@ mod tests {
 
     #[test]
     fn correlation_checks_id_and_question() {
+        use hickory_proto::rr::DNSClass;
+
         let q = parse_query(&sample_query()).unwrap();
 
         let mut good = sample_query();
@@ -805,6 +822,116 @@ mod tests {
         wrong_id[0] = wrong_id[0].wrapping_add(1);
         let wrong_id_view = parse_response(&wrong_id).unwrap();
         assert!(!correlates(&q, &wrong_id_view));
+
+        // A forged reply must match the exact question: name, type and class.
+        let response = |name: &str, qtype: RecordType, qclass: DNSClass| {
+            let mut m = Message::response(q.id, q.op_code);
+            let mut question = Query::query(Name::from_ascii(name).unwrap(), qtype);
+            question.set_query_class(qclass);
+            m.queries.push(question);
+            parse_response(&m.to_vec().unwrap()).unwrap()
+        };
+        assert!(correlates(
+            &q,
+            &response("example.com", RecordType::A, DNSClass::IN)
+        ));
+        assert!(
+            !correlates(&q, &response("exampld.com", RecordType::A, DNSClass::IN)),
+            "different name must be rejected"
+        );
+        assert!(
+            !correlates(&q, &response("example.com", RecordType::AAAA, DNSClass::IN)),
+            "different qtype must be rejected"
+        );
+        assert!(
+            !correlates(&q, &response("example.com", RecordType::A, DNSClass::CH)),
+            "different qclass must be rejected"
+        );
+    }
+
+    #[test]
+    fn response_parser_rejects_short_and_query_packets() {
+        assert!(parse_response(&[0u8; 11]).is_err());
+        let query = sample_query();
+        assert!(parse_response(&query).is_err(), "QR=0 is not a response");
+    }
+
+    #[test]
+    fn response_parser_rejects_compression_pointer_loop() {
+        // Minimal response whose single question name points at itself.
+        let mut bytes = vec![0u8; 12];
+        bytes[0..2].copy_from_slice(&7u16.to_be_bytes());
+        bytes[2] = 0x81; // QR=1, RD=1
+        bytes[3] = 0x80; // RA=1
+        bytes[4..6].copy_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        bytes.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        assert!(
+            parse_response(&bytes).is_err(),
+            "self-referential compression must be rejected"
+        );
+    }
+
+    #[test]
+    fn cache_key_normalizes_case_and_isolates_class_type_and_cd() {
+        use hickory_proto::rr::DNSClass;
+
+        let lower = parse_query(&build_query("example.com", "A").unwrap()).unwrap();
+        let upper = parse_query(&build_query("EXAMPLE.COM", "A").unwrap()).unwrap();
+        assert_eq!(
+            question_key(
+                lower.question(),
+                lower.checking_disabled,
+                lower.recursion_desired
+            ),
+            question_key(
+                upper.question(),
+                upper.checking_disabled,
+                upper.recursion_desired
+            ),
+            "0x20 casing must share one cache entry"
+        );
+
+        let base = question_key(lower.question(), false, true);
+        let mut qclass = lower.question().clone();
+        qclass.set_query_class(DNSClass::CH);
+        assert_ne!(base, question_key(&qclass, false, true));
+        let qtype = Query::query(Name::from_ascii("example.com").unwrap(), RecordType::AAAA);
+        assert_ne!(base, question_key(&qtype, false, true));
+        assert_ne!(base, question_key(lower.question(), true, true));
+        assert_ne!(
+            base,
+            question_key(lower.question(), false, false),
+            "RD=0 responses must not mix with recursive cache entries"
+        );
+    }
+
+    #[test]
+    fn parses_edns_options_as_client_specific() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+
+        let plain = parse_query(&sample_query()).unwrap();
+        assert!(!plain.has_edns_options);
+
+        let mut m = Message::query();
+        m.queries.push(Query::query(
+            Name::from_ascii("example.com").unwrap(),
+            RecordType::A,
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "192.0.2.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        m.set_edns(edns);
+        let q = parse_query(&m.to_vec().unwrap()).unwrap();
+        assert!(q.has_edns);
+        assert!(
+            q.has_edns_options,
+            "ECS must mark the query client-specific"
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ fn main() {
             qtype: 1,
             qclass: 1,
             cd: false,
+            rd: true,
         })
         .collect();
     for k in &cache_keys {

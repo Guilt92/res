@@ -342,6 +342,18 @@ async fn idle_gateway_reports_no_fake_metrics() {
     assert_eq!(up["latency"]["samples"].as_u64(), Some(0), "{body}");
     assert!(up["latency"]["p50_ms"].is_null(), "{body}");
     assert!(up["latency"]["p95_ms"].is_null(), "{body}");
+    // The panel renders the score factors; the API must keep the structured
+    // breakdown intact instead of replacing it with a bare number.
+    assert!(up["score"].is_object(), "score breakdown expected: {body}");
+    assert!(
+        up["score"]["score"].is_number(),
+        "composite score expected: {body}"
+    );
+    assert!(
+        up["score"]["health_factor"].is_number(),
+        "score factors expected: {body}"
+    );
+    assert!(up["score_value"].is_number(), "{body}");
 
     // Let the 1 Hz sampler produce real (idle) buckets: latency series must
     // stay empty while the measured counters stay 0.
@@ -2395,6 +2407,86 @@ async fn auth_config_export_redacts_token_for_viewers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_viewer_cannot_mutate_configuration() {
+    let cfg = base_config();
+    let gw = start_gateway_with_passwords(cfg, "admin-pw", Some("view-pw")).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"viewer","password":"view-pw"}"#),
+        &[],
+    )
+    .await;
+    let session = set_cookie(&raw, "res_session").expect("session");
+    let csrf = set_cookie(&raw, "res_csrf").expect("csrf");
+    let headers = [
+        ("Cookie".into(), format!("res_session={session}")),
+        ("X-CSRF-Token".into(), csrf.clone()),
+    ];
+
+    // Viewer reads are allowed.
+    let (status, body) = http_headers("GET", api, "/api/status", None, &headers).await;
+    assert_eq!(status, 200, "{body}");
+
+    // Every configuration mutation is rejected by the backend, not just by
+    // the dashboard's disabled controls.
+    let mutations = [
+        ("POST", "/api/cache/clear", None),
+        (
+            "PUT",
+            "/api/acl",
+            Some(r#"{"entries":[{"cidr":"127.0.0.0/8","action":"allow","enabled":true}]}"#),
+        ),
+        (
+            "POST",
+            "/api/upstreams",
+            Some(r#"{"name":"viewer-nope","address":"127.0.0.1","port":53}"#),
+        ),
+        (
+            "POST",
+            "/api/auth/rotate-password",
+            Some(r#"{"account":"admin","new_password":"viewer-should-not"}"#),
+        ),
+    ];
+    for (method, path, body) in mutations {
+        let (status, response) = http_headers(method, api, path, body, &headers).await;
+        assert_eq!(
+            status, 403,
+            "viewer {method} {path} must be 403, got {status}: {response}"
+        );
+    }
+
+    // The admin can still perform the same mutation after login.
+    let raw = http_raw(
+        "POST",
+        api,
+        "/api/auth/login",
+        Some(r#"{"username":"admin","password":"admin-pw"}"#),
+        &[],
+    )
+    .await;
+    let admin_session = set_cookie(&raw, "res_session").expect("admin session");
+    let admin_csrf = set_cookie(&raw, "res_csrf").expect("admin csrf");
+    let (status, body) = http_headers(
+        "POST",
+        api,
+        "/api/cache/clear",
+        None,
+        &[
+            ("Cookie".into(), format!("res_session={admin_session}")),
+            ("X-CSRF-Token".into(), admin_csrf),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_rotate_password_invalidates_old_and_works_with_new() {
     let cfg = base_config();
     let gw = start_gateway_with_passwords(cfg, "old-pw", None).await;
@@ -2491,6 +2583,42 @@ async fn auth_secure_cookies_flag_set_when_configured() {
         raw.contains("Secure"),
         "Secure flag expected on cookies: {raw}"
     );
+
+    gw.shutdown().await;
+}
+
+/// Password rotation enforces the server-side minimum length even when the
+/// caller bypasses the dashboard's form validation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_rotate_password_rejects_short_password() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "rotation-token".into();
+    let gw = start_gateway_with_passwords(cfg, "admin-pw", None).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/auth/rotate-password",
+        Some(r#"{"account":"admin","new_password":"short"}"#),
+        Some("rotation-token"),
+    )
+    .await;
+    assert_eq!(status, 400, "short password must be rejected: {body}");
+    assert!(
+        body.contains("8..=1024"),
+        "error must state the policy: {body}"
+    );
+
+    let (status, body) = http_auth(
+        "POST",
+        api,
+        "/api/auth/rotate-password",
+        Some(r#"{"account":"admin","new_password":"long-enough"}"#),
+        Some("rotation-token"),
+    )
+    .await;
+    assert_eq!(status, 200, "valid password must rotate: {body}");
 
     gw.shutdown().await;
 }
@@ -3445,6 +3573,15 @@ async fn api_responses_carry_security_headers() {
     assert!(head.contains("x-content-type-options: nosniff"), "{head}");
     assert!(head.contains("x-frame-options: deny"), "{head}");
     assert!(head.contains("referrer-policy: no-referrer"), "{head}");
+    assert!(
+        head.contains("cache-control: no-store"),
+        "API payloads must not be cached: {head}"
+    );
+    assert!(
+        head.contains("cross-origin-opener-policy: same-origin"),
+        "{head}"
+    );
+    assert!(head.contains("permissions-policy:"), "{head}");
 
     // Even the JSON 404 fallback carries them (layer wraps the fallback).
     let raw = http_raw("GET", api, "/api/nope", None, &[]).await;

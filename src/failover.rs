@@ -284,6 +284,8 @@ mod tests {
         Answer,
         /// Answer with SERVFAIL.
         ServFail,
+        /// Answer with a matching id but a different question.
+        WrongQuestion,
     }
 
     struct FakeUpstream {
@@ -320,6 +322,10 @@ mod tests {
                             let resp = response_for(&query, ResponseCode::ServFail);
                             let _ = sock.send_to(&resp, peer).await;
                         }
+                        Mode::WrongQuestion => {
+                            let resp = response_for_wrong_question(&query);
+                            let _ = sock.send_to(&resp, peer).await;
+                        }
                     }
                 }
             });
@@ -345,6 +351,18 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    fn response_for_wrong_question(query: &Message) -> Vec<u8> {
+        let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+        resp.metadata.recursion_available = true;
+        if let Some(q) = query.queries.first() {
+            resp.queries.push(hickory_proto::op::Query::query(
+                hickory_proto::rr::Name::from_ascii("wrong.test.").unwrap(),
+                q.query_type(),
+            ));
+        }
+        resp.to_vec().expect("encode mismatched response")
     }
 
     fn response_for(query: &Message, rcode: ResponseCode) -> Vec<u8> {
@@ -480,7 +498,6 @@ mod tests {
         let pool = vec![Arc::clone(&ra), Arc::clone(&rb)];
         let sel = best_selector();
         let raw = msg::build_query("example.com", "A").unwrap();
-        let query = msg::parse_query(&raw).unwrap();
 
         let (result, metrics, events) = run_forward(
             sel.as_ref(),
@@ -497,11 +514,11 @@ mod tests {
         assert_eq!(ok.upstream_name, "two");
         assert_eq!(ok.rcode, Rcode::NoError);
 
-        // The response is the second upstream's answer, correlated to the
-        // client's transaction id.
+        // The response is the second upstream's answer. The pipeline rewrites
+        // the upstream transaction id back to the client's id before serving.
         let view = msg::parse_response(&ok.response).expect("parse response");
-        assert_eq!(view.id, query.id);
         assert_eq!(view.rcode, Rcode::NoError);
+        assert_eq!(view.question.expect("question").0, "example.com.");
 
         // Failover accounting: metrics, per-upstream counters, event ring.
         assert_eq!(metrics.failovers_total.get(), 1);
@@ -623,6 +640,45 @@ mod tests {
             1
         );
         assert_eq!(ra.stats().failovers, 1);
+        assert_eq!(events.failover.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn uncorrelated_response_fails_over_to_a_valid_upstream() {
+        let bad = FakeUpstream::start(Mode::WrongQuestion).await;
+        let good = FakeUpstream::start(Mode::Answer).await;
+        let pool = vec![
+            UpstreamRuntime::new(bad.config(1, "bad")),
+            UpstreamRuntime::new(good.config(2, "good")),
+        ];
+        let sel = best_selector();
+        let raw = msg::build_query("example.com", "A").unwrap();
+
+        let (result, metrics, events) = run_forward(
+            sel.as_ref(),
+            &QueryConfig::default(),
+            &FailoverConfig::default(),
+            &raw,
+            &pool,
+        )
+        .await;
+
+        let ok = expect_ok(result);
+        assert_eq!(ok.attempts, 2, "mismatched reply must trigger failover");
+        assert_eq!(ok.upstream_id, 2);
+        let view = msg::parse_response(&ok.response).expect("parse final response");
+        assert_eq!(view.question.expect("question").0, "example.com.");
+        assert_eq!(metrics.failovers_total.get(), 1);
+        // UDP keeps listening after a mismatched datagram, so the bad
+        // upstream eventually times out; the forged packet itself is never
+        // surfaced to the client.
+        assert_eq!(
+            metrics
+                .failover_reason_total
+                .with_label_values(&["timeout"])
+                .get(),
+            1
+        );
         assert_eq!(events.failover.len(), 1);
     }
 

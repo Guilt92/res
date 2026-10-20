@@ -445,11 +445,13 @@ async fn api_concurrency(
 }
 
 /// Response headers for every API/dashboard reply: MIME sniffing off,
-/// framing off, no referrer leakage. A CSP is deliberately not set — the
-/// dashboard ships an inline script/stylesheet by design, and a hash/nonce
-/// policy would have to be kept in lockstep with `index.html` (documented
-/// in the README instead).
+/// framing off, no referrer leakage, and no shared/browser caching for
+/// authenticated API payloads (which can contain configuration and session
+/// metadata). A CSP is deliberately not set — the dashboard ships an inline
+/// script/stylesheet by design, and a hash/nonce policy would have to be
+/// kept in lockstep with `index.html` (documented in the README instead).
 async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
@@ -461,6 +463,25 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    h.insert(
+        "cross-origin-opener-policy",
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        "x-permitted-cross-domain-policies",
+        HeaderValue::from_static("none"),
+    );
+    h.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
+    if path.starts_with("/api/") || path == "/metrics" {
+        // Sessions, CSRF tokens, config exports and live stats must never be
+        // stored by a shared cache or replayed from the browser back/forward
+        // cache after logout.
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
     res
 }
 
@@ -829,10 +850,13 @@ async fn rotate_password(
     Json(req): Json<RotatePasswordRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&st, &headers, "rotate_password")?;
-    if req.new_password.is_empty() || req.new_password.len() > 1024 {
-        return Err(ApiError::BadRequest(
-            "new_password must be 1..=1024 characters".into(),
-        ));
+    // The server is the source of truth for password policy: a browser-side
+    // `minlength` check alone would be bypassed by a direct API call.
+    const MIN_PASSWORD_LEN: usize = 8;
+    if req.new_password.len() < MIN_PASSWORD_LEN || req.new_password.len() > 1024 {
+        return Err(ApiError::BadRequest(format!(
+            "new_password must be {MIN_PASSWORD_LEN}..=1024 characters"
+        )));
     }
     let account = req.account.to_ascii_lowercase();
     // Hashing (argon2) and the credential-file write run on the blocking
@@ -2803,7 +2827,10 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
         .into_iter()
         .map(|(mut v, is_eligible, score, reason)| {
             let id = v["id"].as_i64().unwrap_or(0);
-            v["score"] = json!(score);
+            // Keep the serialized `score` breakdown (factors + composite):
+            // the dashboard renders the factors in a tooltip. `score_value`
+            // is the same composite as a plain number for scripted clients.
+            v["score_value"] = json!(score);
             v["rank"] = ranks.get(&id).map_or(Value::Null, |r| json!(r));
             v["reason"] = Value::String(reason);
             if is_eligible {

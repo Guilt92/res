@@ -101,8 +101,9 @@ impl Pipeline {
         // identical misses coalesce onto one upstream query. The first
         // arrival is the leader and performs the forward; later arrivals
         // wait for the leader's outcome instead of duplicating the query.
-        // DO-bit queries and disabled caches skip this entirely (they never
-        // store, so coalescing would be incorrect).
+        // DO-bit and EDNS-option queries (and disabled caches) skip this
+        // entirely: their responses may be client-specific and must not be
+        // shared through the cache or single-flight.
         if let Some(key) = &prepared.cache_key {
             match self.shared.singleflight.join(key) {
                 FlightRole::Leader(leader) => {
@@ -461,7 +462,11 @@ impl Pipeline {
 
         // ---- Question-type + domain accounting (before any rejection so
         // traffic reflects what clients actually asked for) ----
-        let cache_key = msg::question_key(parsed.question(), parsed.checking_disabled);
+        let cache_key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
         metrics
             .query_type_total
             .with_label_values(&[msg::qtype_label(parsed.qtype())])
@@ -540,8 +545,12 @@ impl Pipeline {
             return Precheck::Reply(msg::error_response(&parsed, Rcode::NotImp));
         }
 
-        // ---- Cache (enabled by default; DO-bit queries always miss) ----
-        let use_cache = rt.cache.enabled && !parsed.dnssec_ok;
+        // ---- Cache (enabled by default; client-specific queries always miss) ----
+        // DO-bit queries need DNSSEC records, and any EDNS option (ECS,
+        // COOKIE, ...) can make the upstream response client-specific. Both
+        // bypass the shared cache and single-flight to prevent cross-client
+        // data leakage or cache poisoning.
+        let use_cache = rt.cache.enabled && !parsed.dnssec_ok && !parsed.has_edns_options;
         if use_cache {
             match shared.cache.get(&cache_key, parsed.id, &rt.cache) {
                 crate::cache::CacheLookup::Hit { mut bytes, rcode } => {
@@ -785,7 +794,11 @@ mod tests {
         let p = pipeline_with(AppConfig::default());
         let raw = query_bytes("example.com", "A");
         let parsed = msg::parse_query(&raw).expect("parse query");
-        let key = msg::question_key(parsed.question(), parsed.checking_disabled);
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
 
         // Store a response under a *different* transaction id: the cache must
         // rewrite it to the client's id on the way out.
@@ -817,6 +830,79 @@ mod tests {
             _ => panic!("expected cache-hit reply"),
         }
         assert_eq!(p.shared.metrics.cache_hits_total.get(), 1);
+    }
+
+    #[test]
+    fn edns_option_queries_bypass_the_shared_cache() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+
+        let mut app = AppConfig::default();
+        app.cache.enabled = true;
+        app.ratelimit.enabled = false;
+        let p = pipeline_with(app);
+
+        let raw = query_bytes("example.com", "A");
+        let parsed = msg::parse_query(&raw).expect("parse query");
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+        let mut stored = Message::response(999, OpCode::Query);
+        stored.queries = parsed.queries.clone();
+        stored.answers.push(Record::from_rdata(
+            parsed.question().name().clone(),
+            300,
+            RData::A(rdata::A::from(std::net::Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+        let cache_cfg = p.shared.rt.load().cache.clone();
+        p.shared.cache.put(
+            key,
+            stored.to_vec().expect("encode cached response"),
+            Duration::from_secs(300),
+            Rcode::NoError,
+            &cache_cfg,
+        );
+
+        // The plain query is served from the shared cache...
+        assert!(matches!(
+            p.precheck(client(), Transport::Udp, &raw, Instant::now()),
+            Precheck::Reply(_)
+        ));
+        assert_eq!(p.shared.metrics.cache_hits_total.get(), 1);
+
+        // ...but an otherwise identical ECS query must never read that entry:
+        // the upstream answer may be specific to another client's subnet.
+        let mut m = Message::query();
+        m.metadata.id = parsed.id;
+        m.queries = parsed.queries.clone();
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "198.51.100.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        m.set_edns(edns);
+        let ecs_raw = m.to_vec().expect("encode ECS query");
+        let ecs = msg::parse_query(&ecs_raw).expect("parse ECS query");
+        assert!(ecs.has_edns_options);
+
+        match p.precheck(client(), Transport::Udp, &ecs_raw, Instant::now()) {
+            Precheck::Proceed(prepared) => assert!(
+                prepared.cache_key.is_none(),
+                "option-bearing queries must not join cache/single-flight"
+            ),
+            Precheck::Reply(_) => panic!("ECS query must not be served from the shared cache"),
+            Precheck::Drop => panic!("ECS query must be forwarded"),
+        }
+        assert_eq!(
+            p.shared.metrics.cache_hits_total.get(),
+            1,
+            "the ECS query must not consume the plain entry"
+        );
     }
 
     #[tokio::test]

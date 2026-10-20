@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>res · Observability</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6feb'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='sans-serif' font-size='12' font-weight='700' fill='white'%3Eres%3C/text%3E%3C/svg%3E">
 <style>
 /* Shabnam (SIL OFL 1.1, Saber Rastikerdar) — bundled in fonts/ so the
    dashboard renders identically in Docker and on machines without the font. */
@@ -277,6 +278,277 @@ footer{margin-top:34px;color:var(--faint);font-size:11px;border-top:1px solid va
 #login-box button.ghost{background:transparent;border:1px solid var(--line2);color:var(--dim);font-weight:400}
 #login-msg{font-size:12px;min-height:16px;margin-top:10px;color:#ff7b72}
 #login-msg.ok{color:#7ee787}
+
+/* =========================================================================
+   Control-plane layout v2
+   ========================================================================= */
+:root{
+  --bg:#080c12; --panel:#10161f; --panel2:#0b1119; --line:#1d2837; --line2:#2b3b51;
+  --fg:#e3eaf4; --dim:#93a3b8; --faint:#64758b;
+  --accent:#5cc8ff; --accent-soft:rgba(92,200,255,.12);
+  --radius:12px; --shadow:0 14px 40px rgba(0,0,0,.35);
+  --header-h:102px;
+}
+html{scroll-behavior:smooth}
+html,body{max-width:100%;overflow-x:hidden}
+body{background:
+  radial-gradient(1100px 500px at 78% -180px, rgba(31,111,235,.14), transparent 70%),
+  radial-gradient(800px 420px at 5% 0, rgba(92,200,255,.06), transparent 70%),
+  var(--bg)}
+::selection{background:rgba(92,200,255,.28)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+[hidden]{display:none!important}
+.skip-link{position:fixed;left:12px;top:-48px;z-index:200;background:var(--accent);color:#04121c;
+  padding:8px 14px;border-radius:8px;font-weight:700;text-decoration:none;transition:top .15s}
+.skip-link:focus{top:10px}
+.mono{font-family:var(--code)}
+
+header{position:sticky;top:0;z-index:40;background:rgba(8,12,18,.9);
+  backdrop-filter:blur(14px);border-bottom:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.22)}
+.hbar{max-width:none;padding:0 20px;gap:12px;flex-wrap:nowrap}
+.hbar-primary{height:58px}
+.hbar-secondary{height:44px;border-top:1px solid rgba(29,40,55,.65);
+  background:rgba(13,19,28,.55);padding-left:20px}
+.brand{display:inline-flex;align-items:center;gap:10px;text-decoration:none;color:var(--fg);
+  flex:0 0 auto;line-height:1.1}
+.brand-mark{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;
+  border-radius:9px;background:linear-gradient(145deg,#1f6feb,#0b3b8c);color:#fff;
+  font-size:13px;font-weight:700;letter-spacing:.02em;box-shadow:inset 0 1px 0 #ffffff2e}
+.brand-sub{display:flex;flex-direction:column;gap:1px;font-size:12.5px;font-weight:600;color:#c9d7e8}
+.brand-sub .v{font-family:var(--code);font-size:10px;color:var(--faint);font-weight:400;letter-spacing:0}
+.nav-toggle{display:none;width:36px;height:36px;border:1px solid var(--line2);border-radius:9px;
+  background:var(--panel);color:var(--fg);cursor:pointer;padding:8px;flex:0 0 auto}
+.nav-toggle span{display:block;height:2px;background:var(--dim);border-radius:2px;margin:3px 0;
+  transition:.2s}
+.live-meta{display:flex;align-items:center;gap:9px;min-width:0}
+.updated{font-family:var(--code);font-size:10.5px;color:var(--faint);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:170px}
+.user-area{display:flex;align-items:center;gap:7px;flex:0 0 auto}
+.auth-chip{cursor:default;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.uptime{white-space:nowrap;gap:7px}
+.uptime b{font-family:var(--code);color:var(--fg);font-weight:500}
+.toolbar-sep{width:1px;height:18px;background:var(--line2)}
+.ctl select{padding:5px 9px;border-radius:7px;background:var(--panel)}
+.check{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;cursor:pointer}
+.check input{accent-color:var(--accent)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border-radius:8px;
+  border:1px solid var(--line2);background:var(--panel);color:var(--fg);padding:6px 12px;
+  font:600 12px var(--sans);cursor:pointer;text-decoration:none;white-space:nowrap}
+.btn:hover{border-color:#405574;background:#162131}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.btn-primary:hover{background:#2f81f7;border-color:#2f81f7}
+.btn-ghost{background:transparent}
+.btn-danger{color:#ff7b72;border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.06)}
+.btn-sm{padding:4px 9px;font-size:11px}
+
+.app-shell{display:grid;grid-template-columns:238px minmax(0,1fr);max-width:1720px;
+  margin:0 auto;align-items:start}
+.sidenav{position:sticky;top:var(--header-h);height:calc(100vh - var(--header-h));
+  display:flex;flex-direction:column;padding:16px 10px 14px;border-right:1px solid var(--line);
+  background:rgba(9,14,21,.55);overflow:hidden;z-index:35}
+.nav-scroll{overflow-y:auto;overflow-x:hidden;padding-right:3px;scrollbar-width:thin}
+.nav-group{margin-bottom:14px}
+.nav-group-title{font-size:9.5px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;
+  color:var(--faint);padding:0 10px;margin-bottom:5px}
+.nav-link{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:8px;
+  color:var(--dim);font-size:12.5px;line-height:1.25;text-decoration:none;border:1px solid transparent;
+  position:relative}
+.nav-link:hover{background:#111a25;color:var(--fg)}
+.nav-link.active{color:#fff;background:linear-gradient(90deg,rgba(31,111,235,.2),rgba(31,111,235,.05));
+  border-color:rgba(92,200,255,.22)}
+.nav-link.active::before{content:"";position:absolute;left:-10px;top:7px;bottom:7px;width:2px;
+  border-radius:2px;background:var(--accent)}
+.nav-idx{font-family:var(--code);font-size:9.5px;color:var(--faint);width:15px;flex:0 0 auto}
+.nav-link.active .nav-idx{color:var(--accent)}
+.nav-foot{margin-top:auto;border-top:1px solid var(--line);padding:11px 10px 0;display:flex;
+  justify-content:space-between;gap:8px;font-size:10.5px;color:var(--faint)}
+.nav-backdrop{position:fixed;inset:var(--header-h) 0 0;background:rgba(2,6,10,.7);
+  backdrop-filter:blur(2px);z-index:34}
+.wrap{max-width:none;margin:0;padding:26px 30px 64px;min-width:0}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:26px;
+  padding-bottom:20px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+.eyebrow{font-size:10px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);
+  margin-bottom:6px}
+.page-head h1{font-size:29px;line-height:1.15;letter-spacing:-.02em;margin:0 0 7px;color:#f0f5fb}
+.page-head p{color:var(--dim);font-size:12.5px;margin:0;max-width:620px}
+.page-facts{display:flex;gap:22px;margin:0;flex-wrap:wrap}
+.page-facts dt{font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);margin-bottom:3px}
+.page-facts dd{margin:0;font-size:11.5px;color:var(--fg);max-width:240px;overflow-wrap:anywhere}
+.banner-stack{display:flex;flex-direction:column;gap:8px;margin-bottom:4px}
+.banner,#emergency,#notraffic,#apiproblem{margin-top:0;padding:11px 14px;border-radius:10px}
+#role-banner{background:rgba(88,166,255,.08);border:1px solid rgba(88,166,255,.32);color:#9ecbff}
+#role-banner b{color:#cfe5ff}
+#notraffic{line-height:1.5}
+#notraffic span{font-size:12px;line-height:1.55}
+
+.panel-section{margin:0 0 30px;scroll-margin-top:calc(var(--header-h) + 16px)}
+.panel-section > h2{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;font-size:15px;
+  letter-spacing:-.01em;text-transform:none;color:#eaf1f9;font-weight:600;margin:0 0 12px;
+  padding-bottom:9px;border-bottom:1px solid var(--line);scroll-margin-top:calc(var(--header-h) + 16px)}
+.panel-section > h2::before{content:"";width:3px;height:14px;border-radius:2px;background:var(--accent);
+  align-self:center;flex:0 0 auto}
+.panel-section > h2 .sub{font-size:11.5px;letter-spacing:0;text-transform:none;color:var(--faint);
+  font-weight:400;margin-left:0;line-height:1.5}
+.panel-section > h2 .sub b{color:var(--dim);font-weight:600}
+
+.kpis{grid-template-columns:repeat(auto-fit,minmax(138px,1fr));gap:10px}
+.kpi{padding:13px 14px;border-radius:var(--radius);background:linear-gradient(180deg,#121a25,#0f151e);
+  border-color:var(--line);box-shadow:inset 0 1px 0 rgba(255,255,255,.025);transition:border-color .15s}
+.kpi:hover{border-color:#2b3b51}
+.kpi .k{font-size:10px;letter-spacing:.09em;color:var(--faint)}
+.kpi .v{font-size:23px;letter-spacing:-.02em;margin-top:4px}
+.kpi .t{height:auto;min-height:14px;margin-top:2px}
+
+.tpanel,.chart,table,details.cfg,#events{background:linear-gradient(180deg,#111823,#0f151e);
+  border-color:var(--line);border-radius:var(--radius);box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}
+.tpanel{padding:13px 14px}
+.tpanel .tptitle{font-size:12px;margin-bottom:9px}
+.tgrid{grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:12px}
+.grid{grid-template-columns:repeat(auto-fit,minmax(min(400px,100%),1fr));gap:12px}
+.signals{grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:8px}
+.sig{padding:9px 11px;border-radius:8px;background:rgba(11,17,25,.7)}
+.chart{padding:12px 13px 8px}
+.chart canvas{height:180px}
+.nodata{height:180px}
+.barlist .lab{font-family:var(--code);white-space:normal;overflow-wrap:anywhere;text-overflow:clip}
+.barlist .br{grid-template-columns:minmax(0,1fr) auto}
+.stats .sr{gap:16px;padding:4px 0}
+.stats .sr .k{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;
+  flex:1 1 auto;min-width:0}
+.stats .sr .v{white-space:normal;overflow-wrap:anywhere;text-align:right;max-width:62%}
+table{font-size:11.5px}
+th{padding:8px 10px;background:rgba(9,14,21,.7)}
+td{padding:7px 10px}
+td.ip{white-space:normal;overflow-wrap:anywhere;word-break:break-word;max-width:280px;min-width:190px}
+#cl-table td:first-child,#acl-table td:nth-child(2){white-space:normal;overflow-wrap:anywhere;
+  word-break:break-word;max-width:300px;min-width:230px}
+.ev{grid-template-columns:74px 70px minmax(0,1fr);padding:8px 13px;row-gap:2px}
+.ev .m{overflow-wrap:anywhere}
+#events{overflow:hidden}
+footer{margin-top:40px;padding-top:14px;font-size:10.5px;gap:14px 22px}
+details.cfg summary{padding:11px 14px}
+.cfgbody{padding:14px}
+.umg-form{grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr))}
+button.primary,.btn-primary{background:#1f6feb;border:1px solid #1f6feb;color:#fff;border-radius:8px;
+  padding:7px 14px;font:600 12px var(--sans);cursor:pointer}
+button.primary:hover,.btn-primary:hover{background:#2f81f7;border-color:#2f81f7}
+button.ghost{background:transparent;border-color:var(--line2);border-radius:8px;padding:7px 12px;
+  font:600 12px var(--sans);color:var(--fg);cursor:pointer}
+button.ghost:hover{border-color:#405574}
+input,select,textarea{transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:#3c78c8!important;
+  box-shadow:0 0 0 3px rgba(31,111,235,.16)}
+[data-readonly="true"] button:not(.readonly-ok), [data-readonly="true"] input:not(.readonly-ok),
+[data-readonly="true"] select:not(.readonly-ok), [data-readonly="true"] textarea:not(.readonly-ok){
+  opacity:.42;cursor:not-allowed}
+body[data-role="viewer"] .admin-only{opacity:.5}
+body[data-role="viewer"] #umg-table .uact button,
+body[data-role="viewer"] #acl-table button[data-act]{
+  opacity:.35;pointer-events:none;filter:grayscale(.4)}
+#viewer-hint{display:none;margin:0 0 10px;padding:9px 12px;border-radius:8px;
+  background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);color:#e3b341;font-size:12px}
+body[data-role="viewer"] #viewer-hint{display:block}
+
+#js-errors{padding:0;margin:0}
+
+#login-ov{background:
+  radial-gradient(800px 500px at 50% -10%, rgba(31,111,235,.2), transparent 70%),
+  rgba(3,7,11,.88);backdrop-filter:blur(9px)}
+#login-box{width:min(408px,calc(100vw - 28px));padding:26px 26px 20px;border-radius:16px;
+  border-color:#2b3b51;box-shadow:0 28px 80px rgba(0,0,0,.65);position:relative}
+.login-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.login-logo{width:42px;height:42px;flex:0 0 auto;border-radius:11px;display:flex;align-items:center;
+  justify-content:center;background:linear-gradient(145deg,#1f6feb,#0b3b8c);color:#fff;
+  font-size:15px;font-weight:700;box-shadow:inset 0 1px 0 #ffffff30,0 8px 20px rgba(31,111,235,.25)}
+#login-box h3{font-size:16px;margin:0;line-height:1.3;color:#f0f5fb}
+#login-box .sub{margin:3px 0 0;font-size:11.5px;color:var(--dim);line-height:1.45}
+#login-box label{margin:12px 0 5px;font-size:10px;letter-spacing:.08em;color:var(--faint)}
+#login-box input{padding:10px 11px;border-radius:8px;font-size:13px;background:#0a1017}
+.password-field{position:relative;display:flex}
+.password-field input{padding-right:58px}
+#login-box .reveal{position:absolute;right:6px;top:50%;transform:translateY(-50%);
+  background:transparent!important;border:0!important;color:var(--dim)!important;
+  font:600 10.5px var(--sans);padding:5px 8px!important;border-radius:6px;cursor:pointer}
+#login-box .reveal:hover{color:var(--fg)!important;background:#1b2634!important}
+.login-submit{width:100%;margin-top:16px;border:1px solid #1f6feb!important;border-radius:8px!important;
+  padding:10px 16px!important;font-size:13px!important;font-weight:600!important;background:#1f6feb!important;
+  color:#fff!important;cursor:pointer}
+.login-submit:hover{background:#2f81f7!important}
+.login-submit:disabled{opacity:.6;cursor:progress}
+.login-retry{width:100%;margin-top:8px;background:transparent!important;border:1px solid var(--line2)!important;
+  color:var(--fg)!important;border-radius:8px!important;padding:8px 12px!important;font-weight:600!important;
+  cursor:pointer}
+#login-msg{margin:10px 0 0;padding:0;font-size:11.5px;min-height:0;line-height:1.45}
+#login-msg:not(:empty){padding:8px 10px;border-radius:7px;background:rgba(248,81,73,.09);
+  border:1px solid rgba(248,81,73,.32)}
+#login-msg.ok{color:#7ee787;background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.3)}
+.login-foot{margin-top:18px;padding-top:13px;border-top:1px solid var(--line);display:flex;
+  justify-content:space-between;gap:12px;font-size:10px;color:var(--faint);line-height:1.45}
+.login-foot .mono{color:var(--faint);white-space:nowrap}
+body.modal-open{overflow:hidden}
+
+@media (max-width:1180px){
+  .app-shell{grid-template-columns:214px minmax(0,1fr)}
+  .wrap{padding:22px 22px 56px}
+  .page-head h1{font-size:26px}
+}
+@media (max-width:980px){
+  .app-shell{grid-template-columns:minmax(0,1fr)}
+  .sidenav{position:fixed;left:0;top:var(--header-h);bottom:0;height:auto;width:270px;
+    transform:translateX(-102%);transition:transform .2s ease;background:#0a1017;z-index:36;
+    box-shadow:18px 0 50px rgba(0,0,0,.45)}
+  .sidenav.open{transform:translateX(0)}
+  .nav-toggle{display:block}
+  .wrap{padding:20px 18px 52px}
+  .hbar-primary{height:56px;padding:0 14px}
+  .hbar-secondary{padding:0 14px;height:42px}
+  .live-meta .updated{max-width:120px}
+  .page-head{align-items:flex-start;flex-direction:column;gap:16px}
+  .page-facts{gap:16px 26px}
+  .brand-sub{font-size:12px}
+}
+@media (max-width:720px){
+  .hbar-primary{height:56px}
+  .hbar-secondary{height:auto;min-height:44px;flex-wrap:wrap;align-items:center;
+    padding:6px 14px;row-gap:6px;overflow:visible}
+  .hbar-secondary .hspace,.hbar-secondary .toolbar-sep{display:none}
+  .live-meta{display:none}
+  .user-area .auth-chip{display:none}
+  .uptime{font-size:11px}
+  .page-head h1{font-size:23px}
+  .page-head p{font-size:12px}
+  .page-facts{width:100%;display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .page-facts dd{font-size:11px}
+  .wrap{padding:16px 13px 44px}
+  .panel-section{margin-bottom:24px}
+  .panel-section > h2{font-size:14px;gap:7px}
+  .panel-section > h2 .sub{font-size:11px;display:block;flex-basis:100%}
+  .kpis{grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}
+  .kpi .v{font-size:20px}
+  .tgrid,.grid{grid-template-columns:minmax(0,1fr)}
+  .signals{grid-template-columns:minmax(0,1fr)}
+  .ev{grid-template-columns:60px minmax(0,1fr);gap:3px 9px}
+  .ev .k{grid-column:2}
+  .ev .m{grid-column:1/-1}
+  .chart canvas,.nodata{height:160px}
+  .stats .sr{flex-direction:column;gap:1px}
+  .stats .sr .v{max-width:none;text-align:left}
+  footer{flex-direction:column;gap:5px}
+  .umg-form{padding:10px}
+  .cfgbody textarea{height:240px}
+}
+@media (max-width:420px){
+  .brand-sub{display:none}
+  .brand-mark{width:32px;height:32px}
+  .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  #login-box{padding:22px 18px 16px}
+  .login-foot{flex-direction:column;gap:4px}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;
+    transition-duration:.001ms!important}
+}
 </style>
 <script>
 /* Headless-CI error probe: any uncaught error/rejection is mirrored into the
@@ -296,67 +568,126 @@ window.addEventListener('unhandledrejection', function(e){
 </script>
 </head>
 <body>
+<a class="skip-link" href="#content">Skip to content</a>
 <div id="js-errors"></div>
 
-<!-- Login overlay: shown when the gateway requires password auth and no
-     live session exists. Session cookie is HttpOnly; nothing is stored in
-     localStorage. -->
-<div id="login-ov" role="dialog" aria-modal="true" aria-labelledby="login-title">
+<!-- Login dialog: session cookies are HttpOnly; no secret is persisted by
+     the dashboard. The control-plane API remains the authority for every
+     authorization decision. -->
+<div id="login-ov" role="dialog" aria-modal="true" aria-labelledby="login-title"
+     aria-describedby="login-subtitle login-msg">
   <div id="login-box">
-    <h3 id="login-title">Sign in to res</h3>
-    <div class="sub">The gateway requires a password. Use the admin or viewer
-      account configured via <span class="mono">RES_ADMIN_PASSWORD</span> /
-      <span class="mono">RES_VIEWER_PASSWORD</span>.</div>
-    <label for="login-user">Username</label>
-    <input id="login-user" autocomplete="username" value="admin">
-    <label for="login-pass">Password</label>
-    <input id="login-pass" type="password" autocomplete="current-password">
-    <div class="row">
-      <button id="login-go">Sign in</button>
-      <button class="ghost" id="login-cancel">Read-only status</button>
+    <div class="login-head">
+      <div class="login-logo" aria-hidden="true">res</div>
+      <div>
+        <h3 id="login-title">Sign in to the control plane</h3>
+        <p class="sub" id="login-subtitle">Use the admin or viewer account configured for this gateway.</p>
+      </div>
     </div>
-    <div id="login-msg"></div>
+    <form id="login-form" novalidate>
+      <label for="login-user">Username</label>
+      <input id="login-user" name="username" autocomplete="username"
+             autocapitalize="none" spellcheck="false" value="admin" required>
+      <label for="login-pass">Password</label>
+      <div class="password-field">
+        <input id="login-pass" name="password" type="password"
+               autocomplete="current-password" required>
+        <button type="button" id="login-reveal" aria-label="Show password"
+                aria-pressed="false" class="reveal">Show</button>
+      </div>
+      <div id="login-msg" role="alert" aria-live="polite"></div>
+      <button id="login-go" class="login-submit" type="submit">Sign in</button>
+      <button id="login-retry" class="login-retry" type="button" hidden>Retry connection</button>
+    </form>
+    <div class="login-foot">
+      <span>Protected by a server-side session; the cookie is HttpOnly and SameSite=Strict.</span>
+      <span class="mono">res v<span id="login-version">0.1.0</span></span>
+    </div>
   </div>
 </div>
 
-<header>
-  <div class="hbar">
-    <span class="brand">res<span class="v" id="version">…</span></span>
-    <span class="pill ok" id="verdict"><span class="dot"></span><span id="verdict-text">…</span></span>
-    <span class="ctl" id="uptime-wrap" style="font-family:var(--mono);font-size:11px">up <span id="uptime">—</span></span>
-    <span class="hspace"></span>
-    <span class="ctl">
-      <label>range
-        <select id="range-sel">
-          <option value="5m" selected>5 min</option>
-          <option value="15m">15 min</option>
-          <option value="1h">1 hour</option>
-          <option value="6h">6 hours</option>
-          <option value="24h">24 hours</option>
-          <option value="7d">7 days</option>
-        </select>
-      </label>
-      <label>source
-        <select id="source-sel">
-          <option value="native" selected>native</option>
-          <option value="auto">auto</option>
-          <option value="prometheus">prometheus</option>
-        </select>
-      </label>
-      <label title="Auto-refresh the live section and history"><input type="checkbox" id="auto-chk" checked> auto</label>
-      <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
-      <span class="chip" id="auth-chip" title="Session status">…</span>
-      <span id="updated">connecting…</span>
+<header id="top">
+  <div class="hbar hbar-primary">
+    <button id="nav-toggle" class="nav-toggle" type="button"
+            aria-label="Open navigation" aria-expanded="false" aria-controls="sidenav">
+      <span></span><span></span><span></span>
+    </button>
+    <a class="brand" href="#top" aria-label="res dashboard home">
+      <span class="brand-mark">res</span>
+      <span class="brand-sub">DNS gateway <span class="v" id="version">v…</span></span>
+    </a>
+    <span class="pill ok" id="verdict" role="status" aria-live="polite">
+      <span class="dot"></span><span id="verdict-text">…</span>
     </span>
+    <span class="hspace"></span>
+    <div class="live-meta">
+      <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
+      <span id="updated" class="updated">connecting…</span>
+    </div>
+    <div class="user-area">
+      <span class="chip auth-chip" id="auth-chip" title="Session status">…</span>
+      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button" hidden>Sign out</button>
+    </div>
+  </div>
+  <div class="hbar hbar-secondary">
+    <span class="ctl uptime" id="uptime-wrap">Uptime <b id="uptime">—</b></span>
+    <span class="toolbar-sep" aria-hidden="true"></span>
+    <label class="ctl">Range
+      <select id="range-sel">
+        <option value="5m" selected>5 min</option>
+        <option value="15m">15 min</option>
+        <option value="1h">1 hour</option>
+        <option value="6h">6 hours</option>
+        <option value="24h">24 hours</option>
+        <option value="7d">7 days</option>
+      </select>
+    </label>
+    <label class="ctl">Source
+      <select id="source-sel">
+        <option value="native" selected>native</option>
+        <option value="auto">auto</option>
+        <option value="prometheus">prometheus</option>
+      </select>
+    </label>
+    <label class="check" title="Auto-refresh live status and history">
+      <input type="checkbox" id="auto-chk" checked> <span>Auto-refresh</span>
+    </label>
+    <span class="hspace"></span>
+    <button id="refresh-btn" class="btn btn-ghost btn-sm" type="button">Refresh now</button>
   </div>
 </header>
 
-<div class="wrap">
-  <div id="emergency">NO_HEALTHY_UPSTREAM — every upstream is down, clients are receiving SERVFAIL. Check the upstream table and the timeline below.</div>
-  <div id="notraffic">No DNS queries received yet
-    <span>Traffic-derived metrics are not measurements yet: QPS is 0, packet/byte/query-type counters are 0, failover/timeout/rate-limit/ACL counters are 0, and latency, success rate, percentiles, cache hit ratio, per-client rates and average payload sizes show <b>N/A</b> instead of default values. The top-client table, the upstream-state lists and the failover list are empty, and charts show “No data” until the first request arrives.</span>
+<div class="app-shell">
+  <aside class="sidenav" id="sidenav" aria-label="Panel sections">
+    <nav class="nav-scroll" id="sidenav-links"></nav>
+    <div class="nav-foot">
+      <span>res gateway</span>
+      <span class="mono" id="nav-mode">—</span>
+    </div>
+  </aside>
+  <div class="nav-backdrop" id="nav-backdrop" hidden></div>
+
+<main class="wrap" id="content">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Control plane</div>
+      <h1>Service overview</h1>
+      <p>Live health, traffic and configuration for this DNS gateway. All values are read from the running process; no sample data is shown.</p>
+    </div>
+    <dl class="page-facts">
+      <div><dt>Version</dt><dd id="page-version">—</dd></div>
+      <div><dt>API bind</dt><dd class="mono ip" id="page-api">—</dd></div>
+      <div><dt>Session</dt><dd id="page-auth">—</dd></div>
+    </dl>
   </div>
-  <div id="apiproblem">Control-plane API unreachable — charts and live data are stale.</div>
+  <div class="banner-stack">
+    <div id="role-banner" class="banner info" hidden></div>
+    <div id="emergency" class="banner crit" hidden>NO_HEALTHY_UPSTREAM — every upstream is down, clients are receiving SERVFAIL. Check the upstream table and the timeline below.</div>
+    <div id="notraffic" class="banner info" hidden>No DNS queries received yet
+      <span>Traffic-derived metrics are not measurements yet: QPS is 0, packet/byte/query-type counters are 0, failover/timeout/rate-limit/ACL counters are 0, and latency, success rate, percentiles, cache hit ratio, per-client rates and average payload sizes show <b>N/A</b> instead of default values. The top-client table, the upstream-state lists and the failover list are empty, and charts show “No data” until the first request arrives.</span>
+    </div>
+    <div id="apiproblem" class="banner warn" hidden>Control-plane API unreachable — charts and live data are stale.</div>
+  </div>
 
   <!-- ============ DNS SERVICE (primary) ============ -->
   <h2>DNS service <span class="sub">live query-path counters · refreshed every 2s from /api/status and /api/stats</span></h2>
@@ -534,7 +865,7 @@ window.addEventListener('unhandledrejection', function(e){
         <input type="password" id="umg-token" placeholder="Bearer token (only if server.api_token is set)" autocomplete="off">
         <button class="ghost" id="umg-token-save">Save</button>
       </div>
-      <div class="tpsub" style="padding:0 12px 10px">Stored in this browser (localStorage), sent as <span class="mono">Authorization: Bearer …</span> on every change. <span id="umg-auth" class="mono"></span></div>
+      <div class="tpsub" style="padding:0 12px 10px">Stored in this tab (sessionStorage; cleared on sign-out), sent as <span class="mono">Authorization: Bearer …</span> on every change. <span id="umg-auth" class="mono"></span></div>
     </div>
     <div class="tpanel">
       <div class="tptitle">Active configuration</div>
@@ -756,6 +1087,7 @@ window.addEventListener('unhandledrejection', function(e){
     <span>events: <span class="mono" id="foot-ev">—</span></span>
     <span id="foot-ready">render: —</span>
   </footer>
+</main>
 </div>
 
 <div id="tip"></div>
@@ -786,8 +1118,174 @@ const state = {
   filter: "all",
   apiFails: 0, lastOk: 0,
   upColors: {},
-  histTimer: null, curTimer: null, monTimer: null,
+  histTimer: null, curTimer: null, monTimer: null, cfgTimer: null, sessionTimer: null,
+  timersStarted: false,
 };
+
+/* =========================================================================
+ * Layout: section wrappers, navigation, responsive shell
+ * ====================================================================== */
+const SECTION_IDS = {
+  "DNS service": "dns-service",
+  "Service statistics": "service-statistics",
+  "Top clients": "top-clients",
+  "Traffic": "traffic",
+  "Assessment": "assessment",
+  "Process & capacity": "process-capacity",
+  "DNS service history": "dns-service-history",
+  "Upstream history": "upstream-history",
+  "Process history": "process-history",
+  "Current upstream state": "current-upstream-state",
+  "Failover monitoring": "failover-monitoring",
+  "Upstreams": "upstreams",
+  "Upstream DNS management": "upstream-dns-management",
+  "Client ACL": "client-acl",
+  "Cache": "cache",
+  "Health checks & selection": "health-checks-selection",
+  "Incident timeline": "incident-timeline",
+  "Configuration": "configuration",
+};
+const NAV_GROUPS = [
+  ["Overview", [["dns-service","DNS service"],["assessment","Assessment"]]],
+  ["Traffic", [["service-statistics","Service statistics"],["top-clients","Top clients"],["traffic","Traffic"]]],
+  ["Resolver", [["current-upstream-state","Current upstream state"],["failover-monitoring","Failover monitoring"],["upstreams","Upstreams"],["upstream-dns-management","Upstream DNS management"]]],
+  ["Protection", [["client-acl","Client ACL"],["cache","Cache"],["health-checks-selection","Health checks & selection"]]],
+  ["Observability", [["dns-service-history","DNS service history"],["upstream-history","Upstream history"],["incident-timeline","Incident timeline"]]],
+  ["System", [["process-capacity","Process & capacity"],["process-history","Process history"],["configuration","Configuration"]]],
+];
+
+function sectionTitle(h2){
+  const clone = h2.cloneNode(true);
+  for (const sub of clone.querySelectorAll(".sub")) sub.remove();
+  return clone.textContent.trim();
+}
+function buildSections(){
+  const main = $("content");
+  const headings = Array.from(main.children).filter(el => el.tagName === "H2");
+  let index = 0;
+  for (const h2 of headings){
+    const title = sectionTitle(h2);
+    const sec = document.createElement("section");
+    sec.className = "panel-section";
+    sec.id = SECTION_IDS[title] || ("section-" + (++index));
+    h2.parentNode.insertBefore(sec, h2);
+    sec.appendChild(h2);
+    let node = sec.nextSibling;
+    while (node){
+      if (node.nodeType === 1 && (node.tagName === "H2" || node.tagName === "FOOTER")) break;
+      const next = node.nextSibling;
+      sec.appendChild(node);
+      node = next;
+    }
+  }
+}
+function buildNav(){
+  const links = $("sidenav-links");
+  let n = 0;
+  for (const [group, items] of NAV_GROUPS){
+    const wrap = document.createElement("div");
+    wrap.className = "nav-group";
+    const title = document.createElement("div");
+    title.className = "nav-group-title";
+    title.textContent = group;
+    wrap.appendChild(title);
+    for (const [id, label] of items){
+      const a = document.createElement("a");
+      a.className = "nav-link";
+      a.href = "#" + id;
+      a.dataset.section = id;
+      const idx = document.createElement("span");
+      idx.className = "nav-idx";
+      idx.textContent = String(++n).padStart(2, "0");
+      const text = document.createElement("span");
+      text.textContent = label;
+      a.appendChild(idx); a.appendChild(text);
+      wrap.appendChild(a);
+    }
+    links.appendChild(wrap);
+  }
+}
+function navSections(){
+  return Array.from(document.querySelectorAll("#content .panel-section"));
+}
+function setActiveSection(id){
+  for (const a of document.querySelectorAll("#sidenav-links .nav-link")){
+    const on = a.dataset.section === id;
+    a.classList.toggle("active", on);
+    if (on) a.setAttribute("aria-current", "location");
+    else a.removeAttribute("aria-current");
+  }
+}
+let navFrame = null;
+function updateActiveSection(){
+  navFrame = null;
+  const sections = navSections();
+  if (!sections.length) return;
+  const y = window.scrollY + 128;
+  let current = sections[0];
+  for (const sec of sections){
+    if (sec.getBoundingClientRect().top + window.scrollY <= y) current = sec;
+    else break;
+  }
+  setActiveSection(current.id);
+}
+function syncHeaderHeight(){
+  const h = $("top").offsetHeight;
+  if (h) document.documentElement.style.setProperty("--header-h", h + "px");
+}
+function wireNavigation(){
+  syncHeaderHeight();
+  if (window.ResizeObserver) new ResizeObserver(() => syncHeaderHeight()).observe($("top"));
+  updateActiveSection();
+  window.addEventListener("scroll", () => {
+    if (navFrame == null) navFrame = requestAnimationFrame(updateActiveSection);
+  }, {passive:true});
+  window.addEventListener("hashchange", () => {
+    const id = location.hash.replace(/^#/, "");
+    if (id && document.getElementById(id)) setActiveSection(id);
+  });
+  for (const a of document.querySelectorAll("#sidenav-links .nav-link")){
+    a.addEventListener("click", () => {
+      setActiveSection(a.dataset.section);
+      closeSidebar();
+    });
+  }
+  const toggle = $("nav-toggle");
+  toggle.addEventListener("click", () => {
+    if ($("sidenav").classList.contains("open")) closeSidebar();
+    else openSidebar();
+  });
+  $("nav-backdrop").addEventListener("click", closeSidebar);
+  window.addEventListener("resize", () => {
+    if (window.innerWidth > 980) closeSidebar();
+    syncHeaderHeight();
+  });
+  window.addEventListener("keydown", e => {
+    if (e.key === "Escape" && $("sidenav").classList.contains("open")) closeSidebar();
+  });
+  if (location.hash){
+    const el = document.getElementById(location.hash.replace(/^#/, ""));
+    if (el) setTimeout(() => el.scrollIntoView(), 0);
+  }
+}
+function openSidebar(){
+  $("sidenav").classList.add("open");
+  $("nav-toggle").setAttribute("aria-expanded","true");
+  $("nav-toggle").setAttribute("aria-label","Close navigation");
+  $("nav-backdrop").hidden = false;
+}
+function closeSidebar(){
+  $("sidenav").classList.remove("open");
+  $("nav-toggle").setAttribute("aria-expanded","false");
+  $("nav-toggle").setAttribute("aria-label","Open navigation");
+  $("nav-backdrop").hidden = true;
+}
+function setBanner(id, on){
+  const el = $(id);
+  if (!el) return;
+  el.hidden = !on;
+  el.style.display = on ? "block" : "none";
+}
 
 /* Series metadata: label, unit, color for every canonical series key. */
 const META = {
@@ -870,88 +1368,272 @@ async function getJSON(path, timeoutMs=6000) {
 }
 
 /* ---------- session / login ---------- */
-const AUTH = { needed: false, role: null, user: null, dismissReadonly: false };
-function authNeeded(){
-  AUTH.needed = true;
-  if (!AUTH.dismissReadonly) $("login-ov").classList.add("on");
+const AUTH = { needed: false, open: false, role: null, user: null };
+let loginReturnFocus = null;
+
+function canWrite(){ return !AUTH.needed && (AUTH.open || AUTH.role === "admin"); }
+function isViewer(){ return AUTH.role === "viewer"; }
+function setAppInert(on){
+  for (const el of [$("top"), document.querySelector(".app-shell")]){
+    if (!el) continue;
+    if (on){
+      el.setAttribute("inert","");
+      el.setAttribute("aria-hidden","true");
+    } else {
+      el.removeAttribute("inert");
+      el.removeAttribute("aria-hidden");
+    }
+  }
 }
-async function checkSession(){
+function loginMessage(text, cls){
+  const msg = $("login-msg");
+  msg.textContent = text || "";
+  msg.className = cls || "";
+}
+function setLoginBusy(on){
+  const b = $("login-go");
+  b.disabled = on;
+  b.setAttribute("aria-busy", on ? "true" : "false");
+  b.textContent = on ? "Signing in…" : "Sign in";
+}
+function showLogin(){
+  const ov = $("login-ov");
+  const wasOpen = ov.classList.contains("on");
+  if (!wasOpen){
+    loginReturnFocus = document.activeElement;
+    ov.classList.add("on");
+    document.body.classList.add("modal-open");
+  }
+  setAppInert(true);
+  $("login-retry").hidden = true;
+  if (!wasOpen){
+    const target = $("login-user").value.trim() ? $("login-pass") : $("login-user");
+    setTimeout(() => { try { target.focus(); } catch(_){} }, 0);
+  }
+}
+function hideLogin(){
+  $("login-ov").classList.remove("on");
+  document.body.classList.remove("modal-open");
+  setAppInert(false);
+  setLoginBusy(false);
+  $("login-retry").hidden = true;
+  if (loginReturnFocus && typeof loginReturnFocus.focus === "function"){
+    try { loginReturnFocus.focus(); } catch(_){}
+  }
+  loginReturnFocus = null;
+}
+function authNeeded(){
+  AUTH.needed = true; AUTH.role = null; AUTH.user = null; AUTH.open = false;
+  umgSetToken("");
+  const t = $("umg-token"); if (t) t.value = "";
+  stopLiveTimers();
+  renderAuthChip();
+  showLogin();
+}
+async function checkSession(silent){
   try {
     const r = await fetch("/api/auth/session", {cache:"no-store", credentials:"same-origin"});
     if (r.ok){
       const j = await r.json().catch(() => ({}));
-      AUTH.needed = false; AUTH.role = j.role || null; AUTH.user = j.username || null;
-      $("login-ov").classList.remove("on");
-      renderAuthChip();
+      AUTH.needed = false; AUTH.open = false;
+      AUTH.role = j.role || null; AUTH.user = j.username || null;
+      hideLogin(); renderAuthChip();
       return true;
     }
-    if (r.status === 401){ authNeeded(); renderAuthChip(); return false; }
-    // Route unavailable/disabled auth: assume open mode.
-    AUTH.needed = false; renderAuthChip(); return true;
-  } catch(_){ AUTH.needed = false; renderAuthChip(); return true; }
+    if (r.status === 401 || r.status === 404){
+      // When password auth is disabled the session route still answers 401,
+      // so distinguish open mode from a locked gateway via the public status
+      // probe. Never assume open mode from an auth failure alone.
+      const s = await fetch("/api/status", {cache:"no-store", credentials:"same-origin"});
+      if (s.ok){
+        AUTH.needed = false; AUTH.open = true; AUTH.role = "admin"; AUTH.user = null;
+        hideLogin(); renderAuthChip();
+        return true;
+      }
+      if (s.status === 401 || s.status === 403){
+        AUTH.needed = true; AUTH.open = false; AUTH.role = null; AUTH.user = null;
+        renderAuthChip(); showLogin();
+        return false;
+      }
+      throw new Error("status probe HTTP " + s.status);
+    }
+    throw new Error("session HTTP " + r.status);
+  } catch(e){
+    if (silent) return true;
+    AUTH.needed = true; AUTH.open = false; AUTH.role = null; AUTH.user = null;
+    stopLiveTimers();
+    renderAuthChip(); showLogin();
+    loginMessage("Control-plane API unreachable: " + e.message, "");
+    $("login-retry").hidden = false;
+    return false;
+  }
 }
 async function doLogin(){
-  const msg = $("login-msg");
-  msg.textContent = "signing in…"; msg.className = "ok";
+  const user = $("login-user").value.trim();
+  const pass = $("login-pass").value;
+  if (!user || !pass){
+    loginMessage("Enter both a username and a password.", "");
+    (user ? $("login-pass") : $("login-user")).focus();
+    return;
+  }
+  loginMessage("", "");
+  setLoginBusy(true);
   try {
     const r = await fetch("/api/auth/login", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
       credentials: "same-origin",
-      body: JSON.stringify({
-        username: $("login-user").value.trim(),
-        password: $("login-pass").value,
-      }),
+      body: JSON.stringify({username: user, password: pass}),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok){
-      msg.className = "";
-      msg.textContent = j.error || ("login failed (HTTP " + r.status + ")");
-      if (r.status === 429 && j.error) msg.textContent = j.error;
+      if (r.status === 401) loginMessage("Incorrect username or password.", "");
+      else if (r.status === 429) loginMessage(j.error || "Too many attempts — wait before trying again.", "");
+      else loginMessage(j.error || ("Login failed (HTTP " + r.status + ")."), "");
+      $("login-pass").value = "";
+      $("login-pass").focus();
       return;
     }
-    AUTH.needed = false; AUTH.dismissReadonly = false;
+    AUTH.needed = false; AUTH.open = false;
     AUTH.role = j.role || null; AUTH.user = j.username || null;
     $("login-pass").value = "";
-    $("login-ov").classList.remove("on");
+    loginMessage("", "");
+    hideLogin();
     renderAuthChip();
-    await Promise.all([fetchCurrent(), fetchMonitoring(), fetchHistory(), loadConfig()]);
-    await Promise.all([loadAcl(), loadCache()]);
-    setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
-    setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
-    setInterval(() => { if (state.auto && AUTH.role) { loadAcl(); loadCache(); } }, 15000);
-    scheduleHistory();
+    await startPortal();
   } catch(e){
-    msg.className = "";
-    msg.textContent = "login failed: " + e.message;
+    loginMessage("Login failed: " + e.message, "");
+    $("login-retry").hidden = false;
+  } finally {
+    setLoginBusy(false);
+  }
+}
+async function retryConnection(){
+  loginMessage("Reconnecting…", "ok");
+  $("login-retry").hidden = true;
+  const ok = await checkSession();
+  if (ok){
+    await startPortal();
   }
 }
 async function doLogout(){
+  stopLiveTimers();
   try {
     await fetch("/api/auth/session", {method:"DELETE", credentials:"same-origin", headers: csrfHeaders()});
   } catch(_){}
-  AUTH.needed = true; AUTH.role = null; AUTH.user = null;
+  umgSetToken("");
+  const t = $("umg-token"); if (t) t.value = "";
+  AUTH.needed = true; AUTH.open = false; AUTH.role = null; AUTH.user = null;
   renderAuthChip();
-  $("login-ov").classList.add("on");
+  if (document.activeElement) document.activeElement.blur();
+  showLogin();
+}
+function applyRoleGating(){
+  const viewer = isViewer();
+  document.body.dataset.role = AUTH.role || "";
+  const ids = [
+    "umg-name","umg-address","umg-port","umg-protocol","umg-priority","umg-weight",
+    "umg-timeout","umg-probe-interval","umg-probe-timeout","umg-expect-rcode",
+    "umg-enabled","umg-confirm","umg-probes","umg-submit",
+    "acl-cidr","acl-action","acl-enabled","acl-add",
+    "cache-enabled","cache-min","cache-max","cache-negmax","cache-maxent","cache-maxmem",
+    "cache-save","cache-clear",
+    "hlt-enabled","hlt-interval","hlt-timeout","hlt-fail","hlt-rec","hlt-minsucc",
+    "hlt-tcp","hlt-dwell","hlt-probes","hlt-save",
+    "sel-strategy","sel-latref","sel-tier","sel-lshare","sel-degraded","sel-minsamples","sel-save",
+    "cfg-apply",
+  ];
+  for (const id of ids){
+    const el = $(id);
+    if (!el) continue;
+    if (viewer){
+      if (!el.dataset.readonlyLocked){
+        el.dataset.readonlyLocked = "1";
+        el.dataset.readonlyOriginal = el.disabled ? "1" : "0";
+      }
+      el.disabled = true;
+    } else if (el.dataset.readonlyLocked){
+      if (el.dataset.readonlyOriginal !== "1") el.disabled = false;
+      delete el.dataset.readonlyLocked;
+      delete el.dataset.readonlyOriginal;
+    }
+  }
+  const cfg = $("cfg-text");
+  if (cfg){
+    if (viewer) cfg.setAttribute("readonly","");
+    else cfg.removeAttribute("readonly");
+  }
 }
 function renderAuthChip(){
   const el = $("auth-chip");
   if (!el) return;
-  if (AUTH.needed && !AUTH.role){
-    el.textContent = "not signed in";
-    el.title = "Click to sign in";
-    el.style.color = "#e3b341";
-    el.style.cursor = "pointer";
-  } else if (AUTH.role){
-    el.textContent = AUTH.user ? (AUTH.user + " · " + AUTH.role) : AUTH.role;
-    el.title = "Signed in — click to sign out";
-    el.style.color = "#7ee787";
-    el.style.cursor = "pointer";
-  } else {
+  if (AUTH.open){
     el.textContent = "no auth";
-    el.title = "";
+    el.title = "Authentication is disabled on this gateway";
     el.style.color = "var(--faint)";
     el.style.cursor = "";
+  } else if (AUTH.role){
+    el.textContent = AUTH.user && AUTH.user !== AUTH.role
+      ? AUTH.user + " · " + AUTH.role : AUTH.role;
+    el.title = "Signed in";
+    el.style.color = "#7ee787";
+    el.style.cursor = "";
+  } else {
+    el.textContent = "signed out";
+    el.title = "Sign in to the control plane";
+    el.style.color = "#e3b341";
+    el.style.cursor = "pointer";
+  }
+  $("logout-btn").hidden = !AUTH.role || AUTH.open;
+  $("nav-mode").textContent = AUTH.open ? "open mode" : (AUTH.role || "locked");
+  $("page-auth").textContent = AUTH.open ? "authentication disabled"
+    : AUTH.role ? (AUTH.role === "admin" ? "admin · full access" : "viewer · read-only") : "signed out";
+  const roleBanner = $("role-banner");
+  if (roleBanner){
+    roleBanner.hidden = !isViewer();
+    roleBanner.innerHTML = isViewer()
+      ? "<b>Viewer session.</b> Monitoring and diagnostics are available; configuration, cache, ACL and upstream mutations are disabled here and independently rejected by the API."
+      : "";
+  }
+  applyRoleGating();
+}
+
+function startLiveTimers(){
+  if (state.timersStarted) return;
+  state.timersStarted = true;
+  state.curTimer = setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
+  state.monTimer = setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
+  state.cfgTimer = setInterval(() => {
+    if (state.auto && AUTH.role){
+      loadAcl(); loadCache(); loadHealthSelection();
+    }
+  }, 15000);
+  state.sessionTimer = setInterval(() => { checkSession(true); }, 60000);
+  scheduleHistory();
+}
+function stopLiveTimers(){
+  for (const key of ["curTimer","monTimer","cfgTimer","sessionTimer","histTimer"]){
+    if (state[key]) clearInterval(state[key]);
+    state[key] = null;
+  }
+  state.timersStarted = false;
+}
+async function startPortal(){
+  await Promise.all([fetchCurrent(), fetchMonitoring()]);
+  await Promise.all([fetchHistory(), loadConfig()]);
+  await Promise.all([loadAcl(), loadCache(), loadHealthSelection()]);
+  startLiveTimers();
+}
+async function refreshAll(){
+  const btn = $("refresh-btn");
+  btn.disabled = true;
+  btn.textContent = "Refreshing…";
+  try {
+    await Promise.allSettled([fetchCurrent(), fetchMonitoring(), fetchHistory(),
+      loadConfig(), loadAcl(), loadCache(), loadHealthSelection()]);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Refresh now";
   }
 }
 /* Double-submit CSRF: read the csrf cookie (set alongside the session) and
@@ -1538,7 +2220,7 @@ function renderClientTable(){
   $("cl-rows").innerHTML = rows.map(r => {
     const failed = intOf(r.failed), timeouts = intOf(r.timeouts);
     return '<tr>'+
-      '<td class="mono">'+escapeHtml(String(r.client))+'</td>'+
+      '<td class="mono ip">'+escapeHtml(String(r.client))+'</td>'+
       '<td class="num">'+intOf(r.requests)+'</td>'+
       '<td class="num">'+(r.share==null?"N/A":(r.share*100).toFixed(1)+"%")+'</td>'+
       '<td class="num">'+fmtVal(r.rps,"qps")+'</td>'+
@@ -1657,12 +2339,15 @@ function renderVerdict(){
   pill.className = "pill " + level;
   txt.textContent = label;
 
-  $("emergency").style.display = emergency ? "block" : "none";
+  setBanner("emergency", emergency);
   // Explicit zero-traffic state: never let the tiles imply measurements that
   // do not exist yet.
-  $("notraffic").style.display = (idle && state.apiFails < 2) ? "block" : "none";
+  setBanner("notraffic", idle && state.apiFails < 2);
   $("uptime").textContent = fmtUptime(st.uptime_seconds);
   $("version").textContent = "v" + st.version;
+  $("login-version").textContent = st.version;
+  $("page-version").textContent = st.version;
+  if (st.listeners && st.listeners.api) $("page-api").textContent = st.listeners.api;
 }
 
 function renderSignals(){
@@ -1840,7 +2525,7 @@ function renderUpstreams(){
       '<td>'+stateChip(u)+'</td>'+
       '<td>'+use+'</td>'+
       '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d" style="background:'+color+'"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td class="num">'+fmtVal(u.qps,"qps")+'</td>'+
       '<td class="num">'+u.queries+'</td>'+
@@ -2080,7 +2765,7 @@ async function fetchCurrent(){
     } catch (_) { /* diagnostics optional for the strip */ }
 
     state.apiFails = 0; state.lastOk = Date.now();
-    $("apiproblem").style.display = "none";
+    setBanner("apiproblem", false);
     $("updated").textContent = "updated "+fmtClock(state.lastOk);
     renderVerdict(); renderKpis(); renderTraffic(); renderStatsBlocks();
     renderClientTable(); renderUpState(); renderFailovers();
@@ -2090,7 +2775,7 @@ async function fetchCurrent(){
   } catch (e) {
     state.apiFails++;
     $("updated").textContent = "API unreachable ("+state.apiFails+")";
-    if (state.apiFails >= 2){ $("apiproblem").style.display = "block"; renderVerdict(); }
+    if (state.apiFails >= 2){ setBanner("apiproblem", true); renderVerdict(); }
   }
 }
 
@@ -2126,6 +2811,7 @@ function maskTokenLine(toml){
 }
 async function applyConfig(){
   const msg = $("cfg-msg");
+  if (!canWrite()){ msg.textContent = "read-only session — configuration changes are disabled"; msg.className = "err"; return; }
   msg.textContent = "applying…"; msg.className = "";
   const toml = $("cfg-text").value;
   const doPut = async (confirmFlag) => {
@@ -2180,12 +2866,24 @@ async function applyConfig(){
  * Upstream DNS management (live add/edit/enable/disable/test/remove)
  * ====================================================================== */
 const umg = { editId: null, pendingConfirm: null };
-function umgToken(){ try { return localStorage.getItem("res-admin-token") || ""; } catch(_){ return ""; } }
+// Migrate away from the legacy persistent token: bearer secrets must not
+// survive tab close or be readable by a later viewer session.
+try { localStorage.removeItem("res-admin-token"); } catch(_){}
+function umgToken(){ try { return sessionStorage.getItem("res-admin-token") || ""; } catch(_){ return ""; } }
 function umgSetToken(t){
-  try { if (t) localStorage.setItem("res-admin-token", t); else localStorage.removeItem("res-admin-token"); } catch(_){}
+  try {
+    localStorage.removeItem("res-admin-token");
+    if (t) sessionStorage.setItem("res-admin-token", t);
+    else sessionStorage.removeItem("res-admin-token");
+  } catch(_){}
 }
 function umgMsg(text, cls){ const m = $("umg-msg"); m.textContent = text || ""; m.className = cls || ""; }
 async function umgApi(method, path, body){
+  if (method !== "GET" && !canWrite()){
+    const err = new Error("this session is read-only");
+    err.status = 403;
+    throw err;
+  }
   const h = csrfHeaders();
   if (body != null) h["Content-Type"] = "application/json";
   const tok = umgToken();
@@ -2249,7 +2947,7 @@ function renderUpstreamMgr(){
       : '<button class="danger" data-act="remove">Remove</button>';
     return '<tr data-id="'+u.id+'">'+
       '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td>'+(u.enabled?stateChip(u):'<span class="state disabled"><span class="d"></span>off</span>')+'</td>'+
       '<td class="num mono">'+lat+'</td>'+
@@ -2481,7 +3179,7 @@ function renderAcl(j){
   const rows = aclState.entries.map(e =>
     '<tr data-id="'+escapeHtml(e.id)+'">'+
       '<td class="mono" style="color:var(--faint)">'+escapeHtml(e.id)+'</td>'+
-      '<td class="mono">'+escapeHtml(e.cidr)+'</td>'+
+      '<td class="mono ip">'+escapeHtml(e.cidr)+'</td>'+
       '<td><span class="tag '+(e.action==="deny"?"bad":"ok")+'">'+escapeHtml(e.action)+'</span></td>'+
       '<td>'+(e.enabled?'<span class="tag ok">on</span>':'<span class="tag">off</span>')+'</td>'+
       '<td style="color:var(--faint)">'+(e.source?escapeHtml(e.source):"—")+'</td>'+
@@ -2798,37 +3496,48 @@ function wire(){
   $("sel-save").addEventListener("click", saveSelection);
   $("sel-reload").addEventListener("click", loadHealthSelection);
   // Login / session
-  $("login-go").addEventListener("click", doLogin);
-  $("login-pass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
-  $("login-user").addEventListener("keydown", e => { if (e.key === "Enter") $("login-pass").focus(); });
-  $("login-cancel").addEventListener("click", () => {
-    AUTH.dismissReadonly = true;
-    $("login-ov").classList.remove("on");
+  $("login-form").addEventListener("submit", e => { e.preventDefault(); doLogin(); });
+  $("login-user").addEventListener("keydown", e => {
+    if (e.key === "Enter"){ e.preventDefault(); $("login-pass").focus(); }
   });
+  $("login-reveal").addEventListener("click", () => {
+    const input = $("login-pass");
+    const show = input.type === "password";
+    input.type = show ? "text" : "password";
+    $("login-reveal").textContent = show ? "Hide" : "Show";
+    $("login-reveal").setAttribute("aria-pressed", show ? "true" : "false");
+    $("login-reveal").setAttribute("aria-label", show ? "Hide password" : "Show password");
+    input.focus();
+  });
+  $("login-retry").addEventListener("click", retryConnection);
+  $("login-ov").addEventListener("keydown", e => {
+    if (e.key !== "Tab") return;
+    const fields = Array.from($("login-ov").querySelectorAll(
+      'input:not([disabled]),button:not([disabled]):not([hidden]),a[href]'))
+      .filter(el => el.getClientRects().length > 0);
+    if (!fields.length) return;
+    const first = fields[0], last = fields[fields.length - 1];
+    if (e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+  });
+  $("logout-btn").addEventListener("click", doLogout);
   $("auth-chip").addEventListener("click", () => {
+    if (AUTH.open) return;
     if (AUTH.role) doLogout();
-    else { AUTH.dismissReadonly = false; $("login-ov").classList.add("on"); $("login-pass").focus(); }
+    else showLogin();
   });
+  $("refresh-btn").addEventListener("click", () => { if (!AUTH.needed) refreshAll(); });
   window.addEventListener("resize", () => drawAllCharts());
 }
 
 async function main(){
+  buildSections();
+  buildNav();
+  wireNavigation();
   wire();
   const authed = await checkSession();
-  if (authed || AUTH.dismissReadonly){
-    await Promise.all([fetchCurrent(), fetchMonitoring()]);
-    await fetchHistory();
-    await loadConfig();
-    await Promise.all([loadAcl(), loadCache(), loadHealthSelection()]);
-    setInterval(() => { if (state.auto) fetchCurrent(); }, 2000);
-    setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
-    // ACL/cache/health views refresh less often to keep browser load low.
-    setInterval(() => { if (state.auto && AUTH.role) { loadAcl(); loadCache(); loadHealthSelection(); } }, 15000);
-    scheduleHistory();
-  } else {
-    // Auth required and overlay is up: keep probing the session so a login
-    // from another tab (or an expired overlay dismissal) recovers cleanly.
-    setInterval(checkSession, 15000);
+  if (authed){
+    await startPortal();
   }
   // Canvas axis labels use Shabnam: re-paint once the webfont has loaded.
   if (document.fonts && document.fonts.ready){

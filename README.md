@@ -20,7 +20,9 @@ implemented.
   token-bucket rate limiting
 * Response cache, enabled by default: TTLs are never extended beyond what the
   upstream advertised (they also decrement on every hit), RFC 2308 negative
-  caching for NXDOMAIN/NODATA, bounded by entry count and TTL caps
+  caching for NXDOMAIN/NODATA, bounded by entry count and TTL caps. Queries
+  carrying any EDNS option (ECS, COOKIE, padding, ...) bypass the shared cache
+  and single-flight, because their upstream replies may be client-specific
 * Upstream pools with priority tiers (strict by default, optional shared
   traffic to keep lower tiers warm), weighted sharing, three selection
   strategies, active health checks with hysteresis, selectable
@@ -251,6 +253,20 @@ Deliberate scope decisions, so nothing here surprises an operator:
 * **No TLS in the binary** — plain HTTP/UDP/TCP; terminate HTTPS at a
   reverse proxy (see above) and set `secure_cookies`.
 * **ACL is application-layer only** — pair it with a host firewall.
+* **No DNSSEC validation** — `DO`/`CD` and DNSSEC records are passed through,
+  and `DO` queries bypass the shared cache because the gateway cannot assert
+  the authenticity of upstream data.
+* **No Response Rate Limiting (RRL)** — per-IP/global token buckets and the
+  fail-closed ACL are the only admission controls. A spoofed-source UDP flood
+  can bypass the per-IP bucket, and the gateway is not safe as an open
+  internet-facing resolver.
+* **Upstream transaction ids are randomized per exchange**, but query-name
+  case randomization (0x20) is not implemented; source-port entropy comes from
+  the OS. Do not expose UDP service to untrusted networks without an upstream
+  path you trust.
+* **Zone transfers are not blocked** — `AXFR`/`IXFR` queries follow the same
+  ACL/forwarding path. `ANY` follows `query.any_policy` (`forward` by default);
+  set it to `refuse` on amplification-sensitive deployments.
 * **`X-Forwarded-For` is not trusted** — API-side per-IP limits (login
   throttle) see the socket peer; rate-limit at the proxy for real client
   IPs. DNS is unaffected.

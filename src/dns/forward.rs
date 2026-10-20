@@ -1,8 +1,9 @@
-//! Upstream DNS exchange: raw query out, correlated response in.
+//! Upstream DNS exchange: query out, correlated response in.
 //!
-//! The gateway forwards the client's original bytes untouched (EDNS, DO bit,
-//! RD flag, etc. are preserved). Responses are validated by transaction id,
-//! message type and question section before being accepted.
+//! The gateway preserves the client's EDNS, DO bit, RD flag and question, but
+//! replaces the DNS transaction id with a fresh unpredictable id for every
+//! upstream exchange. Responses are validated by that id, message type and
+//! question section before being accepted.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -30,6 +31,7 @@ pub enum ExchangeError {
     Invalid(String),
 }
 
+#[derive(Debug)]
 pub struct ExchangeOk {
     pub response: Vec<u8>,
     pub view: ResponseView,
@@ -46,6 +48,21 @@ pub struct Forwarder {
 impl Forwarder {
     pub fn new(tcp_fallback: bool) -> Self {
         Self { tcp_fallback }
+    }
+
+    fn randomized_query(query: &ParsedQuery, raw: &[u8]) -> (ParsedQuery, Vec<u8>) {
+        let mut wire = raw.to_vec();
+        if wire.len() < 2 {
+            return (query.clone(), wire);
+        }
+        let mut id = rand::random::<u16>();
+        if id == query.id {
+            id = id.wrapping_add(1);
+        }
+        wire[0..2].copy_from_slice(&id.to_be_bytes());
+        let mut correlated = query.clone();
+        correlated.id = id;
+        (correlated, wire)
     }
 
     /// Exchange using the upstream's configured protocol.
@@ -88,6 +105,7 @@ impl Forwarder {
                 "query too large for plain UDP".into(),
             ));
         }
+        let (correlated, wire) = Self::randomized_query(query, raw);
         let target = SocketAddr::new(up.address, up.port);
         let bind: SocketAddr = if target.is_ipv4() {
             "0.0.0.0:0".parse().expect("v4 bind")
@@ -104,7 +122,7 @@ impl Forwarder {
         sock.connect(target)
             .await
             .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
-        sock.send(raw)
+        sock.send(&wire)
             .await
             .map_err(|e| ExchangeError::Network(format!("send: {e}")))?;
 
@@ -141,7 +159,7 @@ impl Forwarder {
                         // the query so the client retries over TCP now, rather
                         // than waiting out the deadline for a packet we will
                         // never be able to parse.
-                        let mut stub = msg::error_response(query, msg::Rcode::NoError);
+                        let mut stub = msg::error_response(&correlated, msg::Rcode::NoError);
                         if stub.len() >= 4 {
                             stub[2] |= 0x02; // TC: truncated, retry over TCP
                         }
@@ -158,7 +176,7 @@ impl Forwarder {
                     continue;
                 }
             };
-            if !msg::correlates(query, &view) {
+            if !msg::correlates(&correlated, &view) {
                 continue;
             }
 
@@ -193,6 +211,7 @@ impl Forwarder {
         if raw.len() > MAX_TCP_MESSAGE {
             return Err(ExchangeError::Invalid("query too large for TCP".into()));
         }
+        let (correlated, wire) = Self::randomized_query(query, raw);
         let target = SocketAddr::new(up.address, up.port);
         let start = Instant::now();
 
@@ -202,9 +221,9 @@ impl Forwarder {
                 .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
             let _ = stream.set_nodelay(true);
 
-            let mut frame = Vec::with_capacity(2 + raw.len());
-            frame.extend_from_slice(&(raw.len() as u16).to_be_bytes());
-            frame.extend_from_slice(raw);
+            let mut frame = Vec::with_capacity(2 + wire.len());
+            frame.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&wire);
             stream
                 .write_all(&frame)
                 .await
@@ -226,7 +245,7 @@ impl Forwarder {
                 .map_err(|e| ExchangeError::Network(format!("read body: {e}")))?;
 
             let view = msg::parse_response(&resp).map_err(ExchangeError::Invalid)?;
-            if !msg::correlates(query, &view) {
+            if !msg::correlates(&correlated, &view) {
                 return Err(ExchangeError::Invalid(
                     "response does not match query".into(),
                 ));
@@ -427,5 +446,170 @@ mod tests {
         assert!(view.truncated, "TC stub must be marked truncated");
         let q = view.question.expect("stub echoes the question");
         assert_eq!(q.0, "example.com.");
+    }
+    async fn start_udp_peer() -> (UdpSocket, SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let addr = sock.local_addr().expect("peer addr");
+        (sock, addr)
+    }
+
+    fn upstream(addr: SocketAddr, proto: Protocol) -> UpstreamConfig {
+        UpstreamConfig {
+            id: 1,
+            name: "test".into(),
+            address: addr.ip(),
+            port: addr.port(),
+            protocol: proto,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn reply_for(query: &Message, id: u16) -> Vec<u8> {
+        let mut msg = Message::response(id, query.op_code);
+        msg.metadata.recursion_desired = query.metadata.recursion_desired;
+        msg.metadata.recursion_available = true;
+        msg.queries = query.queries.clone();
+        if let Some(q) = query.queries.first() {
+            msg.answers.push(hickory_proto::rr::Record::from_rdata(
+                q.name().clone(),
+                60,
+                hickory_proto::rr::RData::A("192.0.2.53".parse().unwrap()),
+            ));
+        }
+        msg.to_vec().expect("encode reply")
+    }
+
+    #[tokio::test]
+    async fn udp_ignores_forged_id_and_question_before_valid_reply() {
+        let (sock, addr) = start_udp_peer().await;
+        let raw = msg::build_query("example.com", "A").unwrap();
+        let parsed = msg::parse_query(&raw).unwrap();
+        let (id_tx, id_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, peer) = sock.recv_from(&mut buf).await.expect("receive query");
+            let query = Message::from_vec(&buf[..n]).expect("decode query");
+            id_tx.send(query.metadata.id).expect("send upstream id");
+            let valid = reply_for(&query, query.metadata.id);
+
+            // Same-source forgery with the wrong transaction id.
+            let mut wrong_id = valid.clone();
+            wrong_id[0] ^= 0x01;
+            sock.send_to(&wrong_id, peer).await.expect("send wrong id");
+
+            // Same-source forgery with the wrong question name (same length).
+            let mut wrong_q = valid.clone();
+            wrong_q[13] = b'f'; // example.com -> fxample.com
+            sock.send_to(&wrong_q, peer)
+                .await
+                .expect("send wrong qname");
+
+            // Only the correlated reply may be accepted.
+            sock.send_to(&valid, peer).await.expect("send valid reply");
+        });
+
+        let forwarder = Forwarder::new(false);
+        let ok = forwarder
+            .exchange(
+                &upstream(addr, Protocol::Udp),
+                &parsed,
+                &raw,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("valid reply must be accepted");
+
+        let upstream_id = id_rx.await.expect("upstream id");
+        assert_eq!(
+            ok.view.id, upstream_id,
+            "forged transaction id was accepted"
+        );
+        assert_ne!(
+            ok.view.id, parsed.id,
+            "client transaction id must not be forwarded upstream"
+        );
+        assert_eq!(
+            ok.view.question.expect("question").0,
+            "example.com.",
+            "forged question was accepted"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn udp_discards_replies_from_a_different_source() {
+        let (target, target_addr) = start_udp_peer().await;
+        let (attacker, _attacker_addr) = start_udp_peer().await;
+        let raw = msg::build_query("example.com", "A").unwrap();
+        let parsed = msg::parse_query(&raw).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let target_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, peer) = target.recv_from(&mut buf).await.expect("receive query");
+            let query = Message::from_vec(&buf[..n]).expect("decode query");
+            ready_tx
+                .send((peer, reply_for(&query, query.metadata.id)))
+                .unwrap();
+        });
+
+        let up = upstream(target_addr, Protocol::Udp);
+        let exchange = tokio::spawn(async move {
+            Forwarder::new(false)
+                .exchange(&up, &parsed, &raw, Duration::from_millis(300))
+                .await
+        });
+        let (peer, valid) = ready_rx.await.expect("target received query");
+        // A perfectly correlated reply from a different source must not
+        // satisfy a connected UDP socket.
+        attacker.send_to(&valid, peer).await.expect("spoofed send");
+
+        let result = exchange.await.expect("exchange task");
+        assert!(
+            matches!(result, Err(ExchangeError::Timeout)),
+            "reply from an unexpected source must be ignored, got {result:?}"
+        );
+        target_task.await.expect("target task");
+    }
+
+    #[tokio::test]
+    async fn tcp_rejects_uncorrelated_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp peer");
+        let addr = listener.local_addr().expect("tcp peer addr");
+        let raw = msg::build_query("example.com", "A").unwrap();
+        let parsed = msg::parse_query(&raw).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.expect("read len");
+            let len = usize::from(u16::from_be_bytes(len_buf));
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.expect("read query");
+            let query = Message::from_vec(&body).expect("decode query");
+            let resp = reply_for(&query, query.metadata.id.wrapping_add(1));
+            let mut frame = Vec::with_capacity(2 + resp.len());
+            frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&resp);
+            stream.write_all(&frame).await.expect("write response");
+        });
+
+        let forwarder = Forwarder::new(false);
+        let result = forwarder
+            .exchange(
+                &upstream(addr, Protocol::Tcp),
+                &parsed,
+                &raw,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(ExchangeError::Invalid(reason)) if reason.contains("does not match")),
+            "uncorrelated TCP response must be rejected, got {result:?}"
+        );
+        server.await.expect("server task");
     }
 }

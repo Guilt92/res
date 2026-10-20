@@ -19,14 +19,16 @@ use tokio::sync::watch;
 use crate::config::CacheConfig;
 use crate::dns::msg::{self, Rcode};
 
-/// Cache identity of a question: name, type, class and the client's CD bit
-/// (responses may differ when Checking Disabled is set).
+/// Cache identity of a question: name, type, class, RD and the client's CD
+/// bit. Responses may differ when recursion is not requested or Checking
+/// Disabled is set, so neither may share an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub name: String,
     pub qtype: u16,
     pub qclass: u16,
     pub cd: bool,
+    pub rd: bool,
 }
 
 #[derive(Debug)]
@@ -469,6 +471,7 @@ mod tests {
             qtype: 1,
             qclass: 1,
             cd: false,
+            rd: true,
         }
     }
 

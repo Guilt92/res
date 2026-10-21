@@ -245,6 +245,109 @@ fn build_response(
     resp.to_vec().ok()
 }
 
+/// Paths to the committed self-signed test certificate (CN/SAN localhost and
+/// 127.0.0.1). Never use these outside tests.
+pub const TLS_CERT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/tls/localhost-cert.pem"
+);
+pub const TLS_KEY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/tls/localhost-key.pem"
+);
+pub const TLS_CA_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/tls/ca-cert.pem"
+);
+
+/// Minimal DNS-over-TLS upstream for end-to-end certificate/SNI tests.
+pub struct FakeTlsUpstream {
+    pub addr: SocketAddr,
+    pub hits: Arc<AtomicU64>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl FakeTlsUpstream {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tls");
+        let addr = listener.local_addr().expect("tls addr");
+        let config = res::tls::load_server_config(
+            std::path::Path::new(TLS_CERT_PATH),
+            std::path::Path::new(TLS_KEY_PATH),
+        )
+        .expect("test TLS identity");
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let hits = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        {
+            let hits = Arc::clone(&hits);
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let acceptor = acceptor.clone();
+                    let hits = Arc::clone(&hits);
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut len_buf = [0u8; 2];
+                        if stream.read_exact(&mut len_buf).await.is_err() {
+                            return;
+                        }
+                        let len = usize::from(u16::from_be_bytes(len_buf));
+                        let mut body = vec![0u8; len];
+                        if stream.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let Ok(query) = Message::from_vec(&body) else {
+                            return;
+                        };
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let Some(resp) = build_response(&query, false, ANSWER, false) else {
+                            return;
+                        };
+                        let mut frame = Vec::with_capacity(2 + resp.len());
+                        frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+                        frame.extend_from_slice(&resp);
+                        let _ = stream.write_all(&frame).await;
+                        let _ = stream.flush().await;
+                    });
+                }
+            }));
+        }
+        Self { addr, hits, tasks }
+    }
+
+    pub fn config(&self, name: &str, server_name: &str) -> UpstreamConfig {
+        UpstreamConfig {
+            id: 0,
+            name: name.to_string(),
+            address: self.addr.ip(),
+            port: self.addr.port(),
+            protocol: Protocol::Tls,
+            enabled: true,
+            priority: 1,
+            weight: 1,
+            timeout_ms: None,
+            tls_server_name: Some(server_name.to_string()),
+            tls_ca_file: Some(std::path::PathBuf::from(TLS_CA_PATH)),
+            ..Default::default()
+        }
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    pub async fn stop(self) {
+        for t in self.tasks {
+            t.abort();
+        }
+    }
+}
+
 /// Gateway configuration for tests: loopback-only, ephemeral
 /// ports, no rate limit / ACL surprises unless a test opts in.
 pub fn base_config() -> AppConfig {

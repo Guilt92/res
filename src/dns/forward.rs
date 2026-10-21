@@ -5,13 +5,18 @@
 //! upstream exchange. Responses are validated by that id, message type and
 //! question section before being accepted.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
 use crate::config::{Protocol, UpstreamConfig};
 use crate::dns::msg::{self, ParsedQuery, ResponseView};
@@ -38,7 +43,7 @@ pub struct ExchangeOk {
     pub latency: Duration,
 }
 
-/// Performs DNS exchanges with upstreams over UDP/TCP.
+/// Performs DNS exchanges with upstreams over UDP/TCP/DoT.
 #[derive(Debug, Clone, Copy)]
 pub struct Forwarder {
     /// Retry over TCP when an upstream UDP response is truncated (TC=1).
@@ -89,6 +94,7 @@ impl Forwarder {
         match proto {
             Protocol::Udp => self.exchange_udp(up, query, raw, budget).await,
             Protocol::Tcp => self.exchange_tcp(up, query, raw, budget).await,
+            Protocol::Tls => self.exchange_tls(up, query, raw, budget).await,
         }
     }
 
@@ -211,62 +217,155 @@ impl Forwarder {
         if raw.len() > MAX_TCP_MESSAGE {
             return Err(ExchangeError::Invalid("query too large for TCP".into()));
         }
-        let (correlated, wire) = Self::randomized_query(query, raw);
         let target = SocketAddr::new(up.address, up.port);
         let start = Instant::now();
 
         let result = timeout(budget, async {
-            let mut stream = TcpStream::connect(target)
+            let stream = TcpStream::connect(target)
                 .await
                 .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
             let _ = stream.set_nodelay(true);
-
-            let mut frame = Vec::with_capacity(2 + wire.len());
-            frame.extend_from_slice(&(wire.len() as u16).to_be_bytes());
-            frame.extend_from_slice(&wire);
-            stream
-                .write_all(&frame)
-                .await
-                .map_err(|e| ExchangeError::Network(format!("write: {e}")))?;
-
-            let mut len_buf = [0u8; 2];
-            stream
-                .read_exact(&mut len_buf)
-                .await
-                .map_err(|e| ExchangeError::Network(format!("read len: {e}")))?;
-            let len = usize::from(u16::from_be_bytes(len_buf));
-            if len < 12 {
-                return Err(ExchangeError::Invalid(format!("short frame ({len} bytes)")));
-            }
-            let mut resp = vec![0u8; len];
-            stream
-                .read_exact(&mut resp)
-                .await
-                .map_err(|e| ExchangeError::Network(format!("read body: {e}")))?;
-
-            let view = msg::parse_response(&resp).map_err(ExchangeError::Invalid)?;
-            if !msg::correlates(&correlated, &view) {
-                return Err(ExchangeError::Invalid(
-                    "response does not match query".into(),
-                ));
-            }
-            Ok(ExchangeOk {
-                response: resp,
-                view,
-                latency: Duration::ZERO,
-            })
+            self.exchange_framed(query, raw, stream).await
         })
         .await;
 
-        match result {
-            Err(_) => Err(ExchangeError::Timeout),
-            Ok(Ok(mut ok)) => {
-                ok.latency = start.elapsed();
-                Ok(ok)
-            }
-            Ok(Err(e)) => Err(e),
-        }
+        finish_exchange(result, start)
     }
+
+    /// DNS-over-TLS (RFC 7858): TCP framing inside a certificate-validated TLS
+    /// session. There is no plaintext retry or downgrade: a handshake or
+    /// identity failure is a hard upstream failure.
+    async fn exchange_tls(
+        &self,
+        up: &UpstreamConfig,
+        query: &ParsedQuery,
+        raw: &[u8],
+        budget: Duration,
+    ) -> Result<ExchangeOk, ExchangeError> {
+        if raw.len() > MAX_TCP_MESSAGE {
+            return Err(ExchangeError::Invalid("query too large for TLS".into()));
+        }
+        let server_name = up
+            .tls_server_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                ExchangeError::Invalid(format!(
+                    "upstream '{}' uses protocol tls without tls_server_name",
+                    up.name
+                ))
+            })?;
+        let server_name = ServerName::try_from(server_name.to_string())
+            .map_err(|e| ExchangeError::Invalid(format!("invalid tls_server_name: {e}")))?;
+        let config = tls_client_config(up.tls_ca_file.as_deref())?;
+        let target = SocketAddr::new(up.address, up.port);
+        let start = Instant::now();
+
+        let result = timeout(budget, async {
+            let stream = TcpStream::connect(target)
+                .await
+                .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            let mut stream = TlsConnector::from(config)
+                .connect(server_name, stream)
+                .await
+                .map_err(|e| ExchangeError::Network(format!("tls handshake: {e}")))?;
+            self.exchange_framed(query, raw, &mut stream).await
+        })
+        .await;
+
+        finish_exchange(result, start)
+    }
+
+    /// Write one length-prefixed DNS query and read one correlated response.
+    /// Latency is filled in by the caller around the complete exchange.
+    async fn exchange_framed<S>(
+        &self,
+        query: &ParsedQuery,
+        raw: &[u8],
+        mut stream: S,
+    ) -> Result<ExchangeOk, ExchangeError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (correlated, wire) = Self::randomized_query(query, raw);
+        let mut frame = Vec::with_capacity(2 + wire.len());
+        frame.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&wire);
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("write: {e}")))?;
+
+        let mut len_buf = [0u8; 2];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("read len: {e}")))?;
+        let len = usize::from(u16::from_be_bytes(len_buf));
+        if len < 12 {
+            return Err(ExchangeError::Invalid(format!("short frame ({len} bytes)")));
+        }
+        let mut resp = vec![0u8; len];
+        stream
+            .read_exact(&mut resp)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("read body: {e}")))?;
+
+        let view = msg::parse_response(&resp).map_err(ExchangeError::Invalid)?;
+        if !msg::correlates(&correlated, &view) {
+            return Err(ExchangeError::Invalid(
+                "response does not match query".into(),
+            ));
+        }
+        Ok(ExchangeOk {
+            response: resp,
+            view,
+            latency: Duration::ZERO,
+        })
+    }
+}
+
+/// Normalize the timeout result and stamp the measured latency on success.
+fn finish_exchange(
+    result: Result<Result<ExchangeOk, ExchangeError>, tokio::time::error::Elapsed>,
+    start: Instant,
+) -> Result<ExchangeOk, ExchangeError> {
+    match result {
+        Err(_) => Err(ExchangeError::Timeout),
+        Ok(Ok(mut ok)) => {
+            ok.latency = start.elapsed();
+            Ok(ok)
+        }
+        Ok(Err(e)) => Err(e),
+    }
+}
+
+/// Cache rustls client configs by CA bundle path. The trust roots are loaded
+/// once per path; changing the PEM contents requires a process restart (the
+/// same operational contract as other startup-loaded TLS material).
+fn tls_client_config(ca_file: Option<&Path>) -> Result<Arc<rustls::ClientConfig>, ExchangeError> {
+    static CACHE: OnceLock<Mutex<HashMap<Option<PathBuf>, Arc<rustls::ClientConfig>>>> =
+        OnceLock::new();
+    let key = ca_file.map(Path::to_path_buf);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(config) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(config);
+    }
+    let config = crate::tls::upstream_client_config(ca_file)
+        .map_err(|e| ExchangeError::Invalid(format!("TLS client setup: {e:#}")))?;
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&config));
+    Ok(config)
 }
 
 /// DNS flag day 2020 minimum safe UDP payload (also the receive floor for

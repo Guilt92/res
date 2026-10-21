@@ -40,5 +40,6 @@ pub mod runtime;
 pub mod selection;
 pub mod shared;
 pub mod sysinfo;
+pub mod tls;
 pub mod traffic;
 pub mod upstream;

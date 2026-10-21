@@ -321,6 +321,12 @@ impl AuthState {
         self.cfg.allow_open_mode
     }
 
+    /// Force the `Secure` cookie flag on (used when the management listener
+    /// itself terminates TLS). Never turns it back off.
+    pub fn enable_secure_cookies(&mut self) {
+        self.cfg.secure_cookies = true;
+    }
+
     /// Per-IP login rate limit. Returns `Ok(())` when the attempt may
     /// proceed, or `Err(retry_after_secs)` when the client has exceeded
     /// `login_rate_limit_per_minute` within the current one-minute window.

@@ -8,6 +8,36 @@ use std::time::Duration;
 use common::*;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::RData;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Minimal HTTPS client for the management listener, trusting only the test
+/// CA. Deliberately checks certificate validation instead of disabling it.
+async fn tls_http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    let pem = std::fs::read(TLS_CA_PATH).expect("read test CA");
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)).expect("parse test CA") {
+        roots.add(cert.into()).expect("add test CA");
+    }
+    let config = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let mut tls = tokio_rustls::TlsConnector::from(config)
+        .connect(name, tcp)
+        .await
+        .expect("TLS handshake");
+    tls.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .expect("write request");
+    let mut out = Vec::new();
+    let _ = tls.read_to_end(&mut out).await;
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 fn answers_ip(resp: &hickory_proto::op::Message) -> Option<std::net::Ipv4Addr> {
     match resp.answers.first()?.data {
@@ -28,6 +58,105 @@ async fn udp_forwarding_returns_upstream_answer() {
     assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
     assert_eq!(answers_ip(&resp), Some(ANSWER));
     assert_eq!(fake.hits(), 1);
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+/// Management API served directly over HTTPS, with certificate validation and
+/// HSTS instead of a plaintext listener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_tls_serves_validated_https_with_hsts() {
+    let mut cfg = base_config();
+    cfg.server.tls_cert = Some(TLS_CERT_PATH.into());
+    cfg.server.tls_key = Some(TLS_KEY_PATH.into());
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let raw = tls_http_get(api, "/api/health").await;
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(
+        raw.to_ascii_lowercase()
+            .contains("strict-transport-security: max-age=31536000"),
+        "TLS responses must carry HSTS: {raw}"
+    );
+    assert!(raw.contains("\"status\":\"ok\""), "{raw}");
+
+    // A plain HTTP request to the TLS port must not be served.
+    let mut tcp = tokio::net::TcpStream::connect(api).await.expect("tcp");
+    tcp.write_all(b"GET /api/health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .expect("write plain");
+    let mut buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), tcp.read(&mut buf))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(0);
+    assert!(
+        !String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/"),
+        "plaintext must not be served on the TLS listener"
+    );
+
+    gw.shutdown().await;
+}
+
+/// Management TLS is all-or-nothing: a half-configured identity is rejected
+/// at startup, never silently served as plain HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_tls_requires_both_certificate_and_key() {
+    let mut cfg = base_config();
+    cfg.server.tls_cert = Some(TLS_CERT_PATH.into());
+    let err = res::runtime::start(cfg, None)
+        .await
+        .err()
+        .expect("certificate without key must fail");
+    assert!(
+        err.to_string().contains("tls_cert and server.tls_key"),
+        "unexpected error: {err}"
+    );
+}
+
+/// DNS-over-TLS upstream with SNI verified against a private CA. The answer
+/// must travel inside TLS with no UDP/plain-TCP fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_forwarding_uses_validated_tls() {
+    let fake = FakeTlsUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("dot-1", "localhost"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query(addr, "dot.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(answers_ip(&resp), Some(ANSWER));
+    assert_eq!(fake.hits(), 1, "query must reach the TLS upstream");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+/// A certificate/SNI mismatch is a hard failure: no plaintext retry and no
+/// silent downgrade to the same address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_rejects_server_name_mismatch_without_downgrade() {
+    let fake = FakeTlsUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.query.max_attempts = 1;
+    cfg.query.upstream_timeout_ms = 1000;
+    cfg.query.timeout_ms = 2000;
+    cfg.upstreams
+        .push(fake.config("dot-bad-name", "wrong.example"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query(addr, "dot.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(
+        fake.hits(),
+        0,
+        "mismatched certificate must not carry a query"
+    );
 
     gw.shutdown().await;
     fake.stop().await;

@@ -150,24 +150,34 @@ when neither a password nor an API token is configured. Isolated development
 instances can set `[auth].allow_open_mode = true`; the gateway then logs a
 prominent warning and the dashboard labels the session as unauthenticated.
 
-## Exposing the dashboard (reverse proxy / HTTPS)
+## HTTPS, reverse proxies and encrypted upstreams
 
-The binary speaks plain HTTP only — terminate TLS in front of it:
+The management API can terminate TLS itself, or sit behind a reverse proxy:
 
-* Put nginx/Caddy/Traefik in front of `:8080` with a certificate; forward
-  `X-Forwarded-*` only from a trusted hop.
-* The gateway does **not** honour `X-Forwarded-For`: client-based limits
-  (login throttle) see the proxy's address, so also rate-limit at the proxy
-  (recommended anyway). DNS itself is not affected — it never goes through
-  the proxy.
-* Set `[auth].secure_cookies = true` (or restart with it) once HTTPS is in
-  place so session cookies carry the `Secure` flag.
+* **Direct HTTPS** — set `[server].tls_cert` and `[server].tls_key` to PEM
+  files. The API, dashboard, and `/metrics` are served over TLS only (no
+  plaintext fallback); HSTS is sent and session cookies are forced `Secure`.
+  A certificate or key error aborts startup instead of downgrading.
+* **Reverse proxy** — nginx/Caddy/Traefik in front of `:8080` remains fully
+  supported. Forward `X-Forwarded-*` only from a trusted hop. The gateway
+  does **not** honour `X-Forwarded-For`: client-based limits (login throttle)
+  see the proxy's address, so rate-limit at the proxy too. Set
+  `[auth].secure_cookies = true` and add HSTS at the proxy.
 * API concurrency is bounded (256 in-flight, 5 s wait) and sheds load with
   `503`; a reverse proxy can add its own connection limits.
 * `/metrics` is unauthenticated by default for Prometheus scrapes on the
   internal network; set `[auth].protect_metrics = true` if it is reachable
   more widely. When any credential is configured, scrapers must present the
   bearer token or a session — never expose metrics publicly.
+
+**DNS-over-TLS upstreams:** set an upstream `protocol = "tls"`,
+`port = 853`, and `tls_server_name = "resolver.example"`. The certificate is
+verified against that name using the bundled public WebPKI roots, or against
+`tls_ca_file` when supplied. Certificate/SNI failures are hard upstream
+failures and never fall back to plaintext. DoH (DNS-over-HTTPS) is **not**
+implemented; use DoT or a local DoH proxy if required. DNS responses retain
+upstream DNSSEC records/flags, but this gateway does **not** validate DNSSEC
+locally.
 
 ## API & monitoring
 

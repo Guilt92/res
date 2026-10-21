@@ -25,14 +25,35 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
+use axum::serve::IncomingStream;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// Socket peer information for both the plain and TLS Axum listeners. Axum's
+/// built-in `ConnectInfo<SocketAddr>` only knows its own `TcpListener`; a local
+/// newtype lets the TLS listener carry the same peer address without trusting
+/// proxy headers.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAddr(pub std::net::SocketAddr);
+
+impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for ClientAddr {
+    fn connect_info(stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, crate::tls::TlsListener>> for ClientAddr {
+    fn connect_info(stream: IncomingStream<'_, crate::tls::TlsListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
 
 use crate::acl::{AclAction, AclConfig, AclEntry, AclRules};
 use crate::auth::{AuthState, LoginError, Role};
@@ -412,7 +433,7 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -
             state.clone(),
             api_concurrency,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
     let app = match dashboard {
         Some(dir) => app.fallback(move |req: axum::extract::Request| {
@@ -425,7 +446,10 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -
             ApiError::NotFound(format!("no route for {}", req.uri().path())).into_response()
         }),
     };
-    app.layer(middleware::from_fn(security_headers))
+    app.layer(middleware::from_fn_with_state(
+        state.clone(),
+        security_headers,
+    ))
 }
 
 /// Bounded HTTP concurrency (audit GAP-3): at most `API_CONCURRENCY`
@@ -457,8 +481,13 @@ async fn api_concurrency(
 /// metadata). A CSP is deliberately not set — the dashboard ships an inline
 /// script/stylesheet by design, and a hash/nonce policy would have to be
 /// kept in lockstep with `index.html` (documented in the README instead).
-async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
+async fn security_headers(
+    State(st): State<ApiState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
     let path = req.uri().path().to_string();
+    let tls = st.shared.app.load().server.tls_enabled();
     let mut res = next.run(req).await;
     let h = res.headers_mut();
     h.insert(
@@ -474,6 +503,14 @@ async fn security_headers(req: axum::extract::Request, next: Next) -> Response {
         "cross-origin-opener-policy",
         HeaderValue::from_static("same-origin"),
     );
+    if tls {
+        // Only sent when this listener terminates TLS itself. Reverse-proxy
+        // deployments should set HSTS at the proxy.
+        h.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     h.insert(
         "x-permitted-cross-domain-policies",
         HeaderValue::from_static("none"),
@@ -667,7 +704,7 @@ struct LoginRequest {
 /// is per-username and per-client-IP.
 async fn login(
     State(st): State<ApiState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
     if !st.auth.enabled() {
@@ -875,7 +912,7 @@ struct RotatePasswordRequest {
 /// Persists the new hash to the credentials file when a config path is known.
 async fn rotate_password(
     State(st): State<ApiState>,
-    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ConnectInfo(ClientAddr(addr)): ConnectInfo<ClientAddr>,
     headers: HeaderMap,
     Json(req): Json<RotatePasswordRequest>,
 ) -> Result<Json<Value>, ApiError> {
@@ -989,6 +1026,7 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "configured_udp": app.server.udp_addr.to_string(),
             "configured_tcp": app.server.tcp_addr.to_string(),
             "configured_api": app.server.api_addr.to_string(),
+            "api_tls": app.server.tls_enabled(),
         },
         "config": {
             "path": st.shared.config_path.get().map(|p| p.display().to_string()),
@@ -1281,6 +1319,7 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "configured_udp": app.server.udp_addr.to_string(),
             "configured_tcp": app.server.tcp_addr.to_string(),
             "configured_api": app.server.api_addr.to_string(),
+            "api_tls": app.server.tls_enabled(),
         },
         "config": {
             "path": st.shared.config_path.get().map(|p| p.display().to_string()),
@@ -2686,6 +2725,10 @@ pub struct CreateUpstreamRequest {
     pub probes: Option<Vec<crate::config::HealthProbe>>,
     /// Per-upstream expected rcode for health probes (`UpstreamConfig::expect_rcode`).
     pub expect_rcode: Option<String>,
+    /// SNI/certificate name for `protocol = "tls"`.
+    pub tls_server_name: Option<String>,
+    /// Optional PEM CA bundle for `protocol = "tls"`.
+    pub tls_ca_file: Option<std::path::PathBuf>,
     /// Accepted and ignored on create (the dashboard sends `confirm` on every
     /// write; only updates/deletes need it). Typed here because
     /// `deny_unknown_fields` would otherwise reject the panel's payload with
@@ -2727,6 +2770,12 @@ pub struct UpdateUpstreamRequest {
     pub expect_rcode: Option<String>,
     /// Explicitly clear the `expect_rcode` override.
     pub clear_expect_rcode: Option<bool>,
+    /// SNI/certificate name for `protocol = "tls"`.
+    pub tls_server_name: Option<String>,
+    /// Optional PEM CA bundle for `protocol = "tls"`.
+    pub tls_ca_file: Option<std::path::PathBuf>,
+    /// Explicitly clear the TLS server name / CA bundle.
+    pub clear_tls: Option<bool>,
     /// Explicitly clear the per-upstream probe overrides.
     pub clear_probes: Option<bool>,
     /// Required when the update would disable the last enabled upstream.
@@ -2950,6 +2999,8 @@ async fn create_upstream(
         probe_timeout_ms: req.probe_timeout_ms,
         probes: req.probes.clone(),
         expect_rcode: req.expect_rcode.clone(),
+        tls_server_name: req.tls_server_name.clone(),
+        tls_ca_file: req.tls_ca_file.clone(),
     };
     candidate.validate().map_err(|e| {
         reject(
@@ -3065,6 +3116,21 @@ async fn patch_upstream(
         updated.expect_rcode = None;
     } else if let Some(rc) = &req.expect_rcode {
         updated.expect_rcode = Some(rc.clone());
+    }
+    if Some(true) == req.clear_tls {
+        updated.tls_server_name = None;
+        updated.tls_ca_file = None;
+    } else {
+        if let Some(name) = &req.tls_server_name {
+            updated.tls_server_name = if name.trim().is_empty() {
+                None
+            } else {
+                Some(name.clone())
+            };
+        }
+        if let Some(path) = &req.tls_ca_file {
+            updated.tls_ca_file = Some(path.clone());
+        }
     }
     if Some(true) == req.clear_probes {
         updated.probes = None;

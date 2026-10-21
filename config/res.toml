@@ -10,6 +10,11 @@ max_queries_per_tcp_conn = 100
 tcp_idle_timeout_ms = 10000
 upstream_tcp_fallback = true
 shutdown_grace_ms = 5000
+# Direct HTTPS for the management API/dashboard/metrics. Set both files or
+# neither; there is no plaintext fallback. Leave unset when a reverse proxy
+# terminates TLS. HSTS is sent and session cookies are forced Secure.
+# tls_cert = "/etc/res/tls/fullchain.pem"
+# tls_key = "/etc/res/tls/privkey.pem"
 
 [auth]
 username = "admin"
@@ -197,3 +202,17 @@ protocol = "udp"
 enabled = true
 priority = 3
 weight = 1
+
+# DNS-over-TLS upstream example. `tls_server_name` is required (SNI and
+# certificate verification); `tls_ca_file` replaces the public WebPKI roots.
+# [[upstreams]]
+# id = 7
+# name = "cloudflare-dot"
+# address = "1.1.1.1"
+# port = 853
+# protocol = "tls"
+# tls_server_name = "cloudflare-dns.com"
+# # tls_ca_file = "/etc/res/private-dns-ca.pem"
+# enabled = true
+# priority = 1
+# weight = 1

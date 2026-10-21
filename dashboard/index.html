@@ -895,7 +895,7 @@ window.addEventListener('unhandledrejection', function(e){
       <label>Name <input id="umg-name" maxlength="64" placeholder="cloudflare-1"></label>
       <label>Address <input id="umg-address" placeholder="1.1.1.1 (IP only, no hostname)"></label>
       <label>Port <input id="umg-port" type="number" min="1" max="65535" value="53"></label>
-      <label>Protocol <select id="umg-protocol"><option value="udp">udp</option><option value="tcp">tcp</option></select></label>
+      <label>Protocol <select id="umg-protocol"><option value="udp">udp</option><option value="tcp">tcp</option><option value="tls">tls (DoT)</option></select></label>
       <label>Priority <input id="umg-priority" type="number" min="1" value="1"></label>
       <label>Weight <input id="umg-weight" type="number" min="1" value="1"></label>
       <label>Timeout ms <input id="umg-timeout" type="number" min="1" max="60000" placeholder="inherit"></label>
@@ -903,6 +903,10 @@ window.addEventListener('unhandledrejection', function(e){
         title="Per-upstream health-check interval override; empty inherits [health].interval"></label>
       <label>Probe timeout ms <input id="umg-probe-timeout" type="number" min="1" max="60000" placeholder="inherit"
         title="Per-upstream health-check timeout override; empty inherits [health].timeout"></label>
+      <label id="umg-tls-name-wrap" hidden>TLS server name <input id="umg-tls-name" maxlength="253" placeholder="cloudflare-dns.com"
+        title="SNI and certificate name for DNS-over-TLS; required for protocol tls"></label>
+      <label id="umg-tls-ca-wrap" hidden>TLS CA bundle <input id="umg-tls-ca" maxlength="1024" placeholder="system WebPKI roots"
+        title="Optional PEM CA bundle for this upstream; empty uses the bundled public roots"></label>
       <label>Expected rcode <input id="umg-expect-rcode" maxlength="32" placeholder="any (e.g. NOERROR)"
         title="Health probes pass only when the upstream answers with this rcode; empty = accept any. Clearing a previously saved value removes the expectation."></label>
       <label>Probes <textarea id="umg-probes" rows="3" spellcheck="false"
@@ -1606,6 +1610,7 @@ function applyRoleGating(){
   document.body.dataset.role = AUTH.role || "";
   const ids = [
     "umg-name","umg-address","umg-port","umg-protocol","umg-priority","umg-weight",
+    "umg-tls-name","umg-tls-ca",
     "umg-timeout","umg-probe-interval","umg-probe-timeout","umg-expect-rcode",
     "umg-enabled","umg-confirm","umg-probes","umg-submit",
     "acl-cidr","acl-action","acl-enabled","acl-add",
@@ -2567,6 +2572,9 @@ function windowQueries(h){
 /* =========================================================================
  * Upstream table
  * ====================================================================== */
+function protoLabel(u){
+  return u.protocol + (u.protocol === "tls" && u.tls_server_name ? " ("+u.tls_server_name+")" : "");
+}
 function stateChip(u){
   if (!u.enabled) return '<span class="state disabled"><span class="d"></span>off</span>';
   return '<span class="state '+u.health+'"><span class="d"></span>'+u.health+'</span>';
@@ -2598,7 +2606,7 @@ function renderUpstreams(){
       '<td>'+stateChip(u)+'</td>'+
       '<td>'+use+'</td>'+
       '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d" style="background:'+color+'"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td class="num">'+fmtVal(u.qps,"qps")+'</td>'+
       '<td class="num">'+u.queries+'</td>'+
@@ -3020,7 +3028,7 @@ function renderUpstreamMgr(){
       : '<button class="danger" data-act="remove">Remove</button>';
     return '<tr data-id="'+u.id+'">'+
       '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+u.protocol+'</td>'+
+      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td>'+(u.enabled?stateChip(u):'<span class="state disabled"><span class="d"></span>off</span>')+'</td>'+
       '<td class="num mono">'+lat+'</td>'+
@@ -3044,6 +3052,10 @@ function umgOpenForm(id){
   $("umg-address").value = u ? u.address : "";
   $("umg-port").value = u ? u.port : 53;
   $("umg-protocol").value = u ? (u.protocol || "udp") : "udp";
+  $("umg-tls-name").value = (u && u.tls_server_name) ? u.tls_server_name : "";
+  $("umg-tls-ca").value = (u && u.tls_ca_file) ? u.tls_ca_file : "";
+  umg.origTls = !!(u && (u.tls_server_name || u.tls_ca_file));
+  umgSyncTlsFields();
   $("umg-priority").value = u ? u.priority : 1;
   $("umg-weight").value = u ? u.weight : 1;
   $("umg-timeout").value = (u && u.timeout_ms != null) ? u.timeout_ms : "";
@@ -3066,6 +3078,12 @@ function umgOpenForm(id){
   $("umg-name").focus();
   renderUpstreamMgr();
 }
+function umgSyncTlsFields(){
+  const tls = $("umg-protocol").value === "tls";
+  $("umg-tls-name-wrap").hidden = !tls;
+  $("umg-tls-ca-wrap").hidden = !tls;
+  if (tls && parseInt($("umg-port").value, 10) === 53) $("umg-port").value = 853;
+}
 function umgCloseForm(){
   umg.editId = null;
   $("umg-form-d").open = false;
@@ -3084,6 +3102,13 @@ async function umgSubmit(){
     enabled: $("umg-enabled").checked,
     confirm: $("umg-confirm").checked,
   };
+  if (body.protocol === "tls"){
+    body.tls_server_name = $("umg-tls-name").value.trim();
+    const ca = $("umg-tls-ca").value.trim();
+    if (ca) body.tls_ca_file = ca;
+  } else if (umg.editId != null && umg.origTls){
+    body.clear_tls = true;
+  }
   const t = $("umg-timeout").value.trim();
   if (t) body.timeout_ms = parseInt(t, 10);
   else if (umg.editId != null && umg.origTimeoutMs != null) body.clear_timeout = true;
@@ -3134,7 +3159,7 @@ async function umgRowAction(id, act){
   if (act === "edit"){ umgOpenForm(id); return; }
   if (act === "canceledit"){ umgCloseForm(); return; }
   if (act === "test"){
-    umgMsg("probing "+u.name+" ("+u.address+":"+u.port+" "+u.protocol+")…", "");
+    umgMsg("probing "+u.name+" ("+u.address+":"+u.port+" "+protoLabel(u)+")…", "");
     try {
       const j = await umgApi("POST", "/api/upstreams/"+id+"/test");
       const r = j.result || {};
@@ -3570,6 +3595,7 @@ function wire(){
   $("sel-reload").addEventListener("click", loadHealthSelection);
   // Login / session
   $("login-form").addEventListener("submit", e => { e.preventDefault(); doLogin(); });
+  $("umg-protocol").addEventListener("change", umgSyncTlsFields);
   $("login-token-go").addEventListener("click", doTokenLogin);
   $("login-token").addEventListener("keydown", e => {
     if (e.key === "Enter"){ e.preventDefault(); doTokenLogin(); }

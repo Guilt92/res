@@ -100,6 +100,9 @@ pub mod duration_ms {
 pub enum Protocol {
     Udp,
     Tcp,
+    /// DNS-over-TLS (RFC 7858). Requires `tls_server_name` for certificate
+    /// validation; the TCP port is usually 853.
+    Tls,
 }
 
 impl fmt::Display for Protocol {
@@ -107,6 +110,7 @@ impl fmt::Display for Protocol {
         match self {
             Protocol::Udp => f.write_str("udp"),
             Protocol::Tcp => f.write_str("tcp"),
+            Protocol::Tls => f.write_str("tls"),
         }
     }
 }
@@ -144,6 +148,15 @@ pub struct UpstreamConfig {
     /// Optional required rcode for a probe to count as success (e.g.
     /// "NOERROR"). When unset, both NOERROR and NXDOMAIN count as success.
     pub expect_rcode: Option<String>,
+    /// TLS SNI and certificate name for `protocol = "tls"`. Required for DoT;
+    /// the certificate must match this name (or an IP SAN for an IP literal).
+    /// Never silently falls back to plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
+    /// Optional PEM CA bundle used to verify this upstream's DoT certificate.
+    /// When unset, the bundled public WebPKI roots are used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_file: Option<PathBuf>,
 }
 
 impl Default for UpstreamConfig {
@@ -162,6 +175,8 @@ impl Default for UpstreamConfig {
             probe_timeout_ms: None,
             probes: None,
             expect_rcode: None,
+            tls_server_name: None,
+            tls_ca_file: None,
         }
     }
 }
@@ -246,6 +261,34 @@ impl UpstreamConfig {
                     "upstream '{}' expect_rcode '{rc}' is not a known rcode (NOERROR, NXDOMAIN, SERVFAIL, REFUSED, ...)",
                     self.name
                 ));
+            }
+        }
+        let tls_name = self.tls_server_name.as_deref().map(str::trim);
+        if self.protocol == Protocol::Tls {
+            match tls_name {
+                Some(n) if !n.is_empty() && n.len() <= 253 => {}
+                _ => {
+                    return Err(format!(
+                        "upstream '{}' uses protocol tls but has no valid tls_server_name",
+                        self.name
+                    ))
+                }
+            }
+            if tls_name.is_some_and(|n| n.ends_with('.')) {
+                return Err(format!(
+                    "upstream '{}' tls_server_name must not end with a dot",
+                    self.name
+                ));
+            }
+        } else if self.tls_server_name.is_some() || self.tls_ca_file.is_some() {
+            return Err(format!(
+                "upstream '{}' sets TLS options but protocol is not tls",
+                self.name
+            ));
+        }
+        if let Some(path) = &self.tls_ca_file {
+            if path.as_os_str().is_empty() {
+                return Err(format!("upstream '{}' has an empty tls_ca_file", self.name));
             }
         }
         Ok(())
@@ -381,6 +424,14 @@ pub struct ServerConfig {
     /// emitted at startup). May be supplied via `RES_API_TOKEN`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_token: String,
+    /// PEM certificate chain for the management API. Setting this and
+    /// `tls_key` serves the API, dashboard, and `/metrics` over HTTPS; there
+    /// is no plaintext fallback. Reverse-proxy TLS remains supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -398,7 +449,16 @@ impl Default for ServerConfig {
             upstream_tcp_fallback: true,
             shutdown_grace_ms: 5_000,
             api_token: String::new(),
+            tls_cert: None,
+            tls_key: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// True when the management API is configured for direct HTTPS.
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert.is_some() && self.tls_key.is_some()
     }
 }
 
@@ -921,6 +981,22 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.server.tls_cert.is_some() != self.server.tls_key.is_some() {
+            return Err("server.tls_cert and server.tls_key must be configured together".into());
+        }
+        if self
+            .server
+            .tls_cert
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+            || self
+                .server
+                .tls_key
+                .as_ref()
+                .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("server.tls_cert/server.tls_key must not be empty paths".into());
+        }
         if self.server.max_udp_packet_size < 512 || self.server.max_udp_packet_size > 65_535 {
             return Err("server.max_udp_packet_size must be in 512..=65535".into());
         }
@@ -1675,5 +1751,34 @@ mod tests {
         cfg.upstreams[0].probe_interval_ms = Some(600_001);
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("probe_interval_ms"), "{err}");
+    }
+
+    #[test]
+    fn dot_upstream_requires_tls_server_name() {
+        let mut cfg = base();
+        cfg.upstreams[0].protocol = Protocol::Tls;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("tls_server_name"), "{err}");
+
+        cfg.upstreams[0].tls_server_name = Some("resolver.example".into());
+        cfg.validate().expect("DoT with SNI is valid");
+    }
+
+    #[test]
+    fn tls_options_are_rejected_on_plain_transports() {
+        let mut cfg = base();
+        cfg.upstreams[0].tls_server_name = Some("resolver.example".into());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("protocol is not tls"), "{err}");
+    }
+
+    #[test]
+    fn management_tls_requires_both_files() {
+        let mut cfg = base();
+        cfg.server.tls_cert = Some(std::path::PathBuf::from("cert.pem"));
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("configured together"), "{err}");
+        cfg.server.tls_key = Some(std::path::PathBuf::from("key.pem"));
+        cfg.validate().expect("paired TLS files are valid");
     }
 }

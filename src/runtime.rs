@@ -91,10 +91,16 @@ impl Gateway {
 /// plane runs purely from the validated in-memory configuration.
 pub async fn start(app: AppConfig, config_path: Option<PathBuf>) -> anyhow::Result<Gateway> {
     let auth_cfg = app.auth.clone();
-    let auth = Arc::new(
-        crate::auth::AuthState::load(auth_cfg, config_path.as_deref())
-            .map_err(|e| anyhow::anyhow!("authentication initialization failed: {e}"))?,
-    );
+    let mut auth_state = crate::auth::AuthState::load(auth_cfg, config_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("authentication initialization failed: {e}"))?;
+    if app.server.tls_enabled() && !auth_state.secure_cookies() {
+        tracing::warn!(
+            event = "secure_cookies_forced",
+            note = "management TLS is enabled; marking session cookies Secure"
+        );
+        auth_state.enable_secure_cookies();
+    }
+    let auth = Arc::new(auth_state);
     start_with_auth(app, config_path, auth).await
 }
 
@@ -176,6 +182,17 @@ pub async fn start_with_auth(
     let api_listener = TcpListener::bind(api_addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind API {api_addr}: {e}"))?;
+    let api_tls = match (
+        shared.app.load().server.tls_cert.as_deref(),
+        shared.app.load().server.tls_key.as_deref(),
+    ) {
+        (Some(cert), Some(key)) => Some(
+            crate::tls::load_server_config(cert, key)
+                .map_err(|e| anyhow::anyhow!("management TLS initialization failed: {e:#}"))?,
+        ),
+        (None, None) => None,
+        _ => unreachable!("configuration validation requires both TLS paths"),
+    };
 
     {
         let mut bound = shared.bound.write().unwrap_or_else(|e| e.into_inner());
@@ -230,9 +247,19 @@ pub async fn start_with_auth(
     tasks.push((
         "api_server",
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(
+            if let Some(tls_config) = api_tls {
+                if let Err(e) = axum::serve(
+                    crate::tls::TlsListener::new(api_listener, tls_config),
+                    router.into_make_service_with_connect_info::<api::ClientAddr>(),
+                )
+                .with_graceful_shutdown(api_shutdown)
+                .await
+                {
+                    tracing::error!(event = "api_server_error", error = %e);
+                }
+            } else if let Err(e) = axum::serve(
                 api_listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                router.into_make_service_with_connect_info::<api::ClientAddr>(),
             )
             .with_graceful_shutdown(api_shutdown)
             .await
@@ -248,6 +275,7 @@ pub async fn start_with_auth(
         udp = %shared.bound.read().unwrap_or_else(|e| e.into_inner()).udp.map(|a| a.to_string()).unwrap_or_default(),
         tcp = %shared.bound.read().unwrap_or_else(|e| e.into_inner()).tcp.map(|a| a.to_string()).unwrap_or_default(),
         api = %shared.bound.read().unwrap_or_else(|e| e.into_inner()).api.map(|a| a.to_string()).unwrap_or_default(),
+        api_tls = shared.app.load().server.tls_enabled(),
         upstreams = shared.registry.len(),
     );
 

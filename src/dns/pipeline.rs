@@ -519,6 +519,30 @@ impl Pipeline {
             return Precheck::Drop;
         }
 
+        // ---- Zone transfers are never proxied ----
+        // AXFR/IXFR are authoritative-server operations. Forwarding them
+        // through a cache/forwarder can leak zone contents and creates
+        // multi-message/TCP state this gateway does not implement. Refuse
+        // locally after ACL/rate limiting so policy still applies first.
+        if matches!(parsed.qtype(), RecordType::AXFR | RecordType::IXFR) {
+            metrics
+                .query_errors_total
+                .with_label_values(&["zone_transfer_refused"])
+                .inc();
+            metrics
+                .client_rcode_total
+                .with_label_values(&["REFUSED"])
+                .inc();
+            let elapsed = started.elapsed();
+            metrics.query_duration.observe(elapsed.as_secs_f64());
+            shared.traffic.record_outcome(
+                client.ip(),
+                crate::traffic::Outcome::Failed,
+                Some(elapsed),
+            );
+            return Precheck::Reply(msg::error_response(&parsed, Rcode::Refused));
+        }
+
         // ---- ANY policy (RFC 8482): refuse locally with NOTIMP ----
         // After ACL and rate limiting so a denied or throttled client
         // cannot use cheap local ANY replies to bypass those gates (and
@@ -546,11 +570,17 @@ impl Pipeline {
         }
 
         // ---- Cache (enabled by default; client-specific queries always miss) ----
-        // DO-bit queries need DNSSEC records, and any EDNS option (ECS,
-        // COOKIE, ...) can make the upstream response client-specific. Both
-        // bypass the shared cache and single-flight to prevent cross-client
-        // data leakage or cache poisoning.
-        let use_cache = rt.cache.enabled && !parsed.dnssec_ok && !parsed.has_edns_options;
+        // RD=0 queries bypass the cache entirely: answering an iterative
+        // (non-recursive) request from the recursive cache leaks cached
+        // answers and can be used for cache snooping. DO-bit queries need
+        // DNSSEC records, and any EDNS option (ECS, COOKIE, ...) can make the
+        // upstream response client-specific. All three bypass both the shared
+        // cache and single-flight to prevent cross-client data leakage or
+        // cache poisoning.
+        let use_cache = rt.cache.enabled
+            && parsed.recursion_desired
+            && !parsed.dnssec_ok
+            && !parsed.has_edns_options;
         if use_cache {
             match shared.cache.get(&cache_key, parsed.id, &rt.cache) {
                 crate::cache::CacheLookup::Hit { mut bytes, rcode } => {
@@ -642,7 +672,7 @@ fn attempts_of(e: &ForwardError) -> u32 {
 mod tests {
     use super::*;
 
-    use hickory_proto::op::{MessageType, OpCode, Query as HQuery};
+    use hickory_proto::op::{MessageType, OpCode, Query as HQuery, ResponseCode};
     use hickory_proto::rr::{rdata, Name, RData, Record};
 
     use crate::config::{AnyPolicy, AppConfig};
@@ -728,8 +758,8 @@ mod tests {
 
     #[test]
     fn any_policy_refuse_answers_notimp_locally() {
-        let mut app = AppConfig::default();
-        app.query.any_policy = AnyPolicy::Refuse;
+        let app = AppConfig::default();
+        assert_eq!(app.query.any_policy, AnyPolicy::Refuse);
         let p = pipeline_with(app);
         let raw = query_bytes("example.com", "ANY");
 
@@ -765,9 +795,12 @@ mod tests {
         let out = p.precheck(client(), Transport::Udp, &raw, Instant::now());
         match out {
             Precheck::Reply(bytes) => {
-                let view = msg::parse_response(&bytes).expect("parse NOTIMP");
-                assert_eq!(view.rcode, Rcode::NotImp);
-                assert_eq!(view.id, 7);
+                // The local NOTIMP echoes the unsupported UPDATE opcode, so
+                // the upstream-response parser (Query opcode only) is not the
+                // right decoder here.
+                let reply = Message::from_vec(&bytes).expect("parse NOTIMP");
+                assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
+                assert_eq!(reply.metadata.id, 7);
             }
             _ => panic!("expected NOTIMP reply"),
         }
@@ -787,6 +820,65 @@ mod tests {
                 .get(),
             1
         );
+    }
+
+    #[test]
+    fn zone_transfers_are_refused_locally() {
+        let p = pipeline_with(AppConfig::default());
+        for qtype in ["AXFR", "IXFR"] {
+            let raw = query_bytes("example.com", qtype);
+            assert_eq!(reply_rcode(&p, &raw), Rcode::Refused);
+        }
+        assert_eq!(
+            p.shared
+                .metrics
+                .query_errors_total
+                .with_label_values(&["zone_transfer_refused"])
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn rd_zero_queries_never_read_or_write_the_cache() {
+        let mut app = AppConfig::default();
+        app.cache.enabled = true;
+        app.ratelimit.enabled = false;
+        let p = pipeline_with(app);
+
+        let mut raw = query_bytes("snoop.test", "A");
+        raw[2] &= 0xFE; // clear RD
+        let parsed = msg::parse_query(&raw).expect("parse RD=0 query");
+        assert!(!parsed.recursion_desired);
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+        let mut stored = Message::response(999, OpCode::Query);
+        stored.queries = parsed.queries.clone();
+        stored.answers.push(Record::from_rdata(
+            parsed.question().name().clone(),
+            300,
+            RData::A(rdata::A::from(std::net::Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+        let cache_cfg = p.shared.rt.load().cache.clone();
+        p.shared.cache.put(
+            key,
+            stored.to_vec().expect("encode cached response"),
+            Duration::from_secs(300),
+            Rcode::NoError,
+            &cache_cfg,
+        );
+
+        assert!(
+            matches!(
+                p.precheck(client(), Transport::Udp, &raw, Instant::now()),
+                Precheck::Proceed(_)
+            ),
+            "RD=0 must not be served from cache"
+        );
+        assert_eq!(p.shared.metrics.cache_hits_total.get(), 0);
     }
 
     #[test]

@@ -34,7 +34,7 @@ login_rate_limit_per_minute = 30
 timeout = "2s"
 upstream_timeout = "500ms"
 max_attempts = 3
-any_policy = "forward"
+any_policy = "refuse"
 
 [acl]
 allowed_cidrs = []

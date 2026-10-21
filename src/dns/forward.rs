@@ -476,10 +476,10 @@ mod tests {
     fn any_policy_refuses_locally() {
         use crate::config::{AnyPolicy, QueryConfig};
         let cfg = QueryConfig::default();
-        assert_eq!(cfg.any_policy, AnyPolicy::Forward);
-        let refuse = AnyPolicy::Refuse;
-        assert_eq!(refuse, AnyPolicy::Refuse);
-        assert_ne!(refuse, AnyPolicy::Forward);
+        assert_eq!(cfg.any_policy, AnyPolicy::Refuse);
+        let forward = AnyPolicy::Forward;
+        assert_eq!(forward, AnyPolicy::Forward);
+        assert_ne!(forward, AnyPolicy::Refuse);
     }
 
     #[test]

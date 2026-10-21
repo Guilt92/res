@@ -3365,10 +3365,9 @@ async fn config_rollback_missing_backup_is_404() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn any_policy_refuse_returns_notimp_locally() {
+async fn any_policy_refuse_is_the_default() {
     let fake = FakeUpstream::start().await;
     let mut cfg = base_config();
-    cfg.query.any_policy = res::config::AnyPolicy::Refuse;
     cfg.upstreams.push(fake.config("fake-1"));
     let gw = start_gateway(cfg).await;
     let addr = gw.udp_addr().expect("udp addr");
@@ -3389,15 +3388,52 @@ async fn any_policy_refuse_returns_notimp_locally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn any_policy_forward_default_reaches_upstream() {
+async fn rd_zero_queries_bypass_cache_and_zone_transfers_are_refused() {
     let fake = FakeUpstream::start().await;
     let mut cfg = base_config();
+    cfg.cache.enabled = true;
     cfg.upstreams.push(fake.config("fake-1"));
     let gw = start_gateway(cfg).await;
     let addr = gw.udp_addr().expect("udp addr");
 
-    // Default is Forward: the ANY query is passed upstream (fake answers
-    // with an A record regardless of type, which is fine for this check).
+    // Prime the cache with a recursive query.
+    let first = udp_query(addr, "snoop.test").await.expect("first answer");
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(fake.hits(), 1);
+
+    // The same question with RD=0 must reach the upstream instead of being
+    // answered from the recursive cache (cache snooping).
+    let mut raw = res::dns::msg::build_query("snoop.test", "A").expect("query");
+    raw[2] &= 0xFE; // clear RD
+    let iterative = udp_send_raw(addr, &raw, std::time::Duration::from_secs(2))
+        .await
+        .expect("iterative answer");
+    assert_eq!(iterative.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(fake.hits(), 2, "RD=0 query must not be served from cache");
+
+    for qtype in ["AXFR", "IXFR"] {
+        let resp = udp_query_type(addr, "example.test", qtype)
+            .await
+            .expect("transfer refusal");
+        assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
+    }
+    assert_eq!(fake.hits(), 2, "zone transfers must not reach upstream");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn any_policy_forward_can_be_opted_in() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.query.any_policy = res::config::AnyPolicy::Forward;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    // Explicit opt-in: the ANY query is passed upstream (fake answers with
+    // an A record regardless of type, which is fine for this check).
     let resp = udp_query_type(addr, "example.test", "ANY")
         .await
         .expect("response");

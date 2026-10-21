@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 
 /// Gateway-level response code classification (bounded label set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,94 +176,47 @@ pub fn servfail_for_id(id: u16, op_code: OpCode) -> Vec<u8> {
     msg.to_vec().unwrap_or_default()
 }
 
-/// Inspect an upstream response (id, rcode, truncation, question).
+/// Inspect and validate an upstream response (id, rcode, truncation, question).
 ///
-/// Hot path: only the header and the first question are decoded — the answer
-/// section is never touched. Falls back to the full `hickory-proto` decoder
-/// for unusual encodings (compressed question names) so behaviour stays
-/// correct for every message the full parser accepts.
+/// Security-critical: the whole message is decoded, not just the header. A
+/// response must be a QR=1 Query-opcode message with exactly one question;
+/// malformed sections, compression loops, trailing garbage and QDCOUNT=0 are
+/// rejected instead of being correlated by transaction id alone.
 pub fn parse_response(bytes: &[u8]) -> Result<ResponseView, String> {
     if bytes.len() < 12 {
         return Err("short response".into());
     }
-    let id = u16::from_be_bytes([bytes[0], bytes[1]]);
-    let flags = u16::from_be_bytes([bytes[2], bytes[3]]);
-    if flags & 0x8000 == 0 {
+    let mut decoder = BinDecoder::new(bytes);
+    let msg = Message::read(&mut decoder).map_err(|e| format!("decode error: {e}"))?;
+    if !decoder.is_empty() {
+        return Err(format!(
+            "trailing bytes after DNS message ({} unread)",
+            decoder.len()
+        ));
+    }
+    if msg.metadata.message_type != MessageType::Response {
         return Err("message is not a response".into());
     }
-    let truncated = flags & 0x0200 != 0;
-    let rcode = rcode_from_bits((flags & 0x000F) as u8);
-    let qdcount = u16::from_be_bytes([bytes[4], bytes[5]]);
-
-    let question = if qdcount == 0 {
-        None
-    } else {
-        match parse_question_wire(bytes, 12) {
-            Some(q) => Some(q),
-            // Compressed/unusual question section: full decode (rare).
-            None => {
-                let msg = Message::from_vec(bytes).map_err(|e| format!("decode error: {e}"))?;
-                if msg.metadata.message_type != MessageType::Response {
-                    return Err("message is not a response".into());
-                }
-                msg.queries.first().map(|q| {
-                    (
-                        q.name().to_ascii().to_lowercase(),
-                        u16::from(q.query_type()),
-                        u16::from(q.query_class()),
-                    )
-                })
-            }
-        }
-    };
+    if msg.metadata.op_code != OpCode::Query {
+        return Err("response has a non-query opcode".into());
+    }
+    if msg.queries.len() != 1 {
+        return Err(format!(
+            "response must contain exactly one question (got {})",
+            msg.queries.len()
+        ));
+    }
+    let q = &msg.queries[0];
     Ok(ResponseView {
-        id,
-        rcode,
-        truncated,
-        question,
+        id: msg.metadata.id,
+        rcode: Rcode::from_response_code(msg.metadata.response_code),
+        truncated: msg.metadata.truncation,
+        question: Some((
+            q.name().to_ascii().to_lowercase(),
+            u16::from(q.query_type()),
+            u16::from(q.query_class()),
+        )),
     })
-}
-
-/// Map the 4-bit header rcode (extended rcodes are out of scope here; they
-/// only appear in EDNS version-negotiation edge cases and are classified as
-/// `Other` via their low nibble).
-fn rcode_from_bits(bits: u8) -> Rcode {
-    match bits {
-        0 => Rcode::NoError,
-        1 => Rcode::FormErr,
-        2 => Rcode::ServFail,
-        3 => Rcode::NXDomain,
-        4 => Rcode::NotImp,
-        5 => Rcode::Refused,
-        _ => Rcode::Other,
-    }
-}
-
-/// Decode one question at `pos`. Returns `None` when the name uses a
-/// compression pointer (callers fall back to the full decoder).
-fn parse_question_wire(bytes: &[u8], pos: usize) -> Option<(String, u16, u16)> {
-    let mut name = String::new();
-    let mut p = pos;
-    loop {
-        let len = *bytes.get(p)?;
-        if len == 0 {
-            p += 1;
-            break;
-        }
-        if len & 0xC0 != 0 {
-            return None; // compression pointer: not handled here
-        }
-        let label = bytes.get(p + 1..p + 1 + len as usize)?;
-        if !name.is_empty() {
-            name.push('.');
-        }
-        name.push_str(&String::from_utf8_lossy(label).to_lowercase());
-        p += 1 + len as usize;
-    }
-    let qtype = u16::from_be_bytes([*bytes.get(p)?, *bytes.get(p + 1)?]);
-    let qclass = u16::from_be_bytes([*bytes.get(p + 2)?, *bytes.get(p + 3)?]);
-    name.push('.');
-    Some((name, qtype, qclass))
 }
 
 /// Correlate an upstream response with the query we sent.
@@ -271,9 +225,9 @@ pub fn correlates(query: &ParsedQuery, resp: &ResponseView) -> bool {
         return false;
     }
     match &resp.question {
-        // Some servers omit the question section; id + source IP/port
-        // (connected UDP socket) still protect us in that case.
-        None => true,
+        // parse_response requires a question; a view without one can never be
+        // correlated (defence in depth for internal callers).
+        None => false,
         Some((name, qtype, qclass)) => {
             let q = query.question();
             *name == q.name().to_ascii().to_lowercase()
@@ -802,6 +756,33 @@ mod tests {
         assert_eq!(view.id, q.id);
         assert_eq!(view.rcode, Rcode::Refused);
         assert_eq!(view.question.unwrap().0, "example.com.");
+    }
+
+    #[test]
+    fn response_parser_requires_exactly_one_question_and_query_opcode() {
+        let no_question = Message::response(7, OpCode::Query)
+            .to_vec()
+            .expect("encode empty response");
+        assert!(
+            parse_response(&no_question).is_err(),
+            "QDCOUNT=0 must not correlate by id alone"
+        );
+
+        let update = Message::response(7, OpCode::Update)
+            .to_vec()
+            .expect("encode UPDATE response");
+        assert!(
+            parse_response(&update).is_err(),
+            "non-query opcode must be rejected"
+        );
+
+        let mut q = sample_query();
+        q[2] |= 0x80; // QR=1
+        q.extend_from_slice(&[0xDE, 0xAD]);
+        assert!(
+            parse_response(&q).is_err(),
+            "trailing bytes must be rejected"
+        );
     }
 
     #[test]

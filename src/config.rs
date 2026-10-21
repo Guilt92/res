@@ -467,10 +467,11 @@ impl ServerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnyPolicy {
-    /// Forward `ANY` queries to upstreams like any other type (default).
-    #[default]
+    /// Forward `ANY` queries to upstreams like any other type. Not the
+    /// default because `ANY` is amplification-friendly and rarely needed.
     Forward,
-    /// Refuse `ANY` locally with NOTIMP (RFC 8482).
+    /// Refuse `ANY` locally with NOTIMP (RFC 8482). This is the default.
+    #[default]
     Refuse,
 }
 
@@ -488,8 +489,8 @@ pub struct QueryConfig {
     pub upstream_timeout_ms: u64,
     /// Maximum upstream attempts for one client query (including the first).
     pub max_attempts: u32,
-    /// How to handle `ANY` queries: forward them upstream (default) or refuse
-    /// locally with NOTIMP per RFC 8482 (anti-amplification).
+    /// How to handle `ANY` queries: refuse locally with NOTIMP per RFC 8482
+    /// (default, anti-amplification) or forward them upstream.
     pub any_policy: AnyPolicy,
 }
 
@@ -499,7 +500,7 @@ impl Default for QueryConfig {
             timeout_ms: 2_000,
             upstream_timeout_ms: 500,
             max_attempts: 3,
-            any_policy: AnyPolicy::Forward,
+            any_policy: AnyPolicy::default(),
         }
     }
 }

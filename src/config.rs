@@ -306,6 +306,11 @@ pub struct AuthConfig {
     /// deployments (a startup warning is emitted when auth is enabled on a
     /// non-loopback address without this flag).
     pub secure_cookies: bool,
+    /// Explicit development-only escape hatch: allow the control plane to run
+    /// without any password or API token. Disabled by default; when credentials
+    /// are missing the gateway refuses to start instead of silently exposing
+    /// administrative read/write routes. Never enable this in production.
+    pub allow_open_mode: bool,
     /// Maximum login attempts per client IP per minute (0 disables the
     /// per-IP limiter; per-username lockout still applies).
     pub login_rate_limit_per_minute: u32,
@@ -322,6 +327,7 @@ impl Default for AuthConfig {
             lockout_duration_ms: 15 * 60 * 1000,
             protect_metrics: false,
             secure_cookies: false,
+            allow_open_mode: false,
             login_rate_limit_per_minute: 30,
         }
     }
@@ -1073,9 +1079,17 @@ impl AppConfig {
         }
         if self.server.api_token.is_empty() {
             out.push(
-                "server.api_token is empty: configuration-changing API endpoints \
-                 (upstream create/update/delete/test, config import) are unauthenticated \
-                 unless password authentication is configured (RES_ADMIN_PASSWORD)"
+                "server.api_token is empty: API clients must sign in with a password \
+                 session; startup fails unless password auth or explicit \
+                 [auth].allow_open_mode is configured"
+                    .into(),
+            );
+        }
+        if self.auth.allow_open_mode {
+            out.push(
+                "auth.allow_open_mode is enabled: the control plane may run without any \
+                 authentication; use only for isolated development and never expose it \
+                 to untrusted networks"
                     .into(),
             );
         }

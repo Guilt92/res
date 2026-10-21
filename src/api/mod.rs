@@ -9,14 +9,14 @@
 //! queries keep the snapshot they started with and finish safely; queries
 //! accepted after the swap observe the new configuration immediately.
 //!
-//! Authentication (when a password is configured via `RES_ADMIN_PASSWORD` or
-//! the credentials file): every `/api/*` route except `/api/health` and
-//! `/api/auth/login` requires a session cookie (viewer or admin) or the
-//! legacy `Authorization: Bearer <api_token>` header. Mutations additionally
-//! require the admin role and, for cookie-authenticated requests, a matching
-//! `X-CSRF-Token` header (double-submit). When password auth is not
-//! configured, the legacy token-only posture applies: mutations require
-//! `server.api_token` (if set) and reads stay open.
+//! Authentication: whenever a password (`RES_ADMIN_PASSWORD` / credentials
+//! file) or `server.api_token` is configured, every `/api/*` route except
+//! `/api/health`, `/api/auth/info`, and `/api/auth/login` requires a session
+//! cookie (viewer or admin) or `Authorization: Bearer <api_token>`.
+//! Mutations additionally require the admin role and, for cookie-authenticated
+//! requests, a matching `X-CSRF-Token` header (double-submit). Starting with
+//! no credentials is refused unless `[auth].allow_open_mode = true` is set
+//! explicitly for isolated development.
 
 mod prom;
 
@@ -238,9 +238,8 @@ fn require_admin(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), Api
             )))
         }
         None => {
-            let token_configured = !st.shared.app.load().server.api_token.is_empty();
-            if !token_configured && !st.auth.enabled() {
-                // Development posture: no password and no token configured.
+            if !auth_configured(st) && st.auth.open_mode_allowed() {
+                // Explicit development posture: no password and no token.
                 return Ok(());
             }
             st.shared
@@ -250,6 +249,12 @@ fn require_admin(st: &ApiState, headers: &HeaderMap, op: &str) -> Result<(), Api
             ))
         }
     }
+}
+
+/// True when any control-plane credential exists (password auth or bearer
+/// token). In this mode read routes are no longer anonymous.
+fn auth_configured(st: &ApiState) -> bool {
+    st.auth.enabled() || !st.shared.app.load().server.api_token.is_empty()
 }
 
 /// Length-independent byte-wise equality (avoids early-out on first diff).
@@ -343,10 +348,12 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -
         .clone()
         .filter(|d| d.exists());
 
-    // Unauthenticated: liveness probe + login.
+    // Unauthenticated: liveness probe, login, and the capability probe the
+    // dashboard needs to choose between password and token sign-in.
     let open = Router::new()
         .route("/api/health", get(health))
-        .route("/api/auth/login", post(login));
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/info", get(auth_info));
 
     // Everything else requires a principal when password auth is enabled.
     let protected = Router::new()
@@ -563,18 +570,26 @@ fn dashboard_fallback(dir: &std::path::Path, req: &axum::extract::Request) -> Re
     }
 }
 
-/// Read-route guard: when password auth is enabled, every authenticated
-/// read route requires a live session (viewer or admin) or the bearer
-/// api_token. `/api/health` and `/api/auth/login` are registered before the
-/// route_layer and stay open. When password auth is disabled the guard is a
-/// no-op (legacy posture: reads open, mutations gated by token in handlers).
+/// Read-route guard: whenever any credential is configured (password auth or
+/// bearer token), every read route requires a live session (viewer or admin)
+/// or the bearer api_token. `/api/health`, `/api/auth/info`, and
+/// `/api/auth/login` are registered before the route_layer and stay open.
+/// Only the explicit development open mode is anonymous.
 async fn read_guard(
     State(st): State<ApiState>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !st.auth.enabled() {
-        return next.run(req).await;
+    if !auth_configured(&st) {
+        if st.auth.open_mode_allowed() {
+            return next.run(req).await;
+        }
+        return ApiError::Unauthorized(
+            "authentication is required but no credentials are configured; \
+             set server.api_token or [auth].allow_open_mode for development"
+                .into(),
+        )
+        .into_response();
     }
     match principal(&st, req.headers()) {
         Some(_) => next.run(req).await,
@@ -592,13 +607,15 @@ async fn read_guard(
 }
 
 /// `/metrics` guard: open by default (Prometheus scrapes without cookies);
-/// when `[auth].protect_metrics` is on, a principal is required.
+/// when `[auth].protect_metrics` is on and any credential is configured, a
+/// principal is required. Token-only deployments are protected too; open mode
+/// has no principal to check and therefore stays open by definition.
 async fn metrics_guard(
     State(st): State<ApiState>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !st.auth.enabled() || !st.auth.config().protect_metrics {
+    if !auth_configured(&st) || !st.auth.config().protect_metrics {
         return next.run(req).await;
     }
     match principal(&st, req.headers()) {
@@ -617,6 +634,19 @@ async fn health() -> Json<Value> {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// GET /api/auth/info — unauthenticated capability probe. Exposes only
+/// booleans so the dashboard can show password and/or token sign-in without
+/// leaking account names, token material, or session state.
+async fn auth_info(State(st): State<ApiState>) -> Json<Value> {
+    let token_auth = !st.shared.app.load().server.api_token.is_empty();
+    let password_auth = st.auth.enabled();
+    Json(json!({
+        "password_auth": password_auth,
+        "token_auth": token_auth,
+        "open_mode": !password_auth && !token_auth && st.auth.open_mode_allowed(),
     }))
 }
 
@@ -968,7 +998,8 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "generation": st.shared.config_generation(),
         },
         "auth": {
-            "required": !app.server.api_token.is_empty() || st.auth.enabled(),
+            "required": auth_configured(&st),
+            "open_mode": !auth_configured(&st) && st.auth.open_mode_allowed(),
             "password_auth": st.auth.enabled(),
             "token_auth": !app.server.api_token.is_empty(),
             "admin_username": st.auth.admin_username(),

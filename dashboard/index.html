@@ -471,6 +471,10 @@ body[data-role="viewer"] #viewer-hint{display:block}
   background:transparent!important;border:0!important;color:var(--dim)!important;
   font:600 10.5px var(--sans);padding:5px 8px!important;border-radius:6px;cursor:pointer}
 #login-box .reveal:hover{color:var(--fg)!important;background:#1b2634!important}
+.login-or{display:flex;align-items:center;gap:10px;margin:14px 0 2px;color:var(--faint);
+  font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.login-or::before,.login-or::after{content:"";flex:1;height:1px;background:var(--line2)}
+.login-or[hidden]{display:none}
 .login-submit{width:100%;margin-top:16px;border:1px solid #1f6feb!important;border-radius:8px!important;
   padding:10px 16px!important;font-size:13px!important;font-weight:600!important;background:#1f6feb!important;
   color:#fff!important;cursor:pointer}
@@ -585,18 +589,28 @@ window.addEventListener('unhandledrejection', function(e){
       </div>
     </div>
     <form id="login-form" novalidate>
-      <label for="login-user">Username</label>
-      <input id="login-user" name="username" autocomplete="username"
-             autocapitalize="none" spellcheck="false" value="admin" required>
-      <label for="login-pass">Password</label>
-      <div class="password-field">
-        <input id="login-pass" name="password" type="password"
-               autocomplete="current-password" required>
-        <button type="button" id="login-reveal" aria-label="Show password"
-                aria-pressed="false" class="reveal">Show</button>
+      <div id="login-password-block">
+        <label for="login-user">Username</label>
+        <input id="login-user" name="username" autocomplete="username"
+               autocapitalize="none" spellcheck="false" value="admin" required>
+        <label for="login-pass">Password</label>
+        <div class="password-field">
+          <input id="login-pass" name="password" type="password"
+                 autocomplete="current-password" required>
+          <button type="button" id="login-reveal" aria-label="Show password"
+                  aria-pressed="false" class="reveal">Show</button>
+        </div>
+      </div>
+      <div id="login-token-block" hidden>
+        <div class="login-or" id="login-or"><span>or</span></div>
+        <label for="login-token">API token</label>
+        <input id="login-token" name="api_token" type="password"
+               autocomplete="off" autocapitalize="none" spellcheck="false"
+               placeholder="Bearer token from server.api_token">
       </div>
       <div id="login-msg" role="alert" aria-live="polite"></div>
       <button id="login-go" class="login-submit" type="submit">Sign in</button>
+      <button id="login-token-go" class="login-submit" type="button" hidden>Use API token</button>
       <button id="login-retry" class="login-retry" type="button" hidden>Retry connection</button>
     </form>
     <div class="login-foot">
@@ -1350,11 +1364,18 @@ const CHARTS = [
 /* =========================================================================
  * Helpers
  * ====================================================================== */
+function authHeaders(extra){
+  const h = Object.assign({}, extra || {});
+  const tok = umgToken();
+  if (tok) h["Authorization"] = "Bearer " + tok;
+  return h;
+}
 async function getJSON(path, timeoutMs=6000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(path, {signal: ctl.signal, cache: "no-store", credentials: "same-origin"});
+    const r = await fetch(path, {signal: ctl.signal, cache: "no-store", credentials: "same-origin",
+      headers: authHeaders()});
     if (r.status === 401) {
       authNeeded();
       const j = await r.json().catch(() => ({}));
@@ -1368,7 +1389,8 @@ async function getJSON(path, timeoutMs=6000) {
 }
 
 /* ---------- session / login ---------- */
-const AUTH = { needed: false, open: false, role: null, user: null };
+const AUTH = { needed: false, open: false, role: null, user: null,
+  passwordAuth: false, tokenAuth: false };
 let loginReturnFocus = null;
 
 function canWrite(){ return !AUTH.needed && (AUTH.open || AUTH.role === "admin"); }
@@ -1391,10 +1413,24 @@ function loginMessage(text, cls){
   msg.className = cls || "";
 }
 function setLoginBusy(on){
-  const b = $("login-go");
-  b.disabled = on;
-  b.setAttribute("aria-busy", on ? "true" : "false");
-  b.textContent = on ? "Signing in…" : "Sign in";
+  for (const [id, idle] of [["login-go","Sign in"],["login-token-go","Use API token"]]){
+    const b = $(id);
+    b.disabled = on;
+    b.setAttribute("aria-busy", on ? "true" : "false");
+    b.textContent = on ? "Signing in…" : idle;
+  }
+}
+function applyLoginMode(passwordAuth, tokenAuth){
+  AUTH.passwordAuth = !!passwordAuth;
+  AUTH.tokenAuth = !!tokenAuth;
+  $("login-password-block").hidden = !AUTH.passwordAuth;
+  $("login-token-block").hidden = !AUTH.tokenAuth;
+  $("login-go").hidden = !AUTH.passwordAuth;
+  $("login-token-go").hidden = !AUTH.tokenAuth;
+  $("login-or").hidden = !(AUTH.passwordAuth && AUTH.tokenAuth);
+  $("login-subtitle").textContent = AUTH.passwordAuth
+    ? "Use the admin or viewer account configured for this gateway."
+    : "Enter the API token configured as server.api_token.";
 }
 function showLogin(){
   const ov = $("login-ov");
@@ -1407,7 +1443,9 @@ function showLogin(){
   setAppInert(true);
   $("login-retry").hidden = true;
   if (!wasOpen){
-    const target = $("login-user").value.trim() ? $("login-pass") : $("login-user");
+    let target;
+    if (!AUTH.passwordAuth && AUTH.tokenAuth) target = $("login-token");
+    else target = $("login-user").value.trim() ? $("login-pass") : $("login-user");
     setTimeout(() => { try { target.focus(); } catch(_){} }, 0);
   }
 }
@@ -1432,7 +1470,8 @@ function authNeeded(){
 }
 async function checkSession(silent){
   try {
-    const r = await fetch("/api/auth/session", {cache:"no-store", credentials:"same-origin"});
+    const r = await fetch("/api/auth/session", {cache:"no-store", credentials:"same-origin",
+      headers: authHeaders()});
     if (r.ok){
       const j = await r.json().catch(() => ({}));
       AUTH.needed = false; AUTH.open = false;
@@ -1441,21 +1480,24 @@ async function checkSession(silent){
       return true;
     }
     if (r.status === 401 || r.status === 404){
-      // When password auth is disabled the session route still answers 401,
-      // so distinguish open mode from a locked gateway via the public status
-      // probe. Never assume open mode from an auth failure alone.
-      const s = await fetch("/api/status", {cache:"no-store", credentials:"same-origin"});
-      if (s.ok){
-        AUTH.needed = false; AUTH.open = true; AUTH.role = "admin"; AUTH.user = null;
-        hideLogin(); renderAuthChip();
-        return true;
-      }
-      if (s.status === 401 || s.status === 403){
+      // The public capability probe distinguishes open mode from password
+      // and token-only deployments. Never infer open mode from a 401 alone.
+      const info = await fetch("/api/auth/info", {cache:"no-store", credentials:"same-origin"});
+      if (info.ok){
+        const j = await info.json().catch(() => ({}));
+        applyLoginMode(j.password_auth, j.token_auth);
+        if (j.open_mode){
+          AUTH.needed = false; AUTH.open = true; AUTH.role = "admin"; AUTH.user = null;
+          hideLogin(); renderAuthChip();
+          return true;
+        }
+        // A rejected bearer token must not be retried forever.
+        if (umgToken()){ umgSetToken(""); const t = $("umg-token"); if (t) t.value = ""; }
         AUTH.needed = true; AUTH.open = false; AUTH.role = null; AUTH.user = null;
         renderAuthChip(); showLogin();
         return false;
       }
-      throw new Error("status probe HTTP " + s.status);
+      throw new Error("auth info HTTP " + info.status);
     }
     throw new Error("session HTTP " + r.status);
   } catch(e){
@@ -1466,6 +1508,37 @@ async function checkSession(silent){
     loginMessage("Control-plane API unreachable: " + e.message, "");
     $("login-retry").hidden = false;
     return false;
+  }
+}
+async function doTokenLogin(){
+  const tok = $("login-token").value.trim();
+  if (!tok){
+    loginMessage("Enter the API token.", "");
+    $("login-token").focus();
+    return;
+  }
+  loginMessage("", "");
+  setLoginBusy(true);
+  try {
+    const r = await fetch("/api/auth/session", {cache:"no-store", credentials:"same-origin",
+      headers: {"Authorization": "Bearer " + tok}});
+    if (!r.ok){
+      loginMessage(r.status === 401 ? "The API token was rejected." : ("Token check failed (HTTP " + r.status + ")."), "");
+      return;
+    }
+    const j = await r.json().catch(() => ({}));
+    umgSetToken(tok);
+    AUTH.needed = false; AUTH.open = false;
+    AUTH.role = j.role || "admin"; AUTH.user = j.username || "(api_token)";
+    $("login-token").value = "";
+    loginMessage("", "");
+    hideLogin(); renderAuthChip();
+    await startPortal();
+  } catch(e){
+    loginMessage("Token check failed: " + e.message, "");
+    $("login-retry").hidden = false;
+  } finally {
+    setLoginBusy(false);
   }
 }
 async function doLogin(){
@@ -3497,6 +3570,10 @@ function wire(){
   $("sel-reload").addEventListener("click", loadHealthSelection);
   // Login / session
   $("login-form").addEventListener("submit", e => { e.preventDefault(); doLogin(); });
+  $("login-token-go").addEventListener("click", doTokenLogin);
+  $("login-token").addEventListener("keydown", e => {
+    if (e.key === "Enter"){ e.preventDefault(); doTokenLogin(); }
+  });
   $("login-user").addEventListener("keydown", e => {
     if (e.key === "Enter"){ e.preventDefault(); $("login-pass").focus(); }
   });

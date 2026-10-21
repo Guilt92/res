@@ -106,16 +106,41 @@ pub async fn start_with_auth(
     config_path: Option<PathBuf>,
     auth: Arc<crate::auth::AuthState>,
 ) -> anyhow::Result<Gateway> {
+    let token_configured = !app.server.api_token.is_empty();
+    let auth_configured = auth.enabled() || token_configured;
+    if !auth_configured && !auth.open_mode_allowed() {
+        anyhow::bail!(
+            "no control-plane credentials configured: set RES_ADMIN_PASSWORD, \
+             create a res.credentials file, or configure server.api_token. \
+             To run an explicitly unauthenticated development instance, set \
+             [auth].allow_open_mode = true (never in production)."
+        );
+    }
+    if auth_configured && auth.open_mode_allowed() {
+        tracing::warn!(
+            event = "open_mode_ignored",
+            note = "auth.allow_open_mode is true but credentials are configured; \
+                    authentication remains enforced"
+        );
+    }
+    if auth.admin_username().is_none() && !token_configured {
+        tracing::warn!(
+            event = "admin_login_unavailable",
+            note = "no admin password and no server.api_token: the viewer account \
+                    (if any) can read, but no principal can change configuration"
+        );
+    }
+
     let shared = Shared::new(app)?;
     if let Some(p) = config_path.clone() {
         let _ = shared.config_path.set(p);
     }
 
-    if !auth.enabled() {
+    if !auth_configured {
         tracing::warn!(
-            event = "auth_disabled",
-            note = "no password configured (RES_ADMIN_PASSWORD / credentials file); \
-                    the control plane relies on server.api_token or is open"
+            event = "open_mode_enabled",
+            note = "explicit development open mode: the control plane has no \
+                    authentication and must not be exposed to untrusted networks"
         );
     } else if !auth.secure_cookies() {
         let api_ip = shared.app.load().server.api_addr.ip();

@@ -133,9 +133,10 @@ into the TOML itself:
 * `RES_ADMIN_PASSWORD` — `admin`, full access (login, mutations).
 * `RES_VIEWER_PASSWORD` — `viewer`, read-only (all `GET`s; every mutation is
   rejected with 403).
-* Optional `[server].api_token` / `RES_API_TOKEN` — legacy
-  `Authorization: Bearer` auth for scripts; when set it is *also* required
-  for mutations even for cookie sessions.
+* Optional `[server].api_token` / `RES_API_TOKEN` — `Authorization: Bearer`
+  auth for scripts. When set, every API read and mutation requires either
+  this token or a password session (token-only deployments get a token login
+  in the dashboard).
 
 Behaviour: session cookie (`HttpOnly`, `SameSite=Strict`) plus a CSRF
 double-submit token for cookie-authenticated mutations; `[auth]` section
@@ -144,8 +145,10 @@ within `lockout_window`, held for `lockout_duration`), per-IP login
 throttling (`login_rate_limit_per_minute`; `0` disables) and
 `secure_cookies` (set `true` behind HTTPS). Password rotation
 (`POST /api/auth/rotate-password`) re-hashes the credential **and revokes
-every existing session**. With no passwords configured the gateway falls
-back to the legacy open-read/token posture and warns loudly at startup.
+every existing session**. Credentials are required by default: startup fails
+when neither a password nor an API token is configured. Isolated development
+instances can set `[auth].allow_open_mode = true`; the gateway then logs a
+prominent warning and the dashboard labels the session as unauthenticated.
 
 ## Exposing the dashboard (reverse proxy / HTTPS)
 
@@ -162,8 +165,9 @@ The binary speaks plain HTTP only — terminate TLS in front of it:
 * API concurrency is bounded (256 in-flight, 5 s wait) and sheds load with
   `503`; a reverse proxy can add its own connection limits.
 * `/metrics` is unauthenticated by default for Prometheus scrapes on the
-  internal network; set `[auth].protect_metrics = true` (with an
-  `api_token`) if it is reachable more widely — never expose it publicly.
+  internal network; set `[auth].protect_metrics = true` if it is reachable
+  more widely. When any credential is configured, scrapers must present the
+  bearer token or a session — never expose metrics publicly.
 
 ## API & monitoring
 
@@ -197,9 +201,10 @@ temp-file + fsync + rename write that keeps `res.toml.backup`.
 Safety properties:
 
 * **Admin token** — set `[server].api_token` (or `RES_API_TOKEN`) to require
-  `Authorization: Bearer <token>` on every configuration-changing endpoint.
-  Empty token keeps the open development posture (a startup warning is
-  emitted). The dashboard stores the token in the browser only.
+  `Authorization: Bearer <token>` on API reads and mutations. Without a token
+  or password the gateway refuses to start unless
+  `[auth].allow_open_mode = true` is set explicitly. The dashboard keeps a
+  manually entered token in `sessionStorage` only.
 * **Optimistic concurrency** — mutations accept an optional `generation`
   (from `GET /api/upstreams`); a stale generation is rejected with `409`.
 * **Last-upstream guard** — disabling or removing the last enabled upstream
@@ -271,7 +276,7 @@ Deliberate scope decisions, so nothing here surprises an operator:
   throttle) see the socket peer; rate-limit at the proxy for real client
   IPs. DNS is unaffected.
 * **`/metrics` is open by default** (Prometheus scrape model);
-  `protect_metrics` + `api_token` gate it when needed.
+  `protect_metrics` gates it whenever a password or API token is configured.
 * **Top-clients/top-domains are bounded, not decaying** — capped by
   configured entry limits and evicted FIFO; entries do not age out over
   time on their own.

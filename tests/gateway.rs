@@ -1656,8 +1656,10 @@ async fn upstream_management_requires_admin_token_when_configured() {
     let gw = start_gateway(cfg).await;
     let api = gw.api_addr().expect("api addr");
 
-    // Read-only endpoints stay open.
+    // A bearer token is a credential: reads require it too.
     let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = http_auth("GET", api, "/api/upstreams", None, Some("sekrit-token")).await;
     assert_eq!(status, 200, "{body}");
 
     // Mutations without / with a wrong token are rejected and audited.
@@ -1724,10 +1726,11 @@ async fn upstream_management_requires_admin_token_when_configured() {
     assert_eq!(status, 200, "{body}");
 
     // Status advertises that auth is required; audit ring holds the denials.
-    let (status, body) = http("GET", api, "/api/status", None).await;
+    let (status, body) = http_auth("GET", api, "/api/status", None, Some("sekrit-token")).await;
     assert_eq!(status, 200);
     assert!(body.contains("\"required\":true"), "{body}");
-    let (_, body) = http("GET", api, "/api/config/events", None).await;
+    assert!(body.contains("\"open_mode\":false"), "{body}");
+    let (_, body) = http_auth("GET", api, "/api/config/events", None, Some("sekrit-token")).await;
     assert!(body.contains("unauthorized"), "{body}");
 
     gw.shutdown().await;
@@ -2185,6 +2188,85 @@ async fn manual_upstream_test_reports_probe_result() {
 // ---------------------------------------------------------------------------
 // Auth integration tests
 // ---------------------------------------------------------------------------
+
+/// Production default is fail-closed: missing credentials must abort startup
+/// unless the operator explicitly enables development open mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auth_startup_refuses_missing_credentials_without_explicit_open_mode() {
+    let mut cfg = base_config();
+    cfg.auth.allow_open_mode = false;
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        None,
+        None,
+    ));
+    let err = res::runtime::start_with_auth(cfg.clone(), None, auth)
+        .await
+        .err()
+        .expect("startup must fail without credentials");
+    assert!(
+        err.to_string().contains("no control-plane credentials"),
+        "unexpected error: {err}"
+    );
+
+    // The same configuration starts only after the explicit escape hatch.
+    cfg.auth.allow_open_mode = true;
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        None,
+        None,
+    ));
+    let gw = res::runtime::start_with_auth(cfg, None, auth)
+        .await
+        .expect("explicit open mode must start");
+    let api = gw.api_addr().expect("api addr");
+    let (status, body) = http("GET", api, "/api/auth/info", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("json")["open_mode"],
+        true,
+        "{body}"
+    );
+    gw.shutdown().await;
+}
+
+/// A bearer token must protect reads as well as mutations, and
+/// `[auth].protect_metrics` must also work when there is no password auth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_only_auth_guards_reads_and_metrics() {
+    let mut cfg = base_config();
+    cfg.auth.allow_open_mode = false;
+    cfg.auth.protect_metrics = true;
+    cfg.server.api_token = "sekrit-token".into();
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        None,
+        None,
+    ));
+    let gw = res::runtime::start_with_auth(cfg, None, auth)
+        .await
+        .expect("token-only gateway should start");
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/auth/info", None).await;
+    assert_eq!(status, 200, "{body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(info["password_auth"], false, "{body}");
+    assert_eq!(info["token_auth"], true, "{body}");
+    assert_eq!(info["open_mode"], false, "{body}");
+
+    let (status, body) = http("GET", api, "/api/status", None).await;
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = http_auth("GET", api, "/api/status", None, Some("sekrit-token")).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = http("GET", api, "/metrics", None).await;
+    assert_eq!(status, 401, "{body}");
+    let (status, _) = http_auth("GET", api, "/metrics", None, Some("sekrit-token")).await;
+    assert_eq!(status, 200);
+
+    gw.shutdown().await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_login_session_and_logout_flow() {
@@ -2685,7 +2767,7 @@ async fn acl_put_accepts_structured_entries_and_bare_ips() {
     assert_eq!(v["denied_count"], 1, "{body}");
 
     // GET reflects the new entry list.
-    let (status, body) = http("GET", api, "/api/acl", None).await;
+    let (status, body) = http_auth("GET", api, "/api/acl", None, Some("sekrit")).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["entries"].as_array().expect("entries").len(), 2);
@@ -2916,7 +2998,7 @@ async fn cache_put_updates_settings_and_persists() {
     assert_eq!(v["negative_max_ttl_secs"], 10, "{body}");
 
     // Settings are live: GET reflects the new values.
-    let (status, body) = http("GET", api, "/api/cache", None).await;
+    let (status, body) = http_auth("GET", api, "/api/cache", None, Some("sekrit")).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["max_entries"], 64, "{body}");
@@ -2962,7 +3044,7 @@ async fn cache_disabling_via_put_clears_entries() {
     let _ = udp_query(udp, "warm.test").await.expect("response");
     assert_eq!(fake.hits(), 1, "second query must be a cache hit");
 
-    let (status, body) = http("GET", api, "/api/cache", None).await;
+    let (status, body) = http_auth("GET", api, "/api/cache", None, Some("sekrit")).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert!(v["entries"].as_u64().unwrap_or(0) >= 1, "{body}");
@@ -3123,7 +3205,7 @@ async fn config_rollback_restores_backup() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["status"], "ok", "{body}");
 
-    let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    let (status, body) = http_auth("GET", api, "/api/upstreams", None, Some("sekrit")).await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let names: Vec<String> = v["upstreams"]

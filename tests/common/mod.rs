@@ -259,6 +259,9 @@ pub fn base_config() -> AppConfig {
     cfg.health.enabled = false;
     cfg.cache.enabled = false;
     cfg.upstreams.clear();
+    // Tests intentionally start without credentials; the production default
+    // is fail-closed, so opt in explicitly here.
+    cfg.auth.allow_open_mode = true;
     cfg
 }
 

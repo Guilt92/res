@@ -5,9 +5,9 @@
 //! Credentials come from the environment (`RES_ADMIN_PASSWORD`,
 //! `RES_VIEWER_PASSWORD`) or from a mode-0600 credentials file written next
 //! to the configuration on first setup. Passwords are never stored in the
-//! TOML configuration and never logged. When no password is configured the
-//! control plane falls back to the legacy `server.api_token` behaviour (or a
-//! fully open development posture with a startup warning).
+//! TOML configuration and never logged. With no password the control plane can
+//! still authenticate via `server.api_token`; with neither, startup fails
+//! unless the operator explicitly enables `[auth].allow_open_mode`.
 //!
 //! The DNS data plane never touches this module: authentication protects the
 //! HTTP management plane only.
@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AuthConfig;
 
+/// Minimum accepted password length for environment/file provisioning.
+pub const MIN_PASSWORD_LEN: usize = 8;
 /// Hard cap on concurrent sessions (oldest-expiring session is evicted).
 const MAX_SESSIONS: usize = 1024;
 /// Hard cap on tracked failed-login accounts (oldest window is evicted).
@@ -185,6 +187,18 @@ impl AuthState {
     pub fn load(cfg: AuthConfig, config_path: Option<&Path>) -> Result<Self, String> {
         let env_admin = nonempty_env("RES_ADMIN_PASSWORD");
         let env_viewer = nonempty_env("RES_VIEWER_PASSWORD");
+        for (name, value) in [
+            ("RES_ADMIN_PASSWORD", env_admin.as_deref()),
+            ("RES_VIEWER_PASSWORD", env_viewer.as_deref()),
+        ] {
+            if let Some(password) = value {
+                if password.len() < MIN_PASSWORD_LEN {
+                    return Err(format!(
+                        "{name} must be at least {MIN_PASSWORD_LEN} characters"
+                    ));
+                }
+            }
+        }
         if env_admin.is_some() || env_viewer.is_some() {
             let state = Self::from_passwords(cfg.clone(), env_admin.clone(), env_viewer.clone());
             // Persist hashes so a restart without the env vars still works.
@@ -299,6 +313,12 @@ impl AuthState {
 
     pub fn secure_cookies(&self) -> bool {
         self.cfg.secure_cookies
+    }
+
+    /// True only when the operator explicitly opted into the unauthenticated
+    /// development posture. The data plane never relies on this flag.
+    pub fn open_mode_allowed(&self) -> bool {
+        self.cfg.allow_open_mode
     }
 
     /// Per-IP login rate limit. Returns `Ok(())` when the attempt may

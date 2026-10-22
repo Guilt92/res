@@ -3873,9 +3873,35 @@ async fn dashboard_fallback_is_hardened() {
     assert!(head.contains("x-frame-options: deny"), "{head}");
     assert!(head.contains("referrer-policy: no-referrer"), "{head}");
     assert!(
+        head.contains("content-security-policy: default-src 'none'; script-src 'self'"),
+        "CSP missing or weakened: {head}"
+    );
+    assert!(
+        !head.contains("script-src 'self' 'unsafe-inline'")
+            && !head.contains("script-src 'unsafe-inline'")
+            && !head.contains("script-src 'self' 'unsafe-eval'"),
+        "scripts must not allow inline/eval: {head}"
+    );
+    assert!(
         raw.contains("res · Observability"),
         "index body must be served"
     );
+    assert!(
+        !raw.contains("<style") && !raw.contains("<script>"),
+        "index must not carry inline style/script blocks"
+    );
+
+    // Split dashboard assets are same-origin files with correct MIME types.
+    for (path, mime) in [
+        ("/app.css", "content-type: text/css"),
+        ("/app.js", "content-type: application/javascript"),
+        ("/boot.js", "content-type: application/javascript"),
+    ] {
+        let raw = http_raw("GET", api, path, None, &[]).await;
+        let head = raw.split("\r\n\r\n").next().unwrap_or("").to_lowercase();
+        assert!(raw.contains(" 200"), "{path} must be served");
+        assert!(head.contains(mime), "{path} mime: {head}");
+    }
 
     // Fonts still resolve with their MIME type.
     let (status, body) = http("GET", api, "/fonts/Shabnam.ttf", None).await;
@@ -3928,6 +3954,10 @@ async fn api_responses_carry_security_headers() {
     assert!(head.contains("x-content-type-options: nosniff"), "{head}");
     assert!(head.contains("x-frame-options: deny"), "{head}");
     assert!(head.contains("referrer-policy: no-referrer"), "{head}");
+    assert!(
+        head.contains("content-security-policy: default-src 'none'"),
+        "CSP missing on API responses: {head}"
+    );
     assert!(
         head.contains("cache-control: no-store"),
         "API payloads must not be cached: {head}"

@@ -475,12 +475,15 @@ async fn api_concurrency(
     }
 }
 
+/// Dashboard assets are external files, so scripts can be locked to `self`.
+/// `style-src-attr` permits the chart/canvas markup that still uses inline
+/// `style` attributes; inline `<style>`/`<script>` blocks are not allowed.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self';      style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:;      font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self';      frame-ancestors 'none'; object-src 'none'";
+
 /// Response headers for every API/dashboard reply: MIME sniffing off,
-/// framing off, no referrer leakage, and no shared/browser caching for
-/// authenticated API payloads (which can contain configuration and session
-/// metadata). A CSP is deliberately not set — the dashboard ships an inline
-/// script/stylesheet by design, and a hash/nonce policy would have to be
-/// kept in lockstep with `index.html` (documented in the README instead).
+/// framing off, no referrer leakage, CSP hardened for external dashboard
+/// assets, and no shared/browser caching for authenticated API payloads
+/// (which can contain configuration and session metadata).
 async fn security_headers(
     State(st): State<ApiState>,
     req: axum::extract::Request,
@@ -495,6 +498,10 @@ async fn security_headers(
         HeaderValue::from_static("nosniff"),
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        "content-security-policy",
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),

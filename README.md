@@ -337,9 +337,13 @@ Deliberate scope decisions, so nothing here surprises an operator:
 * **API concurrency is bounded** (256 in-flight, ≤5 s wait, then `503`)
   and **no per-IP API rate limiter** exists beyond the login throttle —
   front it with a reverse proxy for public exposure.
-* **No CSP header** — the dashboard ships an inline script by design;
-  `nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`
-  are set on every response.
+* **Strict CSP with no inline scripts** — dashboard CSS/JavaScript is
+  served from `/app.css`, `/boot.js` and `/app.js`, allowing
+  `script-src 'self'` with no `unsafe-inline`/`unsafe-eval`.
+  `style-src-attr 'unsafe-inline'` remains for inline `style` attributes
+  used by chart/table markup; `nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer` and the rest of the CSP are set on every
+  response.
 * **Static-file fallback hardening** — unknown `/api/*` paths return JSON
   404 (never the SPA page), dotfiles and `..` are never served, missing
   assets 404 loudly.

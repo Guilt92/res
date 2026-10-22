@@ -1672,14 +1672,16 @@ async fn shared_tier_policy_sends_traffic_to_lower_tiers() {
     let gw = start_gateway(cfg).await;
     let addr = gw.udp_addr().expect("udp addr");
 
-    for i in 0..20 {
+    // 100 independent queries keep the "at least one lower-tier pick"
+    // assertion reliable; a 20-query sample occasionally flaked at 50%.
+    for i in 0..100 {
         let r = udp_query(addr, &format!("q{i}.test"))
             .await
             .expect("answer");
         assert_eq!(r.metadata.response_code, ResponseCode::NoError);
     }
     // Strict policy would give the secondary zero traffic; shared must give
-    // it roughly half of 20 queries (>= 1 is enough to prove the policy).
+    // it roughly half of 100 queries (>= 1 is enough to prove the policy).
     let sec_hits = secondary.hits();
     assert!(
         sec_hits >= 1,

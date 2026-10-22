@@ -41,6 +41,10 @@ pub struct Metrics {
     pub acl_denied_total: IntCounter,
     pub rate_limit_dropped_total: IntCounter,
     pub overload_dropped_total: IntCounter,
+    /// UDP answers replaced with TC=1 by response-rate limiting.
+    pub rrl_truncated_total: IntCounter,
+    /// UDP answers silently dropped by response-rate limiting.
+    pub rrl_dropped_total: IntCounter,
     /// Bounded query-type counters (`qtype` label from [`QTYPES`]).
     pub query_type_total: IntCounterVec,
 
@@ -189,6 +193,14 @@ impl Metrics {
         let overload_dropped_total = mk(
             "res_overload_dropped_total",
             "Queries dropped because the in-flight limit was reached",
+        );
+        let rrl_truncated_total = mk(
+            "res_rrl_truncated_total",
+            "UDP answers replaced with TC=1 by response-rate limiting",
+        );
+        let rrl_dropped_total = mk(
+            "res_rrl_dropped_total",
+            "UDP answers dropped by response-rate limiting",
         );
         let query_type_total = mk1(
             "res_query_type_total",
@@ -453,6 +465,8 @@ impl Metrics {
             &acl_denied_total,
             &rate_limit_dropped_total,
             &overload_dropped_total,
+            &rrl_truncated_total,
+            &rrl_dropped_total,
             &failovers_total,
             &cache_hits_total,
             &cache_misses_total,
@@ -536,6 +550,8 @@ impl Metrics {
             acl_denied_total,
             rate_limit_dropped_total,
             overload_dropped_total,
+            rrl_truncated_total,
+            rrl_dropped_total,
             query_type_total,
             udp_packets_received_total,
             udp_packets_sent_total,
@@ -860,6 +876,8 @@ mod tests {
             "res_failover_latency_seconds",
             "res_acl_denied_total",
             "res_rate_limit_dropped_total",
+            "res_rrl_truncated_total",
+            "res_rrl_dropped_total",
             "res_udp_inflight",
             "res_tcp_connections",
             "res_resident_memory_bytes",

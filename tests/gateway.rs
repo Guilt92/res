@@ -371,6 +371,74 @@ async fn rate_limit_drops_excess_queries() {
     fake.stop().await;
 }
 
+/// Response-rate limiting is a UDP amplification guard: repeated identical
+/// answers become TC=1 so the client can retry over TCP, while the connected
+/// TCP path still receives the complete answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rrl_truncates_repeated_udp_responses_but_not_tcp() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.rrl.enabled = true;
+    cfg.rrl.per_client_qps = 0.001;
+    cfg.rrl.burst = 2;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let udp = gw.udp_addr().expect("udp addr");
+    let tcp = gw.tcp_addr().expect("tcp addr");
+
+    let first = udp_query(udp, "rrl.test").await.expect("first answer");
+    assert!(!first.metadata.truncation);
+    let second = udp_query(udp, "rrl.test").await.expect("second answer");
+    assert!(!second.metadata.truncation);
+    let third = udp_query(udp, "rrl.test").await.expect("limited answer");
+    assert!(
+        third.metadata.truncation,
+        "third identical UDP answer must be TC=1"
+    );
+
+    let over_tcp = tcp_query(tcp, "rrl.test").await.expect("tcp answer");
+    assert!(!over_tcp.metadata.truncation);
+    assert_eq!(over_tcp.metadata.response_code, ResponseCode::NoError);
+
+    let text = gw.shared.metrics.render();
+    assert!(text.contains("res_rrl_truncated_total 1"), "{text}");
+    assert!(text.contains("res_rrl_dropped_total 0"), "{text}");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rrl_drop_action_sheds_repeated_udp_responses() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.rrl.enabled = true;
+    cfg.rrl.per_client_qps = 0.001;
+    cfg.rrl.burst = 1;
+    cfg.rrl.action = res::ratelimit::RrlAction::Drop;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let udp = gw.udp_addr().expect("udp addr");
+
+    assert!(udp_query(udp, "rrl-drop.test").await.is_some());
+    assert!(
+        udp_query_timeout(udp, "rrl-drop.test", Duration::from_millis(300))
+            .await
+            .is_none(),
+        "drop action must send nothing for the limited response"
+    );
+    assert!(gw
+        .shared
+        .metrics
+        .render()
+        .contains("res_rrl_dropped_total 1"));
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_packets_dropped_notimp_answered() {
     let fake = FakeUpstream::start().await;

@@ -1247,6 +1247,8 @@ fn build_stats(st: &ApiState) -> Value {
         "acl_denied": metrics.acl_denied_total.get(),
         "rate_limited": metrics.rate_limit_dropped_total.get(),
         "overload_dropped": metrics.overload_dropped_total.get(),
+        "rrl_truncated": metrics.rrl_truncated_total.get(),
+        "rrl_dropped": metrics.rrl_dropped_total.get(),
         "malformed": metrics.malformed_total.get(),
         "config_errors": metrics.config_errors_total.get(),
         "tcp": {

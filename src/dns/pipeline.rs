@@ -170,14 +170,21 @@ impl Pipeline {
                                     outcome,
                                     Some(elapsed),
                                 );
-                                return Some(enforce_client_udp_limit(
+                                let response = enforce_client_udp_limit(
                                     bytes,
                                     transport == Transport::Udp,
                                     prepared.parsed.has_edns,
                                     prepared.parsed.edns_payload,
                                     prepared.udp_cap,
                                     &prepared.parsed,
-                                ));
+                                );
+                                return self.apply_rrl(
+                                    client,
+                                    transport,
+                                    &prepared.parsed,
+                                    rcode,
+                                    response,
+                                );
                             }
                             // Leader's bytes cannot be aligned to this query
                             // (malformed): fall through to a direct forward
@@ -193,7 +200,14 @@ impl Pipeline {
                                 .unwrap_or_else(|e| e.into_inner())
                                 .push(elapsed);
                             self.note_forward_failure(client, transport, reason, 0, elapsed);
-                            return Some(msg::error_response(&prepared.parsed, Rcode::ServFail));
+                            let response = msg::error_response(&prepared.parsed, Rcode::ServFail);
+                            return self.apply_rrl(
+                                client,
+                                transport,
+                                &prepared.parsed,
+                                Rcode::ServFail,
+                                response,
+                            );
                         }
                         // Timeout, cancelled, or the leader vanished: fall
                         // through to a direct forward so the client still gets
@@ -333,12 +347,71 @@ impl Pipeline {
                     prepared.udp_cap,
                     &prepared.parsed,
                 );
-                Some(response)
+                self.apply_rrl(client, transport, &prepared.parsed, success.rcode, response)
             }
             Err(e) => {
                 self.note_forward_failure(client, transport, e.reason(), attempts_of(&e), elapsed);
-                Some(msg::error_response(&prepared.parsed, Rcode::ServFail))
+                let response = msg::error_response(&prepared.parsed, Rcode::ServFail);
+                self.apply_rrl(
+                    client,
+                    transport,
+                    &prepared.parsed,
+                    Rcode::ServFail,
+                    response,
+                )
             }
+        }
+    }
+
+    /// Apply UDP response-rate limiting at the final egress point. TCP is
+    /// exempt: a connected transport cannot be used for spoofed-source
+    /// amplification, and its normal query/connection limits still apply.
+    fn apply_rrl(
+        &self,
+        client: SocketAddr,
+        transport: Transport,
+        parsed: &ParsedQuery,
+        rcode: Rcode,
+        response: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        if transport != Transport::Udp {
+            return Some(response);
+        }
+        let cfg = self.shared.rt.load().rrl.clone();
+        if !cfg.enabled {
+            return Some(response);
+        }
+        let name = parsed.question().name().to_ascii();
+        if self
+            .shared
+            .rrl
+            .allow(client.ip(), &name, u16::from(parsed.qtype()), rcode, &cfg)
+        {
+            return Some(response);
+        }
+
+        let action = match cfg.action {
+            crate::ratelimit::RrlAction::Drop => {
+                self.shared.metrics.rrl_dropped_total.inc();
+                "drop"
+            }
+            crate::ratelimit::RrlAction::Truncate => {
+                self.shared.metrics.rrl_truncated_total.inc();
+                "truncate"
+            }
+        };
+        self.shared.note_system_event(
+            "rrl_limited",
+            json!({
+                "client_ip": self.shared.client_label(client.ip()),
+                "transport": transport.as_str(),
+                "action": action,
+                "rcode": rcode.as_str(),
+            }),
+        );
+        match cfg.action {
+            crate::ratelimit::RrlAction::Drop => None,
+            crate::ratelimit::RrlAction::Truncate => Some(msg::truncated_response(parsed)),
         }
     }
 
@@ -617,7 +690,10 @@ impl Pipeline {
                             rt.max_udp_packet_size as u16,
                             &parsed,
                         );
-                        return Precheck::Reply(resp);
+                        return match self.apply_rrl(client, transport, &parsed, rcode, resp) {
+                            Some(resp) => Precheck::Reply(resp),
+                            None => Precheck::Drop,
+                        };
                     }
                 }
                 crate::cache::CacheLookup::Miss => {

@@ -359,6 +359,7 @@ pub fn base_config() -> AppConfig {
     cfg.server.shutdown_grace_ms = 500;
     cfg.acl.allowed_cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
     cfg.ratelimit.enabled = false;
+    cfg.rrl.enabled = false;
     cfg.health.enabled = false;
     cfg.cache.enabled = false;
     cfg.upstreams.clear();

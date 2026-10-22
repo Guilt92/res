@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::acl::{AclConfig, AclRules};
-use crate::ratelimit::RateLimitConfig;
+use crate::ratelimit::{RateLimitConfig, RrlConfig};
 
 /// Serde helpers for human-friendly durations stored as milliseconds.
 ///
@@ -873,6 +873,7 @@ pub struct AppConfig {
     pub query: QueryConfig,
     pub acl: AclConfig,
     pub ratelimit: RateLimitConfig,
+    pub rrl: RrlConfig,
     pub failover: FailoverConfig,
     pub health: HealthConfig,
     pub selection: SelectionConfig,
@@ -1066,6 +1067,21 @@ impl AppConfig {
             }
             if self.ratelimit.max_tracked_clients == 0 {
                 return Err("ratelimit.max_tracked_clients must be > 0".into());
+            }
+        }
+
+        if self.rrl.enabled {
+            if !self.rrl.per_client_qps.is_finite() || self.rrl.per_client_qps <= 0.0 {
+                return Err("rrl.per_client_qps must be a finite value > 0".into());
+            }
+            if self.rrl.burst == 0 {
+                return Err("rrl.burst must be > 0".into());
+            }
+            if self.rrl.max_tracked_keys == 0 {
+                return Err("rrl.max_tracked_keys must be > 0".into());
+            }
+            if self.rrl.max_tracked_keys > 1_000_000 {
+                return Err("rrl.max_tracked_keys must be <= 1000000".into());
             }
         }
 
@@ -1280,6 +1296,7 @@ pub struct RuntimeConfig {
     pub upstream_tcp_fallback: bool,
     pub acl: AclRules,
     pub ratelimit: RateLimitConfig,
+    pub rrl: RrlConfig,
     pub query: QueryConfig,
     pub failover: FailoverConfig,
     pub selection: SelectionConfig,
@@ -1301,6 +1318,7 @@ impl RuntimeConfig {
             upstream_tcp_fallback: app.server.upstream_tcp_fallback,
             acl: AclRules::parse(&app.acl)?,
             ratelimit: app.ratelimit.clone(),
+            rrl: app.rrl.clone(),
             query: app.query.clone(),
             failover: app.failover.clone(),
             selection: app.selection.clone(),
@@ -1435,6 +1453,25 @@ mod tests {
             .expect("disabled plaintext upstream is inert");
         cfg.upstreams[0].enabled = true;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rrl_bounds_are_validated_even_when_hot_reloaded() {
+        let mut cfg = base();
+        cfg.server.api_token = "test-token".into();
+        cfg.rrl.enabled = true;
+        cfg.rrl.per_client_qps = 0.0;
+        assert!(cfg.validate().unwrap_err().contains("rrl.per_client_qps"));
+        cfg.rrl.per_client_qps = 10.0;
+        cfg.rrl.burst = 0;
+        assert!(cfg.validate().unwrap_err().contains("rrl.burst"));
+        cfg.rrl.burst = 10;
+        cfg.rrl.max_tracked_keys = 0;
+        assert!(cfg.validate().unwrap_err().contains("rrl.max_tracked_keys"));
+        cfg.rrl.max_tracked_keys = 1_000_001;
+        assert!(cfg.validate().unwrap_err().contains("rrl.max_tracked_keys"));
+        cfg.rrl.max_tracked_keys = 65_536;
+        cfg.validate().expect("valid RRL configuration");
     }
 
     #[test]

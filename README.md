@@ -117,10 +117,16 @@ Binaries: `res` (serve/probe), `res-loadtest`, `res-hotpath-bench`,
 ## Configuration
 
 Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
-`"500ms"`); sections `[server]`, `[query]`, `[acl]`, `[ratelimit]`,
+`"500ms"`); sections `[server]`, `[query]`, `[acl]`, `[ratelimit]`, `[rrl]`,
 `[failover]`, `[health]`, `[selection]`, `[cache]`, `[auth]`, `[logging]`,
 `[monitoring]`, `[[upstreams]]`.
 
+* `[rrl]` enables bounded response-rate limiting (default: 50 identical
+  UDP responses/s with burst 100, keyed by client, question, qtype and
+  rcode). Exceeding a bucket returns TC=1 so the client retries over TCP;
+  set `action = "drop"` to send nothing instead. TCP is not RRL-limited
+  because it cannot be used for spoofed-source amplification, and normal
+  query/connection limits still apply.
 * The config directory must be writable: the API rewrites the file
   atomically (temp + fsync + rename) and keeps `res.toml.backup` as the last
   valid version, which is loaded automatically if the primary file is broken.
@@ -295,10 +301,12 @@ Deliberate scope decisions, so nothing here surprises an operator:
 * **No DNSSEC validation** — `DO`/`CD` and DNSSEC records are passed through,
   and `DO` queries bypass the shared cache because the gateway cannot assert
   the authenticity of upstream data.
-* **No Response Rate Limiting (RRL)** — per-IP/global token buckets and the
-  fail-closed ACL are the only admission controls. A spoofed-source UDP flood
-  can bypass the per-IP bucket, and the gateway is not safe as an open
-  internet-facing resolver.
+* **Response-rate limiting is UDP-only and client-IP-keyed** — `[rrl]`
+  buckets `(client, lowercased name, qtype, rcode)` and replaces excess
+  repeated answers with TC=1 (or drops them, per `rrl.action`). This limits
+  cache/upstream-to-client amplification, but it is not a volumetric DDoS
+  defence: spoofed-source floods still reach the host, so pair it with network
+  filtering and never run as an open resolver.
 * **Upstream replies are fully decoded and strictly correlated** — QR=1,
   Query opcode, exactly one matching question, and no trailing bytes. This is
   deliberately stricter than accepting a matching transaction id alone.

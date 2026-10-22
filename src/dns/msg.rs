@@ -10,7 +10,7 @@ use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 
 /// Gateway-level response code classification (bounded label set).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rcode {
     NoError,
     FormErr,
@@ -168,6 +168,17 @@ pub fn error_response(req: &ParsedQuery, rcode: Rcode) -> Vec<u8> {
         msg.edns = Some(edns);
     }
     msg.to_vec().unwrap_or_default()
+}
+
+/// Minimal TC=1 response echoing the query (question + EDNS), telling the
+/// client to retry over TCP. Used both for oversized UDP answers and for
+/// response-rate limiting.
+pub fn truncated_response(req: &ParsedQuery) -> Vec<u8> {
+    let mut stub = error_response(req, Rcode::NoError);
+    if stub.len() >= 4 {
+        stub[2] |= 0x02; // TC
+    }
+    stub
 }
 
 /// Build a local SERVFAIL for a query whose header could still be read.

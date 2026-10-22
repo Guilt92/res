@@ -20,7 +20,7 @@ use crate::dns::listener::Counter;
 use crate::events::{Event, EventLogs};
 use crate::history::HistoryStore;
 use crate::metrics::Metrics;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{RateLimiter, ResponseRateLimiter};
 use crate::selection::{build_selector, SelectorHandle, UpstreamSelector};
 use crate::upstream::latency::{LatencyStats, LatencyWindow};
 use crate::upstream::Registry;
@@ -47,6 +47,8 @@ pub struct Shared {
     /// onto one upstream query (leader/follower), avoiding thundering herds.
     pub singleflight: Arc<crate::cache::SingleFlight>,
     pub ratelimit: RateLimiter,
+    /// Per-client response-rate limiting for client-facing UDP answers.
+    pub rrl: ResponseRateLimiter,
     /// Bounded in-memory event rings (config / health / failover / system).
     pub events: Arc<EventLogs>,
     /// Multi-resolution time series for the dashboard (sampled 1/s).
@@ -150,6 +152,7 @@ impl Shared {
             cache: DnsCache::new(),
             singleflight: crate::cache::SingleFlight::new(),
             ratelimit: RateLimiter::new(),
+            rrl: ResponseRateLimiter::new(),
             events: Arc::new(EventLogs::new()),
             history: HistoryStore::new(),
             traffic,
@@ -225,6 +228,11 @@ impl Shared {
         self.selector.store(Arc::new(SelectorHandle::new(selector)));
         self.rt.store(Arc::new(rt));
         self.app.store(Arc::new(next));
+        if !self.rt.load().rrl.enabled {
+            self.rrl.clear();
+        } else {
+            self.rrl.trim_to(self.rt.load().rrl.max_tracked_keys);
+        }
         // Trim the cache to the new capacity (or clear it when disabled) so a
         // smaller `max_entries` never leaves an oversized cache resident.
         let new_rt = self.rt.load();

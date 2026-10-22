@@ -431,11 +431,7 @@ pub fn enforce_client_udp_limit(
 /// Minimal TC=1 response echoing the query (question + EDNS), telling the
 /// client to retry over TCP.
 fn tc_stub(parsed_query: &ParsedQuery) -> Vec<u8> {
-    let mut stub = msg::error_response(parsed_query, msg::Rcode::NoError);
-    if stub.len() >= 4 {
-        stub[2] |= 0x02; // TC
-    }
-    stub
+    msg::truncated_response(parsed_query)
 }
 
 #[cfg(test)]

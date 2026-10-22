@@ -23,6 +23,8 @@
 //! * `shared` – atomically swappable configuration + shared state
 //! * `runtime` – orchestration and graceful shutdown
 
+#![recursion_limit = "256"]
+
 pub mod acl;
 pub mod api;
 pub mod auth;

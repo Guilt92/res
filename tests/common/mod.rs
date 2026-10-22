@@ -319,6 +319,14 @@ pub struct FakeTlsUpstream {
 
 impl FakeTlsUpstream {
     pub async fn start() -> Self {
+        Self::start_inner(false).await
+    }
+
+    pub async fn start_silent() -> Self {
+        Self::start_inner(true).await
+    }
+
+    async fn start_inner(silent: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tls");
         let addr = listener.local_addr().expect("tls addr");
         let config = res::tls::load_server_config(
@@ -355,6 +363,9 @@ impl FakeTlsUpstream {
                             return;
                         };
                         hits.fetch_add(1, Ordering::SeqCst);
+                        if silent {
+                            std::future::pending::<()>().await;
+                        }
                         let Some(resp) = build_response(&query, false, ANSWER, false, false) else {
                             return;
                         };

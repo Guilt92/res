@@ -162,6 +162,32 @@ async fn dot_rejects_server_name_mismatch_without_downgrade() {
     fake.stop().await;
 }
 
+/// A TLS upstream that completes the handshake then goes silent must produce
+/// SERVFAIL within the upstream budget, not hang the client or downgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_silent_upstream_fails_without_downgrade() {
+    let fake = FakeTlsUpstream::start_silent().await;
+    let mut cfg = base_config();
+    cfg.query.max_attempts = 1;
+    cfg.query.upstream_timeout_ms = 300;
+    cfg.query.timeout_ms = 1500;
+    cfg.upstreams.push(fake.config("dot-silent", "localhost"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let started = std::time::Instant::now();
+    let resp = udp_query(addr, "dot-silent.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "silent TLS upstream must respect the configured timeout"
+    );
+    assert_eq!(fake.hits(), 1, "query must reach the TLS upstream");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
 /// DoT through an authenticated upstream proxy still performs the normal TLS
 /// handshake and certificate validation inside the tunnel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

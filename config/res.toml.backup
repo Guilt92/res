@@ -10,6 +10,11 @@ max_queries_per_tcp_conn = 100
 tcp_idle_timeout_ms = 10000
 upstream_tcp_fallback = true
 shutdown_grace_ms = 5000
+# Direct HTTPS for the management API/dashboard/metrics. Set both files or
+# neither; there is no plaintext fallback. Leave unset when a reverse proxy
+# terminates TLS. HSTS is sent and session cookies are forced Secure.
+# tls_cert = "/etc/res/tls/fullchain.pem"
+# tls_key = "/etc/res/tls/privkey.pem"
 
 [auth]
 username = "admin"
@@ -20,13 +25,16 @@ lockout_window = "15m"
 lockout_duration = "15m"
 protect_metrics = false
 secure_cookies = false
+# Development-only escape hatch. Leave false in production: startup then
+# requires RES_ADMIN_PASSWORD, a credentials file, or server.api_token.
+allow_open_mode = false
 login_rate_limit_per_minute = 30
 
 [query]
 timeout = "2s"
 upstream_timeout = "500ms"
 max_attempts = 3
-any_policy = "forward"
+any_policy = "refuse"
 
 [acl]
 allowed_cidrs = []
@@ -113,11 +121,12 @@ latency_reference_ms = 50.0
 tier_policy = "strict"
 lower_tier_share = 0.0
 degraded_policy = "usable"
-min_probe_samples = 3
+min_probe_samples = 4
 
 [cache]
 enabled = true
 max_entries = 4096
+max_memory_bytes = 33554432
 min_ttl_secs = 0
 max_ttl_secs = 3600
 negative_max_ttl_secs = 30
@@ -193,3 +202,17 @@ protocol = "udp"
 enabled = true
 priority = 3
 weight = 1
+
+# DNS-over-TLS upstream example. `tls_server_name` is required (SNI and
+# certificate verification); `tls_ca_file` replaces the public WebPKI roots.
+# [[upstreams]]
+# id = 7
+# name = "cloudflare-dot"
+# address = "1.1.1.1"
+# port = 853
+# protocol = "tls"
+# tls_server_name = "cloudflare-dns.com"
+# # tls_ca_file = "/etc/res/private-dns-ca.pem"
+# enabled = true
+# priority = 1
+# weight = 1

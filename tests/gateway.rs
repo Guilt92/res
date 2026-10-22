@@ -179,6 +179,53 @@ async fn tcp_forwarding_returns_upstream_answer() {
     fake.stop().await;
 }
 
+/// IPv6 listeners use the same data/control planes. The test skips on hosts
+/// with IPv6 disabled (common in minimal CI images) instead of failing for
+/// an environment property the gateway cannot change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv6_loopback_serves_dns_and_api_when_available() {
+    if tokio::net::UdpSocket::bind("[::1]:0").await.is_err() {
+        eprintln!("skipping IPv6 test: IPv6 loopback is unavailable");
+        return;
+    }
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.server.udp_addr = "[::1]:0".parse().expect("udp addr");
+    cfg.server.tcp_addr = "[::1]:0".parse().expect("tcp addr");
+    cfg.server.api_addr = "[::1]:0".parse().expect("api addr");
+    cfg.upstreams.push(fake.config("fake-v6"));
+    let gw = start_gateway(cfg).await;
+    let udp = gw.udp_addr().expect("udp addr");
+    let tcp = gw.tcp_addr().expect("tcp addr");
+    let api = gw.api_addr().expect("api addr");
+    assert!(udp.is_ipv6() && tcp.is_ipv6() && api.is_ipv6());
+
+    let sock = tokio::net::UdpSocket::bind("[::1]:0")
+        .await
+        .expect("v6 udp");
+    sock.connect(udp).await.expect("connect v6 udp");
+    let query = res::dns::msg::build_query("ipv6.test", "A").expect("query");
+    sock.send(&query).await.expect("send v6 udp");
+    let mut buf = vec![0u8; 65_535];
+    let n = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf))
+        .await
+        .expect("v6 udp timeout")
+        .expect("v6 udp recv");
+    let resp = hickory_proto::op::Message::from_vec(&buf[..n]).expect("v6 udp parse");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(answers_ip(&resp), Some(ANSWER));
+
+    let resp = tcp_query(tcp, "ipv6.test").await.expect("v6 tcp answer");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(answers_ip(&resp), Some(ANSWER));
+
+    let (status, body) = http("GET", api, "/api/health", None).await;
+    assert_eq!(status, 200, "v6 API: {body}");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn truncated_udp_response_falls_back_to_tcp() {
     let fake = FakeUpstream::start().await;

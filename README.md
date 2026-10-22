@@ -107,6 +107,12 @@ $ RES_DNS_PUBLISH=5353 docker compose up -d --build
 $ dig @127.0.0.1 -p 5353 example.com
 ```
 
+IPv6 is supported by all three listeners. Set the addresses to `[::]`
+(dual-stack, Linux default) or `[::1]` (loopback only), e.g.
+`udp_addr = "[::]:53"` and `api_addr = "[::1]:8080"`; ACL entries must
+likewise allow the client's IPv6 prefix (`::1/128` is already listed).
+Live IPv6 DNS/API tests skip automatically when the host has IPv6 disabled.
+
 Local binary (the default config binds `:53`, so root or
 `CAP_NET_BIND_SERVICE` is required):
 

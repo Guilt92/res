@@ -11,8 +11,9 @@ rule_files:
 
 scrape_configs:
   - job_name: res
-    # docker-compose.yml sets RES_API_TOKEN + RES_PROTECT_METRICS=true, so the
-    # gateway requires this bearer token for /metrics.
+    # docker-compose.yml sets RES_METRICS_TOKEN + RES_PROTECT_METRICS=true, so
+    # /metrics accepts only this dedicated metrics bearer token (not the
+    # administrator API credential).
     authorization:
       type: Bearer
       credentials: res-metrics-token

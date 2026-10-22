@@ -342,8 +342,17 @@ pub struct AuthConfig {
     #[serde(rename = "lockout_duration", with = "duration_ms")]
     pub lockout_duration_ms: u64,
     /// Require authentication for the Prometheus /metrics endpoint (default:
-    /// open, since Prometheus scrapes without session cookies).
+    /// open, since Prometheus scrapes without session cookies). When enabled,
+    /// only `RES_METRICS_TOKEN` is accepted: administrator bearer tokens and
+    /// dashboard sessions deliberately cannot scrape metrics.
     pub protect_metrics: bool,
+    /// Dedicated metrics-only bearer credential. Environment-only
+    /// (`RES_METRICS_TOKEN`): it is never loaded from or written to TOML, so
+    /// config exports and persistence cannot leak it. It grants access to
+    /// `/metrics` and nothing else. When `protect_metrics` is enabled and this
+    /// is empty, `/metrics` fails closed with 401.
+    #[serde(skip)]
+    pub metrics_token: String,
     /// Mark session/CSRF cookies `Secure` (HTTPS-only). Enable when the
     /// management API is served over TLS; leave off for plain-HTTP LAN
     /// deployments (a startup warning is emitted when auth is enabled on a
@@ -369,6 +378,7 @@ impl Default for AuthConfig {
             lockout_window_ms: 15 * 60 * 1000,
             lockout_duration_ms: 15 * 60 * 1000,
             protect_metrics: false,
+            metrics_token: String::new(),
             secure_cookies: false,
             allow_open_mode: false,
             login_rate_limit_per_minute: 30,
@@ -917,6 +927,13 @@ impl AppConfig {
                 self.server.api_token = v;
             }
         }
+        if let Ok(v) = std::env::var("RES_METRICS_TOKEN") {
+            // Environment-only, like the Prometheus password: the scrape
+            // credential is never accepted from TOML and never serialized.
+            if !v.is_empty() {
+                self.auth.metrics_token = v;
+            }
+        }
         if let Ok(v) = std::env::var("RES_PROTECT_METRICS") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => self.auth.protect_metrics = true,
@@ -1171,6 +1188,21 @@ impl AppConfig {
                 "server.api_token is empty: API clients must sign in with a password \
                  session; startup fails unless password auth or explicit \
                  [auth].allow_open_mode is configured"
+                    .into(),
+            );
+        }
+        if self.auth.protect_metrics && self.auth.metrics_token.is_empty() {
+            out.push(
+                "auth.protect_metrics is enabled but RES_METRICS_TOKEN is empty: \
+                 /metrics will reject every request (fail closed); set a dedicated \
+                 metrics token rather than reusing the admin credential"
+                    .into(),
+            );
+        }
+        if !self.auth.protect_metrics && !self.auth.metrics_token.is_empty() {
+            out.push(
+                "RES_METRICS_TOKEN is configured but auth.protect_metrics is false: \
+                 /metrics remains unauthenticated"
                     .into(),
             );
         }
@@ -1541,6 +1573,25 @@ mod tests {
             .expect_err("password key must be rejected")
             .to_string();
         assert!(err.contains("prometheus_password"), "{err}");
+    }
+
+    /// The metrics scrape credential is env-only for the same reason as the
+    /// Prometheus password: an admin config export must never contain it.
+    #[test]
+    fn metrics_token_is_env_only() {
+        let auth = AuthConfig {
+            protect_metrics: true,
+            metrics_token: "metrics-sekrit".into(),
+            ..Default::default()
+        };
+        let out = toml::to_string(&auth).expect("serialize");
+        assert!(!out.contains("metrics-sekrit"), "token leaked: {out}");
+        assert!(!out.contains("metrics_token"), "token field leaked: {out}");
+
+        let err = toml::from_str::<AuthConfig>("metrics_token = \"x\"")
+            .expect_err("TOML metrics token must be rejected")
+            .to_string();
+        assert!(err.contains("metrics_token"), "{err}");
     }
 
     #[test]

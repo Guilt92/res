@@ -2361,13 +2361,15 @@ async fn auth_startup_refuses_missing_credentials_without_explicit_open_mode() {
     gw.shutdown().await;
 }
 
-/// A bearer token must protect reads as well as mutations, and
-/// `[auth].protect_metrics` must also work when there is no password auth.
+/// A bearer token must protect reads as well as mutations, and the metrics
+/// credential must be a distinct metrics-only principal rather than the
+/// administrator API token.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_only_auth_guards_reads_and_metrics() {
     let mut cfg = base_config();
     cfg.auth.allow_open_mode = false;
     cfg.auth.protect_metrics = true;
+    cfg.auth.metrics_token = "metrics-only-token".into();
     cfg.server.api_token = "sekrit-token".into();
     let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
         cfg.auth.clone(),
@@ -2393,8 +2395,44 @@ async fn token_only_auth_guards_reads_and_metrics() {
 
     let (status, body) = http("GET", api, "/metrics", None).await;
     assert_eq!(status, 401, "{body}");
+    let (status, body) = http_auth("GET", api, "/metrics", None, Some("sekrit-token")).await;
+    assert_eq!(status, 401, "admin token must not scrape metrics: {body}");
+    let (status, body) = http_auth("GET", api, "/metrics", None, Some("metrics-only-token")).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _) = http_auth("GET", api, "/api/status", None, Some("metrics-only-token")).await;
+    assert_eq!(
+        status, 401,
+        "metrics token must not grant control-plane access"
+    );
+
+    gw.shutdown().await;
+}
+
+/// `protect_metrics` with no dedicated token fails closed: it must not fall
+/// back to the administrator bearer token or an unauthenticated scrape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn protected_metrics_without_dedicated_token_fails_closed() {
+    let mut cfg = base_config();
+    cfg.auth.allow_open_mode = false;
+    cfg.auth.protect_metrics = true;
+    cfg.server.api_token = "sekrit-token".into();
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        None,
+        None,
+    ));
+    let gw = res::runtime::start_with_auth(cfg, None, auth)
+        .await
+        .expect("token-only gateway should start");
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, _) = http("GET", api, "/metrics", None).await;
+    assert_eq!(status, 401);
     let (status, _) = http_auth("GET", api, "/metrics", None, Some("sekrit-token")).await;
-    assert_eq!(status, 200);
+    assert_eq!(
+        status, 401,
+        "missing metrics token must not fall back to the admin token"
+    );
 
     gw.shutdown().await;
 }

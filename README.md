@@ -83,7 +83,7 @@ this deployment (no secrets manager), defined in exactly one place:
 | Dashboard/API | `:8080` | `admin` (full), `viewer` (read-only) | `RES_ADMIN_PASSWORD` / `RES_VIEWER_PASSWORD` (`docker-compose.yml`) |
 | Grafana | `:3000` | `admin` | `GF_SECURITY_ADMIN_PASSWORD` (`docker-compose.yml`) |
 | Prometheus | `:9090` | `prom` | `deploy/prometheus/web.config.yml` (`--web.config.file`) |
-| Gateway metrics scrape | `res:8080/metrics` | bearer | `RES_API_TOKEN` (`docker-compose.yml`, mirrored in `deploy/prometheus.yml`) |
+| Gateway metrics scrape | `res:8080/metrics` | bearer | `RES_METRICS_TOKEN` (`docker-compose.yml`, mirrored in `deploy/prometheus.yml`) |
 
 Each application enforces its own credential: the gateway rejects
 unauthenticated API requests with `401` (viewer mutations: `403`) and stores
@@ -128,9 +128,12 @@ Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
   `RES_PROMETHEUS_USERNAME` / `RES_PROMETHEUS_PASSWORD` (env-only, never in
   the TOML) are sent as HTTP basic auth on every proxy query when the
   Prometheus server requires it.
-* `RES_API_TOKEN` supplies the control-plane bearer token; `RES_PROTECT_METRICS`
-  (`true`/`false`) overrides `[auth].protect_metrics`. Compose sets both so
-  Prometheus scrapes `/metrics` with a bearer token.
+* `RES_API_TOKEN` supplies the control-plane bearer token.
+  `RES_METRICS_TOKEN` supplies a separate metrics-only bearer token and is
+  never loaded from or written to TOML. `RES_PROTECT_METRICS`
+  (`true`/`false`) overrides `[auth].protect_metrics`; when protection is on,
+  only `RES_METRICS_TOKEN` is accepted and a missing token fails closed.
+  Compose sets both so Prometheus can scrape without an admin credential.
 * Directories mounted into containers must be directory mounts (compose uses
   `./config:/etc/res:rw`).
 
@@ -178,10 +181,11 @@ The management API can terminate TLS itself, or sit behind a reverse proxy:
   `503`; a reverse proxy can add its own connection limits.
 * `/metrics` is unauthenticated by default for Prometheus scrapes on the
   internal network; set `[auth].protect_metrics = true` (or
-  `RES_PROTECT_METRICS=true`) if it is reachable more widely. When any
-  credential is configured, scrapers must present the bearer token or a
-  session — never expose metrics publicly. The bundled Compose stack enables
-  this and Prometheus sends `RES_API_TOKEN`.
+  `RES_PROTECT_METRICS=true`) if it is reachable more widely. Protected
+  metrics accept only the dedicated `RES_METRICS_TOKEN`, never the admin API
+  token or a dashboard session. A missing metrics token fails closed with
+  `401`. The bundled Compose stack enables this and Prometheus sends
+  `RES_METRICS_TOKEN`.
 
 **DNS-over-TLS upstreams:** set an upstream `protocol = "tls"`,
 `port = 853`, and `tls_server_name = "resolver.example"`. The certificate is
@@ -303,7 +307,8 @@ Deliberate scope decisions, so nothing here surprises an operator:
   throttle) see the socket peer; rate-limit at the proxy for real client
   IPs. DNS is unaffected.
 * **`/metrics` is open by default** (Prometheus scrape model);
-  `protect_metrics` gates it whenever a password or API token is configured.
+  `protect_metrics` requires the separate metrics-only `RES_METRICS_TOKEN`.
+  Admin tokens and sessions are deliberately rejected on `/metrics`.
 * **Top-clients/top-domains are bounded, not decaying** — capped by
   configured entry limits and evicted FIFO; entries do not age out over
   time on their own.

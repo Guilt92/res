@@ -417,7 +417,7 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -
         .route_layer(middleware::from_fn_with_state(state.clone(), read_guard));
 
     // /metrics: open by default (Prometheus scrapes it without cookies);
-    // optionally guarded when [auth].protect_metrics is on.
+    // when [auth].protect_metrics is on, only RES_METRICS_TOKEN is accepted.
     let metrics = Router::new()
         .route("/metrics", get(metrics_endpoint))
         .route_layer(middleware::from_fn_with_state(state.clone(), metrics_guard));
@@ -643,23 +643,38 @@ async fn read_guard(
     }
 }
 
-/// `/metrics` guard: open by default (Prometheus scrapes without cookies);
-/// when `[auth].protect_metrics` is on and any credential is configured, a
-/// principal is required. Token-only deployments are protected too; open mode
-/// has no principal to check and therefore stays open by definition.
+/// `/metrics` guard: open by default (Prometheus scrapes without cookies).
+/// When `[auth].protect_metrics` is on, only a dedicated metrics bearer token
+/// is accepted. Administrator API tokens and dashboard sessions are
+/// intentionally not valid here, so a leak of the scrape credential cannot
+/// grant control-plane access. If no `RES_METRICS_TOKEN` is configured the
+/// endpoint fails closed with 401 rather than falling back to another
+/// credential.
 async fn metrics_guard(
     State(st): State<ApiState>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !auth_configured(&st) || !st.auth.config().protect_metrics {
+    let (protected, configured) = {
+        let app = st.shared.app.load();
+        (app.auth.protect_metrics, app.auth.metrics_token.clone())
+    };
+    if !protected {
         return next.run(req).await;
     }
-    match principal(&st, req.headers()) {
-        Some(_) => next.run(req).await,
-        None => {
-            ApiError::Unauthorized("authentication required for /metrics".into()).into_response()
-        }
+    let provided = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !configured.is_empty() && ct_eq(provided.as_bytes(), configured.as_bytes()) {
+        next.run(req).await
+    } else {
+        ApiError::Unauthorized(
+            "metrics require the dedicated RES_METRICS_TOKEN bearer credential".into(),
+        )
+        .into_response()
     }
 }
 

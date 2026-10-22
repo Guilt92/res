@@ -57,7 +57,7 @@ impl Connected<IncomingStream<'_, crate::tls::TlsListener>> for ClientAddr {
 
 use crate::acl::{AclAction, AclConfig, AclEntry, AclRules};
 use crate::auth::{AuthState, LoginError, Role};
-use crate::config::{AppConfig, Protocol, UpstreamConfig};
+use crate::config::{AppConfig, Protocol, ProxyProtocol, UpstreamConfig};
 use crate::dns::forward::Forwarder;
 use crate::dns::msg::Rcode;
 use crate::events::Event;
@@ -72,7 +72,6 @@ pub const CSRF_COOKIE: &str = "res_csrf";
 #[derive(Clone)]
 pub struct ApiState {
     pub shared: Arc<Shared>,
-    pub forwarder: Forwarder,
     /// Serialises configuration mutations (create/update/delete/import).
     pub mutation: Arc<tokio::sync::Mutex<()>>,
     /// Bounded HTTP concurrency: at most `API_CONCURRENCY` handlers run at
@@ -350,10 +349,9 @@ fn reject(st: &ApiState, action: &str, mut detail: Value, err: ApiError) -> ApiE
     err
 }
 
-pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -> Router {
+pub fn router(shared: Arc<Shared>, auth: Arc<AuthState>) -> Router {
     let state = ApiState {
         shared,
-        forwarder,
         mutation: Arc::new(tokio::sync::Mutex::new(())),
         api_sem: Arc::new(tokio::sync::Semaphore::new(API_CONCURRENCY)),
         probe: Arc::new(std::sync::Mutex::new(None)),
@@ -408,6 +406,8 @@ pub fn router(shared: Arc<Shared>, forwarder: Forwarder, auth: Arc<AuthState>) -
         )
         .route("/api/cache", get(get_cache).put(put_cache))
         .route("/api/cache/clear", post(clear_cache))
+        .route("/api/proxy", get(get_proxy).put(put_proxy))
+        .route("/api/proxy/test", post(test_proxy))
         .route(
             "/api/health/config",
             get(get_health_config).put(put_health_config),
@@ -478,7 +478,7 @@ async fn api_concurrency(
 /// Dashboard assets are external files, so scripts can be locked to `self`.
 /// `style-src-attr` permits the chart/canvas markup that still uses inline
 /// `style` attributes; inline `<style>`/`<script>` blocks are not allowed.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self';      style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:;      font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self';      frame-ancestors 'none'; object-src 'none'";
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self';      style-src 'self'; img-src 'self' data:;      font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self';      frame-ancestors 'none'; object-src 'none'";
 
 /// Response headers for every API/dashboard reply: MIME sniffing off,
 /// framing off, no referrer leakage, CSP hardened for external dashboard
@@ -1124,6 +1124,16 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
         "emergency": {
             "no_healthy_upstreams": total > 0 && healthy == 0,
         },
+        "proxy": {
+            "enabled": app.proxy.enabled,
+            "protocol": app.proxy.protocol.as_str(),
+            "address": app.proxy.address.to_string(),
+            "port": app.proxy.port,
+            "username": app.proxy.username,
+            "password_set": !app.proxy.password.is_empty(),
+            "connect_timeout_ms": app.proxy.connect_timeout_ms,
+            "udp_supported": app.proxy.protocol.supports_udp(),
+        },
         "inflight": {
             "udp": st.shared.udp_inflight.current(),
             "tcp_connections": st.shared.tcp_connections.current(),
@@ -1384,6 +1394,16 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
             "memory_bytes": st.shared.cache.memory_bytes(),
         },
+        "proxy": {
+            "enabled": app.proxy.enabled,
+            "protocol": app.proxy.protocol.as_str(),
+            "address": app.proxy.address.to_string(),
+            "port": app.proxy.port,
+            "username": app.proxy.username,
+            "password_set": !app.proxy.password.is_empty(),
+            "connect_timeout_ms": app.proxy.connect_timeout_ms,
+            "udp_supported": app.proxy.protocol.supports_udp(),
+        },
         "inflight": {
             "udp": st.shared.udp_inflight.current(),
             "tcp_connections": st.shared.tcp_connections.current(),
@@ -1456,10 +1476,12 @@ async fn export_config(
     // Viewers (and anonymous open-mode readers) must never see the bearer
     // token: re-serialize with it stripped. Admins get the full export.
     let is_admin = principal(&st, &headers).is_some_and(|p| p.role == Role::Admin);
+    let mut redacted = AppConfig::clone(app.as_ref());
+    // Proxy passwords never leave the process, regardless of role.
+    redacted.proxy.password.clear();
     let toml_text = if is_admin {
-        app.to_toml().map_err(ApiError::Internal)?
+        redacted.to_toml().map_err(ApiError::Internal)?
     } else {
-        let mut redacted = AppConfig::clone(app.as_ref());
         redacted.server.api_token = String::new();
         redacted.to_toml().map_err(ApiError::Internal)?
     };
@@ -1807,7 +1829,7 @@ async fn timeseries(
 }
 
 /// Top client addresses and top queried names (traffic introspection).
-/// Addresses follow the configured `client_ip_privacy` policy (masked by
+/// Addresses follow the configured `client_ip_privacy` policy (full by
 /// default); tables are bounded, so `tracked.skipped_requests` reports
 /// requests that could not be attributed instead of hiding them.
 #[derive(Deserialize)]
@@ -2238,6 +2260,194 @@ async fn clear_cache(
         "status": "ok",
         "entries_dropped": before,
         "memory_bytes_freed": mem,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Outbound upstream proxy (SOCKS5 / HTTP CONNECT)
+// ---------------------------------------------------------------------------
+
+fn proxy_json(app: &AppConfig) -> Value {
+    json!({
+        "enabled": app.proxy.enabled,
+        "protocol": app.proxy.protocol.as_str(),
+        "address": app.proxy.address.to_string(),
+        "port": app.proxy.port,
+        "username": app.proxy.username,
+        "password_set": !app.proxy.password.is_empty(),
+        "connect_timeout_ms": app.proxy.connect_timeout_ms,
+        "udp_supported": app.proxy.protocol.supports_udp(),
+        // Secrets are write-only: the dashboard must send a replacement to
+        // change them and can request an explicit clear.
+        "password": Value::Null,
+        "generation": 0,
+    })
+}
+
+async fn get_proxy(State(st): State<ApiState>) -> Json<Value> {
+    let app = st.shared.app.load();
+    let mut v = proxy_json(&app);
+    if let Value::Object(ref mut m) = v {
+        m.insert(
+            "generation".into(),
+            Value::from(st.shared.config_generation()),
+        );
+    }
+    Json(v)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyUpdateRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    protocol: Option<ProxyProtocol>,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    username: Option<String>,
+    /// Absent = keep the stored password. Empty string is rejected as a
+    /// change; use `clear_password` to remove it explicitly.
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    clear_password: bool,
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    generation: Option<u64>,
+}
+
+async fn put_proxy(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+    Query(q): Query<AclPutQuery>,
+    Json(req): Json<ProxyUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "proxy_update")?;
+    let _guard = st.mutation.lock().await;
+    check_generation(&st, req.generation.or(q.generation), "proxy_update")?;
+
+    let mut next = AppConfig::clone(st.shared.app.load().as_ref());
+    if let Some(enabled) = req.enabled {
+        next.proxy.enabled = enabled;
+    }
+    if let Some(protocol) = req.protocol {
+        next.proxy.protocol = protocol;
+    }
+    if let Some(address) = req.address.as_deref() {
+        next.proxy.address = address
+            .trim()
+            .parse()
+            .map_err(|e| ApiError::BadRequest(format!("invalid proxy address: {e}")))?;
+    }
+    if let Some(port) = req.port {
+        next.proxy.port = port;
+    }
+    if let Some(username) = req.username.as_ref() {
+        next.proxy.username = username.clone();
+    }
+    if req.clear_password {
+        next.proxy.password.clear();
+    } else if let Some(password) = req.password.as_ref() {
+        if password.is_empty() {
+            return Err(ApiError::BadRequest(
+                "proxy.password cannot be set to an empty string; use clear_password".into(),
+            ));
+        }
+        next.proxy.password = password.clone();
+    }
+    if let Some(timeout) = req.connect_timeout_ms {
+        next.proxy.connect_timeout_ms = timeout;
+    }
+    let password_changed = req.clear_password || req.password.is_some();
+
+    st.shared.replace_config(next).map_err(|e| {
+        reject(
+            &st,
+            "proxy_update_rejected",
+            json!({ "op": "proxy_update" }),
+            ApiError::BadRequest(e),
+        )
+    })?;
+    let (persisted, persist_error) = persist_or_report(&st);
+    let outcome = if persist_error.is_some() {
+        "applied_persist_failed"
+    } else {
+        "applied"
+    };
+    st.shared.record_config_event(
+        "proxy_update",
+        json!({
+            "enabled": req.enabled,
+            "protocol": req.protocol.map(|p| p.as_str()),
+            "address": req.address.as_deref(),
+            "port": req.port,
+            "username": req.username.as_deref(),
+            "password_changed": password_changed,
+            "persisted": persisted,
+            "persist_error": persist_error,
+            "outcome": outcome,
+        }),
+    );
+    let app = st.shared.app.load();
+    let mut v = proxy_json(&app);
+    if let Value::Object(ref mut m) = v {
+        m.insert("status".into(), Value::from("ok"));
+        m.insert("persisted".into(), Value::from(persisted));
+        m.insert("persist_error".into(), json!(persist_error));
+        m.insert(
+            "generation".into(),
+            Value::from(st.shared.config_generation()),
+        );
+    }
+    Ok(Json(v))
+}
+
+/// POST /api/proxy/test — establish a real tunnel through the configured
+/// proxy to the first enabled upstream. It validates routing/authentication
+/// but deliberately does not send a DNS query (no health state changes).
+async fn test_proxy(
+    State(st): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&st, &headers, "proxy_test")?;
+    let app = AppConfig::clone(st.shared.app.load().as_ref());
+    if !app.proxy.enabled {
+        return Err(ApiError::BadRequest("proxy is disabled".into()));
+    }
+    let up = app
+        .upstreams
+        .iter()
+        .find(|u| u.enabled)
+        .ok_or_else(|| ApiError::BadRequest("no enabled upstream to test".into()))?;
+    let target = std::net::SocketAddr::new(up.address, up.port);
+    let started = Instant::now();
+    let budget = Duration::from_millis(app.proxy.connect_timeout_ms);
+    let outcome = if up.protocol == Protocol::Udp {
+        crate::proxy::open_udp(&app.proxy, budget)
+            .await
+            .map(|_assoc| "udp_associate")
+    } else {
+        crate::proxy::connect_tcp(&app.proxy, target, budget)
+            .await
+            .map(|_stream| "tcp_tunnel")
+    };
+    let (reachable, error) = match outcome {
+        Ok(kind) => (true, Some(kind)),
+        Err(e) => (false, Some(e.kind.as_str())),
+    };
+    Ok(Json(json!({
+        "reachable": reachable,
+        "protocol": app.proxy.protocol.as_str(),
+        "upstream": up.name,
+        "target": target.to_string(),
+        "transport": up.protocol.to_string(),
+        "tunnel": if reachable { error } else { None },
+        "error": if reachable { None } else { error },
+        "latency_ms": (started.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
     })))
 }
 
@@ -3334,7 +3544,10 @@ async fn test_upstream(
         .get(id)
         .ok_or_else(|| ApiError::NotFound(format!("upstream {id} not found")))?;
     let cfg = runtime.config();
-    let result = probe_once(&st.shared, &st.forwarder, &runtime).await;
+    // Build from the live configuration so a proxy change applies to the
+    // operator-triggered probe immediately.
+    let forwarder = Forwarder::from_shared(&st.shared);
+    let result = probe_once(&st.shared, &forwarder, &runtime).await;
     Ok(Json(json!({
         "upstream": cfg.name,
         "address": cfg.address.to_string(),

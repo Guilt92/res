@@ -18,8 +18,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
-use crate::config::{Protocol, UpstreamConfig};
+use crate::config::{Protocol, ProxyConfig, UpstreamConfig};
 use crate::dns::msg::{self, ParsedQuery, ResponseView};
+use crate::metrics::Metrics;
+use crate::proxy::{self, ProxyError};
 
 /// Maximum DNS message size over TCP (2-byte length prefix).
 pub const MAX_TCP_MESSAGE: usize = 65_535;
@@ -34,6 +36,8 @@ pub enum ExchangeError {
     Network(String),
     #[error("invalid response: {0}")]
     Invalid(String),
+    #[error("{0}")]
+    Proxy(ProxyError),
 }
 
 #[derive(Debug)]
@@ -41,18 +45,133 @@ pub struct ExchangeOk {
     pub response: Vec<u8>,
     pub view: ResponseView,
     pub latency: Duration,
+    /// True when this exchange traversed the configured upstream proxy.
+    pub proxied: bool,
+    /// Time spent establishing the TCP tunnel / SOCKS association, separate
+    /// from DNS response latency.
+    pub proxy_connect_latency: Option<Duration>,
+    /// Proxy protocol label for metrics (`socks5` / `http_connect`).
+    pub proxy_protocol: Option<&'static str>,
 }
 
 /// Performs DNS exchanges with upstreams over UDP/TCP/DoT.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct Forwarder {
     /// Retry over TCP when an upstream UDP response is truncated (TC=1).
     pub tcp_fallback: bool,
+    proxy: Option<Arc<ProxyConfig>>,
+    metrics: Option<Arc<Metrics>>,
+    /// Per-datagram receive ceiling from `server.max_udp_packet_size`.
+    /// Bounds attacker-influenced EDNS advertisements to the operator's
+    /// configured egress budget instead of allocating up to 64 KiB per query.
+    udp_cap: usize,
+}
+
+impl std::fmt::Debug for Forwarder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forwarder")
+            .field("tcp_fallback", &self.tcp_fallback)
+            .field("proxied", &self.proxy.is_some())
+            .finish()
+    }
 }
 
 impl Forwarder {
     pub fn new(tcp_fallback: bool) -> Self {
-        Self { tcp_fallback }
+        Self {
+            tcp_fallback,
+            proxy: None,
+            metrics: None,
+            udp_cap: 65_535,
+        }
+    }
+
+    /// Build a forwarder from one data-plane configuration snapshot. The
+    /// proxy is cloned through an `Arc`, so the per-query cost stays trivial.
+    pub fn with_proxy(
+        tcp_fallback: bool,
+        proxy: Option<Arc<ProxyConfig>>,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
+        Self {
+            tcp_fallback,
+            proxy,
+            metrics,
+            udp_cap: 65_535,
+        }
+    }
+
+    /// Apply the live `server.max_udp_packet_size` receive ceiling.
+    pub fn with_udp_cap(mut self, cap: usize) -> Self {
+        self.udp_cap = cap.clamp(super::forward::MIN_RECV_CAP, 65_535);
+        self
+    }
+
+    /// Forwarder reflecting the *current* live configuration. Used by health
+    /// and API probes so a proxy change applies without a restart.
+    pub fn from_shared(shared: &crate::shared::Shared) -> Self {
+        let rt = shared.rt.load();
+        Self::with_proxy(
+            rt.upstream_tcp_fallback,
+            rt.proxy.clone(),
+            Some(shared.metrics.clone()),
+        )
+        .with_udp_cap(rt.max_udp_packet_size)
+    }
+
+    async fn connect_stream(
+        &self,
+        target: SocketAddr,
+        budget: Duration,
+    ) -> Result<(TcpStream, Option<Duration>, Option<&'static str>), ExchangeError> {
+        let Some(cfg) = &self.proxy else {
+            let stream = TcpStream::connect(target)
+                .await
+                .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
+            let _ = stream.set_nodelay(true);
+            return Ok((stream, None, None));
+        };
+        let proto = cfg.protocol.as_str();
+        let limit = budget.min(Duration::from_millis(cfg.connect_timeout_ms));
+        let start = Instant::now();
+        match proxy::connect_tcp(cfg, target, limit).await {
+            Ok(stream) => {
+                let elapsed = start.elapsed();
+                self.record_proxy_connect(proto, None, elapsed);
+                Ok((stream, Some(elapsed), Some(proto)))
+            }
+            Err(e) => {
+                self.record_proxy_connect(proto, Some(&e), start.elapsed());
+                Err(ExchangeError::Proxy(e))
+            }
+        }
+    }
+
+    fn record_proxy_connect(&self, proto: &str, error: Option<&ProxyError>, elapsed: Duration) {
+        let Some(metrics) = &self.metrics else { return };
+        let result = error.map(|e| e.kind.as_str()).unwrap_or("success");
+        metrics
+            .proxy_connect_total
+            .with_label_values(&[proto, result])
+            .inc();
+        if error.is_none() {
+            metrics
+                .proxy_connect_duration_seconds
+                .with_label_values(&[proto])
+                .observe(elapsed.as_secs_f64());
+        }
+    }
+
+    fn record_tunnel_bytes(&self, direction: &str, bytes: usize) {
+        if self.proxy.is_none() {
+            return;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .proxy_tunnel_bytes_total
+                .with_label_values(&[direction])
+                .inc_by(bytes as u64);
+        }
     }
 
     fn randomized_query(query: &ParsedQuery, raw: &[u8]) -> (ParsedQuery, Vec<u8>) {
@@ -91,6 +210,17 @@ impl Forwarder {
         budget: Duration,
         proto: Protocol,
     ) -> Result<ExchangeOk, ExchangeError> {
+        if let (Some(cfg), Some(metrics)) = (&self.proxy, &self.metrics) {
+            let transport = match proto {
+                Protocol::Udp => "udp",
+                Protocol::Tcp => "tcp",
+                Protocol::Tls => "tls",
+            };
+            metrics
+                .proxy_requests_total
+                .with_label_values(&[cfg.protocol.as_str(), transport])
+                .inc();
+        }
         match proto {
             Protocol::Udp => self.exchange_udp(up, query, raw, budget).await,
             Protocol::Tcp => self.exchange_tcp(up, query, raw, budget).await,
@@ -110,6 +240,9 @@ impl Forwarder {
             return Err(ExchangeError::Invalid(
                 "query too large for plain UDP".into(),
             ));
+        }
+        if self.proxy.is_some() {
+            return self.exchange_udp_proxy(up, query, raw, budget).await;
         }
         let (correlated, wire) = Self::randomized_query(query, raw);
         let target = SocketAddr::new(up.address, up.port);
@@ -140,7 +273,7 @@ impl Forwarder {
         // One extra byte: `recv` filling it means the datagram is larger than
         // the client can receive — a detectable overflow instead of a silent
         // mid-record cut that the parser would only see as garbage.
-        let expected = recv_buf_size(query);
+        let expected = recv_buf_size(query).min(self.udp_cap);
         let mut buf = vec![0u8; expected + 1];
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -177,6 +310,9 @@ impl Forwarder {
                             response: stub,
                             view,
                             latency: start.elapsed(),
+                            proxied: false,
+                            proxy_connect_latency: None,
+                            proxy_protocol: None,
                         });
                     }
                     continue;
@@ -194,6 +330,9 @@ impl Forwarder {
                             response: ok.response,
                             view: ok.view,
                             latency: start.elapsed(),
+                            proxied: ok.proxied,
+                            proxy_connect_latency: ok.proxy_connect_latency,
+                            proxy_protocol: ok.proxy_protocol,
                         });
                     }
                 }
@@ -203,6 +342,129 @@ impl Forwarder {
                 response: buf[..received].to_vec(),
                 view,
                 latency: start.elapsed(),
+                proxied: false,
+                proxy_connect_latency: None,
+                proxy_protocol: None,
+            });
+        }
+    }
+
+    /// SOCKS5 UDP ASSOCIATE path: one TCP control connection per attempt (a
+    /// fresh unpredictable query id is still used inside the payload). The
+    /// relay is connected so only the proxy can inject datagrams; each reply
+    /// is additionally checked against the target address.
+    async fn exchange_udp_proxy(
+        &self,
+        up: &UpstreamConfig,
+        query: &ParsedQuery,
+        raw: &[u8],
+        budget: Duration,
+    ) -> Result<ExchangeOk, ExchangeError> {
+        let Some(cfg) = &self.proxy else {
+            return Err(ExchangeError::Invalid("proxy missing".into()));
+        };
+        if cfg.protocol != crate::config::ProxyProtocol::Socks5 {
+            return Err(ExchangeError::Proxy(ProxyError::new(
+                crate::proxy::ProxyErrorKind::Rejected,
+                "HTTP CONNECT cannot carry UDP DNS",
+            )));
+        }
+        let (correlated, wire) = Self::randomized_query(query, raw);
+        let target = SocketAddr::new(up.address, up.port);
+        let start = Instant::now();
+        let deadline = start + budget;
+        let proto = cfg.protocol.as_str();
+        let limit = budget.min(Duration::from_millis(cfg.connect_timeout_ms));
+        let connect_start = Instant::now();
+        let assoc = match proxy::open_udp(cfg, limit).await {
+            Ok(a) => {
+                let elapsed = connect_start.elapsed();
+                self.record_proxy_connect(proto, None, elapsed);
+                a
+            }
+            Err(e) => {
+                self.record_proxy_connect(proto, Some(&e), connect_start.elapsed());
+                return Err(ExchangeError::Proxy(e));
+            }
+        };
+        let connect_latency = connect_start.elapsed();
+        // Keep the TCP control connection alive for the whole exchange.
+        let _control = assoc.control;
+        let sock = proxy::relay_socket(assoc.relay)
+            .await
+            .map_err(ExchangeError::Proxy)?;
+        let packet = proxy::encode_udp(target, &wire);
+        sock.send(&packet)
+            .await
+            .map_err(|e| ExchangeError::Network(format!("proxy UDP send: {e}")))?;
+        self.record_tunnel_bytes("sent", packet.len());
+
+        let expected = recv_buf_size(query).min(self.udp_cap);
+        let mut buf = vec![0u8; expected + 1 + proxy::udp_header_len(target)];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ExchangeError::Timeout);
+            }
+            let received = match timeout(remaining, sock.recv(&mut buf)).await {
+                Err(_) => return Err(ExchangeError::Timeout),
+                Ok(Err(e)) => return Err(ExchangeError::Network(format!("proxy UDP recv: {e}"))),
+                Ok(Ok(n)) => n,
+            };
+            self.record_tunnel_bytes("received", received);
+            let Some(payload) = proxy::decode_udp(target, &buf[..received]) else {
+                continue;
+            };
+            let oversized = payload.len() > expected;
+            let view = match msg::parse_response(payload) {
+                Ok(v) => v,
+                Err(_) => {
+                    if oversized {
+                        let mut stub = msg::error_response(&correlated, msg::Rcode::NoError);
+                        if stub.len() >= 4 {
+                            stub[2] |= 0x02;
+                        }
+                        let view = match msg::parse_response(&stub) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        return Ok(ExchangeOk {
+                            response: stub,
+                            view,
+                            latency: start.elapsed(),
+                            proxied: true,
+                            proxy_connect_latency: Some(connect_latency),
+                            proxy_protocol: Some(proto),
+                        });
+                    }
+                    continue;
+                }
+            };
+            if !msg::correlates(&correlated, &view) {
+                continue;
+            }
+            if view.truncated && self.tcp_fallback && up.protocol == Protocol::Udp {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    if let Ok(ok) = self.exchange_tcp(up, query, raw, remaining).await {
+                        return Ok(ExchangeOk {
+                            response: ok.response,
+                            view: ok.view,
+                            latency: start.elapsed(),
+                            proxied: true,
+                            proxy_connect_latency: ok.proxy_connect_latency,
+                            proxy_protocol: ok.proxy_protocol,
+                        });
+                    }
+                }
+            }
+            return Ok(ExchangeOk {
+                response: payload.to_vec(),
+                view,
+                latency: start.elapsed(),
+                proxied: true,
+                proxy_connect_latency: Some(connect_latency),
+                proxy_protocol: Some(proto),
             });
         }
     }
@@ -221,11 +483,13 @@ impl Forwarder {
         let start = Instant::now();
 
         let result = timeout(budget, async {
-            let stream = TcpStream::connect(target)
-                .await
-                .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
-            let _ = stream.set_nodelay(true);
-            self.exchange_framed(query, raw, stream).await
+            let (stream, proxy_latency, proxy_protocol) =
+                self.connect_stream(target, budget).await?;
+            let mut ok = self.exchange_framed(query, raw, stream).await?;
+            ok.proxied = proxy_latency.is_some();
+            ok.proxy_connect_latency = proxy_latency;
+            ok.proxy_protocol = proxy_protocol;
+            Ok(ok)
         })
         .await;
 
@@ -263,15 +527,17 @@ impl Forwarder {
         let start = Instant::now();
 
         let result = timeout(budget, async {
-            let stream = TcpStream::connect(target)
-                .await
-                .map_err(|e| ExchangeError::Network(format!("connect: {e}")))?;
-            let _ = stream.set_nodelay(true);
+            let (stream, proxy_latency, proxy_protocol) =
+                self.connect_stream(target, budget).await?;
             let mut stream = TlsConnector::from(config)
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| ExchangeError::Network(format!("tls handshake: {e}")))?;
-            self.exchange_framed(query, raw, &mut stream).await
+            let mut ok = self.exchange_framed(query, raw, &mut stream).await?;
+            ok.proxied = proxy_latency.is_some();
+            ok.proxy_connect_latency = proxy_latency;
+            ok.proxy_protocol = proxy_protocol;
+            Ok(ok)
         })
         .await;
 
@@ -297,6 +563,7 @@ impl Forwarder {
             .write_all(&frame)
             .await
             .map_err(|e| ExchangeError::Network(format!("write: {e}")))?;
+        self.record_tunnel_bytes("sent", frame.len());
 
         let mut len_buf = [0u8; 2];
         stream
@@ -312,6 +579,7 @@ impl Forwarder {
             .read_exact(&mut resp)
             .await
             .map_err(|e| ExchangeError::Network(format!("read body: {e}")))?;
+        self.record_tunnel_bytes("received", 2 + len);
 
         let view = msg::parse_response(&resp).map_err(ExchangeError::Invalid)?;
         if !msg::correlates(&correlated, &view) {
@@ -323,6 +591,9 @@ impl Forwarder {
             response: resp,
             view,
             latency: Duration::ZERO,
+            proxied: false,
+            proxy_connect_latency: None,
+            proxy_protocol: None,
         })
     }
 }
@@ -371,6 +642,10 @@ fn tls_client_config(ca_file: Option<&Path>) -> Result<Arc<rustls::ClientConfig>
 /// DNS flag day 2020 minimum safe UDP payload (also the receive floor for
 /// plain-UDP exchanges: some servers exceed RFC 1035's 512 without EDNS).
 const MIN_RECV_BUF: usize = 1232;
+
+/// Lowest receive ceiling accepted by validation (512-byte legacy DNS is
+/// lifted to the 1232-byte flag-day floor).
+const MIN_RECV_CAP: usize = 1232;
 
 /// Receive buffer size for one upstream UDP exchange: the client's advertised
 /// EDNS payload clamped to a sane window, or the 1232-byte floor for
@@ -466,6 +741,12 @@ mod tests {
         let mut tiny = msg::parse_query(&msg::build_query("example.com", "A").unwrap()).unwrap();
         tiny.edns_payload = Some(256);
         assert_eq!(recv_buf_size(&tiny), MIN_RECV_BUF);
+
+        // The configured server egress cap also bounds the allocation even
+        // when a client advertises a much larger EDNS payload.
+        let forwarder = Forwarder::new(false).with_udp_cap(512);
+        assert_eq!(forwarder.udp_cap, MIN_RECV_CAP);
+        assert_eq!(recv_buf_size(&q).min(forwarder.udp_cap), MIN_RECV_CAP);
     }
 
     #[test]
@@ -706,5 +987,104 @@ mod tests {
             "uncorrelated TCP response must be rejected, got {result:?}"
         );
         server.await.expect("server task");
+    }
+    #[tokio::test]
+    async fn socks5_udp_proxy_carries_a_real_exchange_end_to_end() {
+        use crate::config::{ProxyConfig, ProxyProtocol};
+        use crate::proxy as px;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, UdpSocket};
+
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
+            resp.metadata.recursion_available = true;
+            resp.queries = query.queries.clone();
+            upstream
+                .send_to(&resp.to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let (mut control, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            control.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            control.write_all(&[5, 0]).await.unwrap();
+            let mut head = [0u8; 10];
+            control.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..], &[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let mut reply = vec![5, 0, 0, 1];
+            reply.extend_from_slice(
+                &relay_addr
+                    .ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            control.write_all(&reply).await.unwrap();
+            // Keep the SOCKS control connection alive while the client uses
+            // the association.
+            let mut one = [0u8; 1];
+            let _ = control.read(&mut one).await;
+        });
+
+        let relay_addr_copy = relay_addr;
+        let relay_loop = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = relay.recv_from(&mut buf).await.unwrap();
+            let target = upstream_addr;
+            let payload = px::decode_udp(target, &buf[..n]).expect("encapsulated query");
+            let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            up.send_to(payload, target).await.unwrap();
+            let mut answer = vec![0u8; 4096];
+            let (an, _) = up.recv_from(&mut answer).await.unwrap();
+            let packet = px::encode_udp(target, &answer[..an]);
+            relay.send_to(&packet, peer).await.unwrap();
+            assert_eq!(relay.local_addr().unwrap(), relay_addr_copy);
+        });
+
+        let cfg = ProxyConfig {
+            enabled: true,
+            protocol: ProxyProtocol::Socks5,
+            address: proxy_addr.ip(),
+            port: proxy_addr.port(),
+            connect_timeout_ms: 2_000,
+            ..Default::default()
+        };
+        let forwarder = Forwarder::with_proxy(false, Some(Arc::new(cfg)), None);
+        let up = UpstreamConfig {
+            id: 1,
+            name: "via-proxy".into(),
+            address: upstream_addr.ip(),
+            port: upstream_addr.port(),
+            protocol: Protocol::Udp,
+            ..Default::default()
+        };
+        let raw = msg::build_query("example.com", "A").unwrap();
+        let parsed = msg::parse_query(&raw).unwrap();
+        let ok = forwarder
+            .exchange(&up, &parsed, &raw, Duration::from_secs(2))
+            .await
+            .expect("proxied exchange");
+        assert!(ok.proxied);
+        assert_eq!(ok.proxy_protocol, Some("socks5"));
+        assert!(ok.proxy_connect_latency.is_some());
+        assert_eq!(ok.view.rcode, msg::Rcode::NoError);
+
+        upstream_task.await.unwrap();
+        relay_task.await.unwrap();
+        relay_loop.await.unwrap();
     }
 }

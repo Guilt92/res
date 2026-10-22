@@ -19,7 +19,7 @@ use serde_json::json;
 
 use crate::acl::AclDecision;
 use crate::cache::{CacheKey, FlightOutcome, FlightRole, FlightWait};
-use crate::config::{CacheConfig, FailoverConfig, QueryConfig};
+use crate::config::{CacheConfig, FailoverConfig, ProxyConfig, QueryConfig};
 use crate::dns::forward::{enforce_client_udp_limit, Forwarder};
 use crate::dns::msg::{self, ParsedQuery, QueryReject, Rcode};
 use crate::dns::Transport;
@@ -46,6 +46,8 @@ struct Prepared {
     tcp_fallback: bool,
     /// `server.max_udp_packet_size` as of this query: egress ceiling.
     udp_cap: u16,
+    /// Enabled outbound proxy snapshot as of this query.
+    proxy: Option<Arc<ProxyConfig>>,
 }
 
 enum Precheck {
@@ -94,7 +96,12 @@ impl Pipeline {
         let pool = self.shared.registry.enabled_snapshot();
         // tcp_fallback is re-read from the config snapshot taken for *this*
         // query so a config swap applies without a process restart.
-        let forwarder = Forwarder::new(prepared.tcp_fallback);
+        let forwarder = Forwarder::with_proxy(
+            prepared.tcp_fallback,
+            prepared.proxy.clone(),
+            Some(self.shared.metrics.clone()),
+        )
+        .with_udp_cap(prepared.udp_cap as usize);
 
         // ---- Single-flight (cache-miss coalescing) ----
         // When the cache is enabled and this question missed, concurrent
@@ -715,6 +722,7 @@ impl Pipeline {
             min_probe_samples: rt.selection.min_probe_samples,
             tcp_fallback: rt.upstream_tcp_fallback,
             udp_cap: rt.max_udp_packet_size as u16,
+            proxy: rt.proxy.clone(),
         })
     }
 

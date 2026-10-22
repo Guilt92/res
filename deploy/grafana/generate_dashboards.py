@@ -438,8 +438,9 @@ def clients():
         "res-clients",
         "2. Client / Traffic Analysis",
         "Where the traffic comes from: requests per client IP (top-N export, "
-        "masked labels by default), top clients by volume/bytes/failures, "
-        "per-client outcome rates, rate limiting and ACL activity.",
+        "following the configured client_ip_privacy policy), top clients by "
+        "volume/bytes/failures, per-client outcome rates, rate limiting and "
+        "ACL activity.",
         ["res", "dns", "clients"],
     )
 

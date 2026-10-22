@@ -4,7 +4,7 @@
 //! that answers every query with a fixed A record, can be silenced to simulate
 //! an outage, and can answer with TC=1 over UDP to exercise TCP fallback.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -339,6 +339,126 @@ impl FakeTlsUpstream {
 
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::SeqCst)
+    }
+
+    pub async fn stop(self) {
+        for t in self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Minimal no-auth SOCKS5 CONNECT proxy used to prove that upstream DNS
+/// (including DoT) traverses the configured tunnel and never falls back to a
+/// direct connection when the proxy is unavailable.
+pub struct Socks5Proxy {
+    pub addr: SocketAddr,
+    pub connections: Arc<AtomicU64>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Socks5Proxy {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks");
+        let addr = listener.local_addr().expect("socks addr");
+        let connections = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        {
+            let connections = Arc::clone(&connections);
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let Ok((mut client, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let connections = Arc::clone(&connections);
+                    tokio::spawn(async move {
+                        let mut head = [0u8; 2];
+                        if client.read_exact(&mut head).await.is_err() || head[0] != 5 {
+                            return;
+                        }
+                        let mut methods = vec![0u8; usize::from(head[1])];
+                        if client.read_exact(&mut methods).await.is_err() {
+                            return;
+                        }
+                        if client.write_all(&[5, 0]).await.is_err() {
+                            return;
+                        }
+                        let mut req = [0u8; 4];
+                        if client.read_exact(&mut req).await.is_err() || req[1] != 1 {
+                            return;
+                        }
+                        let target = match req[3] {
+                            1 => {
+                                let mut b = [0u8; 4];
+                                if client.read_exact(&mut b).await.is_err() {
+                                    return;
+                                }
+                                IpAddr::V4(Ipv4Addr::from(b))
+                            }
+                            4 => {
+                                let mut b = [0u8; 16];
+                                if client.read_exact(&mut b).await.is_err() {
+                                    return;
+                                }
+                                IpAddr::V6(Ipv6Addr::from(b))
+                            }
+                            3 => {
+                                let mut len = [0u8; 1];
+                                if client.read_exact(&mut len).await.is_err() {
+                                    return;
+                                }
+                                let mut name = vec![0u8; usize::from(len[0])];
+                                if client.read_exact(&mut name).await.is_err() {
+                                    return;
+                                }
+                                let Ok(name) = String::from_utf8(name) else {
+                                    return;
+                                };
+                                let mut port = [0u8; 2];
+                                if client.read_exact(&mut port).await.is_err() {
+                                    return;
+                                }
+                                let port = u16::from_be_bytes(port);
+                                let addrs =
+                                    match tokio::net::lookup_host((name.as_str(), port)).await {
+                                        Ok(addrs) => addrs.collect::<Vec<_>>(),
+                                        Err(_) => return,
+                                    };
+                                match addrs.first() {
+                                    Some(addr) => addr.ip(),
+                                    None => return,
+                                }
+                            }
+                            _ => return,
+                        };
+                        let mut port = [0u8; 2];
+                        if client.read_exact(&mut port).await.is_err() {
+                            return;
+                        }
+                        let port = u16::from_be_bytes(port);
+                        let Ok(mut upstream) = TcpStream::connect((target, port)).await else {
+                            let _ = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                            return;
+                        };
+                        connections.fetch_add(1, Ordering::SeqCst);
+                        let reply = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+                        if client.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    });
+                }
+            }));
+        }
+        Self {
+            addr,
+            connections,
+            tasks,
+        }
+    }
+
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::SeqCst)
     }
 
     pub async fn stop(self) {

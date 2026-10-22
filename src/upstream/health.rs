@@ -89,11 +89,7 @@ pub fn step(
 }
 
 /// Background health-check loop.
-pub async fn run_health_checker(
-    shared: Arc<Shared>,
-    forwarder: Forwarder,
-    mut shutdown: watch::Receiver<bool>,
-) {
+pub async fn run_health_checker(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     tracing::debug!(event = "health_checker_started");
     loop {
         let app = shared.app.load();
@@ -123,13 +119,16 @@ pub async fn run_health_checker(
         if !hc.enabled {
             continue;
         }
-        run_round(&shared, &forwarder, &hc).await;
+        run_round(&shared, &hc).await;
         refresh_gauges(&shared, &shared.metrics);
     }
     tracing::debug!(event = "health_checker_stopped");
 }
 
-async fn run_round(shared: &Arc<Shared>, forwarder: &Forwarder, hc: &HealthConfig) {
+async fn run_round(shared: &Arc<Shared>, hc: &HealthConfig) {
+    // Build from the current configuration on every round so a proxy or
+    // tcp-fallback change applies without restarting the checker.
+    let forwarder = Forwarder::from_shared(shared);
     let now = Instant::now();
     let upstreams: Vec<Arc<UpstreamRuntime>> = shared
         .registry
@@ -165,7 +164,7 @@ async fn run_round(shared: &Arc<Shared>, forwarder: &Forwarder, hc: &HealthConfi
     let mut set = tokio::task::JoinSet::new();
     for up in upstreams {
         let shared = Arc::clone(shared);
-        let forwarder = *forwarder;
+        let forwarder = forwarder.clone();
         let hc = hc.clone();
         set.spawn(async move {
             check_upstream(&shared, &forwarder, &up, &hc, &hyst).await;
@@ -246,6 +245,7 @@ async fn check_upstream(
                         crate::dns::forward::ExchangeError::Timeout => "timeout",
                         crate::dns::forward::ExchangeError::Network(_) => "network",
                         crate::dns::forward::ExchangeError::Invalid(_) => "invalid",
+                        crate::dns::forward::ExchangeError::Proxy(_) => "proxy",
                     };
                 }
             }

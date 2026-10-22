@@ -213,6 +213,7 @@ pub async fn forward(
                     ExchangeError::Timeout => OutcomeKind::Timeout,
                     ExchangeError::Network(_) => OutcomeKind::Network,
                     ExchangeError::Invalid(_) => OutcomeKind::Invalid,
+                    ExchangeError::Proxy(_) => OutcomeKind::Network,
                 };
                 runtime.record_forward(kind, Duration::ZERO);
                 metrics
@@ -236,6 +237,7 @@ pub async fn forward(
                     ExchangeError::Timeout => "timeout",
                     ExchangeError::Network(_) => "network",
                     ExchangeError::Invalid(_) => "invalid",
+                    ExchangeError::Proxy(_) => "proxy",
                 };
                 failed_attempt_time += started_attempt.elapsed();
                 last_failure = Some((

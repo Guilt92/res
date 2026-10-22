@@ -7,7 +7,8 @@
 //! administrator-defined and bounded, rcodes and query types use fixed
 //! enum-like sets, and domain names are never labels. The only per-client
 //! labels come from the top-N client-metrics collector, which exports at most
-//! `monitoring.client_metrics_max` addresses per scrape, masked by default.
+//! `monitoring.client_metrics_max` addresses per scrape, full by default and
+//! reducible to masked/off via `client_ip_privacy`.
 
 use prometheus::core::{Collector, Desc};
 use prometheus::{
@@ -99,6 +100,20 @@ pub struct Metrics {
     /// Extra latency paid by clients because earlier upstream attempts failed
     /// (observed only when failover eventually succeeded).
     pub failover_latency: Histogram,
+
+    // Upstream proxy.
+    /// Whether the configured upstream proxy is enabled (1) or bypassed (0).
+    pub proxy_enabled: IntGauge,
+    /// Proxied query attempts by proxy protocol and DNS transport.
+    pub proxy_requests_total: IntCounterVec,
+    /// Proxy tunnel establishment outcomes (`success` or a bounded failure
+    /// kind: timeout/network/protocol/auth/rejected).
+    pub proxy_connect_total: IntCounterVec,
+    /// Latency of successful proxy tunnel establishment (TCP/SOCKS handshake
+    /// plus UDP ASSOCIATE), separate from DNS response latency.
+    pub proxy_connect_duration_seconds: HistogramVec,
+    /// Payload bytes written/read through the proxy tunnel.
+    pub proxy_tunnel_bytes_total: IntCounterVec,
 
     // Cache.
     pub cache_hits_total: IntCounter,
@@ -370,6 +385,36 @@ impl Metrics {
         )
         .expect("metric");
 
+        let proxy_enabled = IntGauge::with_opts(Opts::new(
+            "res_proxy_enabled",
+            "1 when an outbound upstream proxy is enabled",
+        ))
+        .expect("metric");
+        let proxy_requests_total = mk1(
+            "res_proxy_requests_total",
+            "Upstream exchanges routed through the configured proxy",
+            &["protocol", "transport"],
+        );
+        let proxy_connect_total = mk1(
+            "res_proxy_connect_total",
+            "Proxy tunnel establishment attempts by protocol and bounded result",
+            &["protocol", "result"],
+        );
+        let proxy_connect_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "res_proxy_connect_duration_seconds",
+                "Successful proxy tunnel establishment latency",
+            )
+            .buckets(LATENCY_BUCKETS.to_vec()),
+            &["protocol"],
+        )
+        .expect("metric");
+        let proxy_tunnel_bytes_total = mk1(
+            "res_proxy_tunnel_bytes_total",
+            "DNS payload bytes sent or received through the proxy tunnel",
+            &["direction"],
+        );
+
         let cache_hits_total = mk("res_cache_hits_total", "Cache hits");
         let cache_misses_total = mk("res_cache_misses_total", "Cache misses");
         let cache_entries = IntGauge::with_opts(Opts::new(
@@ -457,6 +502,9 @@ impl Metrics {
             &upstream_state_changes_total,
             &failover_reason_total,
             &healthcheck_reason_total,
+            &proxy_requests_total,
+            &proxy_connect_total,
+            &proxy_tunnel_bytes_total,
         ] {
             registry.register(Box::new(c.clone())).expect("register");
         }
@@ -503,6 +551,10 @@ impl Metrics {
             let h = &healthcheck_duration_seconds;
             registry.register(Box::new(h.clone())).expect("register");
         }
+        {
+            let h = &proxy_connect_duration_seconds;
+            registry.register(Box::new(h.clone())).expect("register");
+        }
         for g in [
             &upstream_health,
             &upstream_state,
@@ -518,6 +570,7 @@ impl Metrics {
             &cache_entries,
             &cache_capacity,
             &cache_memory_bytes,
+            &proxy_enabled,
             &udp_inflight,
             &tcp_connections,
             &resident_memory_bytes,
@@ -581,6 +634,11 @@ impl Metrics {
             healthy_upstreams,
             failovers_total,
             failover_latency,
+            proxy_enabled,
+            proxy_requests_total,
+            proxy_connect_total,
+            proxy_connect_duration_seconds,
+            proxy_tunnel_bytes_total,
             cache_hits_total,
             cache_misses_total,
             cache_entries,
@@ -690,9 +748,9 @@ impl Metrics {
 ///
 /// * **Bounded** — at most `monitoring.client_metrics_max` clients, selected
 ///   from the already-bounded traffic table on every scrape.
-/// * **Privacy-preserving** — labels follow the configured policy: `masked`
-///   (default) aggregates by masked address, `full` uses real addresses,
-///   `off` exports nothing at all.
+/// * **Privacy-preserving** — labels follow the configured policy: `full`
+///   (default) uses real addresses, `masked` aggregates by prefix, and `off`
+///   exports nothing at all.
 /// * **Real counters** — every value is the cumulative count kept by the
 ///   traffic table; results are only exported once they actually occurred
 ///   (an outcome with a count of 0 is omitted instead of padded with zeros).

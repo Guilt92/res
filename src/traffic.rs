@@ -12,7 +12,7 @@
 //!   totals always come from the Prometheus counters, not from these tables.
 //!   Unmeasured values (`avg_ms`, `p95_ms`, `share`) stay `None` until real
 //!   samples exist; `rps` is the measured rate since the previous sample.
-//! * **Privacy** — client addresses are masked by default; see
+//! * **Privacy** — full client addresses are shown by default; see
 //!   [`ClientIpPrivacy`]. Sorting always uses the real (unmasked) counters.
 
 use std::collections::HashMap;

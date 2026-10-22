@@ -37,6 +37,7 @@ pub mod history;
 pub mod logging;
 pub mod metrics;
 pub mod persist;
+pub mod proxy;
 pub mod ratelimit;
 pub mod runtime;
 pub mod selection;

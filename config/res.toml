@@ -12,6 +12,13 @@ upstream_tcp_fallback = true
 require_encrypted_upstreams = false
 shutdown_grace_ms = 5000
 
+[proxy]
+enabled = false
+protocol = "socks5"
+address = "127.0.0.1"
+port = 1080
+connect_timeout_ms = 5000
+
 [auth]
 username = "admin"
 viewer_username = "viewer"
@@ -140,7 +147,7 @@ servfail_sample_every = 0
 [monitoring]
 prometheus_url = "http://prometheus:9090"
 prometheus_username = "prom"
-client_ip_privacy = "masked"
+client_ip_privacy = "full"
 top_clients_max = 4096
 top_domains_max = 8192
 client_metrics_max = 100

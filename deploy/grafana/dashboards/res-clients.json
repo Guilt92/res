@@ -2,7 +2,7 @@
  "annotations": {
   "list": []
  },
- "description": "Where the traffic comes from: requests per client IP (top-N export, masked labels by default), top clients by volume/bytes/failures, per-client outcome rates, rate limiting and ACL activity.",
+ "description": "Where the traffic comes from: requests per client IP (top-N export, following the configured client_ip_privacy policy), top clients by volume/bytes/failures, per-client outcome rates, rate limiting and ACL activity.",
  "editable": true,
  "fiscalYearStartMonth": 0,
  "graphTooltip": 1,

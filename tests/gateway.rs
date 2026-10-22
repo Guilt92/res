@@ -162,6 +162,63 @@ async fn dot_rejects_server_name_mismatch_without_downgrade() {
     fake.stop().await;
 }
 
+/// DoT through an authenticated upstream proxy still performs the normal TLS
+/// handshake and certificate validation inside the tunnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_traverses_socks5_proxy_with_certificate_validation() {
+    let fake = FakeTlsUpstream::start().await;
+    let proxy = Socks5Proxy::start().await;
+    let mut cfg = base_config();
+    cfg.proxy.enabled = true;
+    cfg.proxy.protocol = res::config::ProxyProtocol::Socks5;
+    cfg.proxy.address = proxy.addr.ip();
+    cfg.proxy.port = proxy.addr.port();
+    cfg.proxy.connect_timeout_ms = 1000;
+    cfg.upstreams
+        .push(fake.config("dot-via-proxy", "localhost"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query(addr, "dot-proxy.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(answers_ip(&resp), Some(ANSWER));
+    assert_eq!(fake.hits(), 1, "DoT query must traverse the proxy");
+    assert_eq!(proxy.connections(), 1, "proxy must see the tunnel");
+
+    gw.shutdown().await;
+    fake.stop().await;
+    proxy.stop().await;
+}
+
+/// A dead proxy is a hard failure: the data plane must not bypass the tunnel
+/// and contact the upstream directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_failure_never_falls_back_to_direct_upstream() {
+    let fake = FakeTlsUpstream::start().await;
+    let proxy = Socks5Proxy::start().await;
+    let proxy_addr = proxy.addr;
+    proxy.stop().await;
+    let mut cfg = base_config();
+    cfg.query.max_attempts = 1;
+    cfg.query.upstream_timeout_ms = 1000;
+    cfg.query.timeout_ms = 2000;
+    cfg.proxy.enabled = true;
+    cfg.proxy.protocol = res::config::ProxyProtocol::Socks5;
+    cfg.proxy.address = proxy_addr.ip();
+    cfg.proxy.port = proxy_addr.port();
+    cfg.proxy.connect_timeout_ms = 500;
+    cfg.upstreams.push(fake.config("dot-direct", "localhost"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query(addr, "no-direct.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(fake.hits(), 0, "proxied traffic must never go direct");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_forwarding_returns_upstream_answer() {
     let fake = FakeUpstream::start().await;
@@ -689,7 +746,7 @@ async fn dns_service_metrics_report_real_traffic() {
         t["avg_response_bytes"].is_null(),
         "no responses => no average: {body}"
     );
-    assert_eq!(t["client_ip_privacy"].as_str(), Some("masked"), "{body}");
+    assert_eq!(t["client_ip_privacy"].as_str(), Some("full"), "{body}");
     assert_eq!(t["clients"]["tracked_keys"].as_u64(), Some(0), "{body}");
     assert_eq!(t["domains"]["tracked_keys"].as_u64(), Some(0), "{body}");
     assert!(
@@ -702,7 +759,7 @@ async fn dns_service_metrics_report_real_traffic() {
     let (status, body) = http("GET", api, "/api/status", None).await;
     assert_eq!(status, 200, "status body: {body}");
     let s: serde_json::Value = serde_json::from_str(&body).expect("status json");
-    assert_eq!(s["privacy"]["client_ip"].as_str(), Some("masked"), "{body}");
+    assert_eq!(s["privacy"]["client_ip"].as_str(), Some("full"), "{body}");
     assert_eq!(s["privacy"]["top_clients_max"].as_u64(), Some(4096));
     assert_eq!(s["privacy"]["top_domains_max"].as_u64(), Some(8192));
 
@@ -768,8 +825,8 @@ async fn dns_service_metrics_report_real_traffic() {
     assert_eq!(top_clients.len(), 1, "{body}");
     assert_eq!(
         top_clients[0]["client"].as_str(),
-        Some("127.x.x.x"),
-        "client address must be masked by default: {body}"
+        Some("127.0.0.1"),
+        "client address must be full by default: {body}"
     );
     assert_eq!(top_clients[0]["count"].as_u64(), Some(4), "{body}");
     assert_eq!(top_clients[0]["requests"].as_u64(), Some(4), "{body}");
@@ -790,13 +847,13 @@ async fn dns_service_metrics_report_real_traffic() {
     let (status, body) = http("GET", api, "/api/clients?limit=5", None).await;
     assert_eq!(status, 200, "clients body: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("clients json");
-    assert_eq!(v["privacy"].as_str(), Some("masked"), "{body}");
+    assert_eq!(v["privacy"].as_str(), Some("full"), "{body}");
     assert_eq!(
         v["tracked"]["recorded_requests"].as_u64(),
         Some(4),
         "{body}"
     );
-    assert_eq!(v["rows"][0]["client"].as_str(), Some("127.x.x.x"), "{body}");
+    assert_eq!(v["rows"][0]["client"].as_str(), Some("127.0.0.1"), "{body}");
     assert_eq!(v["rows"][0]["count"].as_u64(), Some(4), "{body}");
     assert_eq!(v["rows"][0]["failed"].as_u64(), Some(0), "{body}");
     assert_eq!(v["rows"][0]["timeouts"].as_u64(), Some(0), "{body}");
@@ -867,13 +924,13 @@ async fn dns_service_metrics_report_real_traffic() {
         "query-type histogram must be exported:\n{text}"
     );
 
-    // ---- per-client Prometheus series (top-N export, masked labels) ----
+    // ---- per-client Prometheus series (top-N export, full labels) ----
     assert!(
-        text.contains("res_client_queries_total{client=\"127.x.x.x\"} 4"),
+        text.contains("res_client_queries_total{client=\"127.0.0.1\"} 4"),
         "per-client request counter must be exported:\n{text}"
     );
     assert!(
-        text.contains("res_client_query_result_total{client=\"127.x.x.x\",result=\"ok\"} 4"),
+        text.contains("res_client_query_result_total{client=\"127.0.0.1\",result=\"ok\"} 4"),
         "per-client outcome counters:\n{text}"
     );
     assert!(
@@ -882,7 +939,7 @@ async fn dns_service_metrics_report_real_traffic() {
     );
     let bytes_line = text
         .lines()
-        .find(|l| l.starts_with("res_client_request_bytes_total{client=\"127.x.x.x\"}"))
+        .find(|l| l.starts_with("res_client_request_bytes_total{client=\"127.0.0.1\"}"))
         .expect("per-client byte counter exported");
     assert!(
         bytes_line
@@ -1159,6 +1216,106 @@ async fn wait_for_health(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_api_is_authenticated_validated_and_never_exports_the_secret() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.upstreams.push(fake.config("proxy-upstream"));
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    let (status, body) = http("GET", api, "/api/proxy", None).await;
+    assert_eq!(status, 200, "{body}");
+    let initial: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(initial["enabled"], false);
+    assert_eq!(initial["password_set"], false);
+
+    // HTTP CONNECT cannot carry the UDP upstream in the base config.
+    let invalid = serde_json::json!({
+        "enabled": true,
+        "protocol": "http_connect",
+        "address": "127.0.0.1",
+        "port": 8080,
+        "connect_timeout_ms": 200
+    })
+    .to_string();
+    let (status, body) = http("PUT", api, "/api/proxy", Some(&invalid)).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("http_connect"), "{body}");
+
+    let valid = serde_json::json!({
+        "enabled": true,
+        "protocol": "socks5",
+        "address": "127.0.0.1",
+        "port": 1,
+        "username": "user",
+        "password": "proxy-sekrit",
+        "connect_timeout_ms": 200
+    })
+    .to_string();
+    let (status, body) = http("PUT", api, "/api/proxy", Some(&valid)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("proxy-sekrit"), "secret leaked: {body}");
+    let saved: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(saved["password_set"], true);
+    assert_eq!(saved["password"], serde_json::Value::Null);
+
+    let (status, body) = http("GET", api, "/api/proxy", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("proxy-sekrit"), "secret leaked: {body}");
+    assert!(!body.contains(r#""password":"proxy-sekrit""#), "{body}");
+
+    let (status, body) = http("GET", api, "/api/config", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("proxy-sekrit"), "export leaked: {body}");
+
+    let (status, body) = http("GET", api, "/api/diagnostics", None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("proxy-sekrit"), "diagnostics leaked: {body}");
+    assert!(body.contains(r#""proxy""#), "{body}");
+
+    // A real (bounded) connection attempt to a closed local port.
+    let (status, body) = http("POST", api, "/api/proxy/test", None).await;
+    assert_eq!(status, 200, "{body}");
+    let tested: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(tested["reachable"], false, "{body}");
+    assert!(tested["error"].as_str().is_some(), "{body}");
+    assert!(!body.contains("proxy-sekrit"), "{body}");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_management_requires_a_valid_admin_credential() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit-token".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    for (method, path, body) in [
+        ("GET", "/api/proxy", None),
+        ("PUT", "/api/proxy", Some(r#"{"enabled":false}"#)),
+        ("POST", "/api/proxy/test", None),
+    ] {
+        let (status, response) = http(method, api, path, body).await;
+        assert_eq!(status, 401, "{method} {path}: {response}");
+    }
+    let (status, response) = http_auth(
+        "PUT",
+        api,
+        "/api/proxy",
+        Some(r#"{"enabled":false}"#),
+        Some("wrong-token"),
+    )
+    .await;
+    assert_eq!(status, 401, "{response}");
+    let (status, response) = http_auth("GET", api, "/api/proxy", None, Some("sekrit-token")).await;
+    assert_eq!(status, 200, "{response}");
+
+    gw.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1506,10 +1663,10 @@ async fn system_events_capture_acl_and_rate_limit_activity() {
     assert!(!events.is_empty(), "expected a system event");
     assert_eq!(events[0]["kind"], "system");
     assert_eq!(events[0]["action"], "acl_denied");
-    // Default privacy: the event carries the masked address, never the host.
+    // Default privacy: the event carries the full address.
     assert_eq!(
         events[0]["detail"]["client_ip"].as_str(),
-        Some("127.x.x.x"),
+        Some("127.0.0.1"),
         "{body}"
     );
 
@@ -2816,6 +2973,12 @@ async fn auth_viewer_cannot_mutate_configuration() {
             "/api/auth/rotate-password",
             Some(r#"{"account":"admin","new_password":"viewer-should-not"}"#),
         ),
+        (
+            "PUT",
+            "/api/proxy",
+            Some(r#"{"enabled":true,"protocol":"socks5","address":"127.0.0.1","port":1080}"#),
+        ),
+        ("POST", "/api/proxy/test", None),
     ];
     for (method, path, body) in mutations {
         let (status, response) = http_headers(method, api, path, body, &headers).await;

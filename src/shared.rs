@@ -136,6 +136,7 @@ impl Shared {
         );
         let traffic = Arc::new(traffic);
         let metrics = Metrics::new();
+        metrics.proxy_enabled.set(i64::from(app.proxy.enabled));
         metrics
             .registry
             .register(Box::new(crate::metrics::ClientMetricsCollector::new(
@@ -252,6 +253,9 @@ impl Shared {
                 );
             }
         }
+        self.metrics
+            .proxy_enabled
+            .set(i64::from(new_rt.proxy.is_some()));
         self.metrics
             .cache_capacity
             .set(new_rt.cache.max_entries as i64);

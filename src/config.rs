@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,139 @@ impl UpstreamConfig {
         self.expect_rcode
             .as_deref()
             .and_then(crate::dns::msg::parse_rcode)
+    }
+}
+
+/// Upstream proxy protocol. Both choices tunnel TCP; SOCKS5 additionally
+/// supports UDP ASSOCIATE so plaintext UDP upstreams keep their transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProtocol {
+    Socks5,
+    HttpConnect,
+}
+
+impl ProxyProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProxyProtocol::Socks5 => "socks5",
+            ProxyProtocol::HttpConnect => "http_connect",
+        }
+    }
+
+    pub fn supports_udp(self) -> bool {
+        matches!(self, ProxyProtocol::Socks5)
+    }
+}
+
+impl fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Optional outbound proxy for every upstream exchange (data plane, health
+/// probes and operator-triggered probes). The proxy endpoint must be an IP:
+/// the data plane must never need a resolver to find its network path.
+///
+/// `Debug` is implemented manually so the password can never reach logs,
+/// diagnostics, errors or a panic message. API exports redact it explicitly;
+/// the functional on-disk configuration still needs the real value to keep
+/// working across restarts.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProxyConfig {
+    pub enabled: bool,
+    pub protocol: ProxyProtocol,
+    pub address: IpAddr,
+    pub port: u16,
+    /// SOCKS5 username / HTTP Basic username. Empty = no proxy auth.
+    pub username: String,
+    /// Proxy password. Never serialized into API exports.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password: String,
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: ProxyProtocol::Socks5,
+            address: IpAddr::from([127, 0, 0, 1]),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            connect_timeout_ms: 5_000,
+        }
+    }
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("enabled", &self.enabled)
+            .field("protocol", &self.protocol)
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    ""
+                } else {
+                    "[redacted]"
+                },
+            )
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .finish()
+    }
+}
+
+impl ProxyConfig {
+    pub fn endpoint(&self) -> SocketAddr {
+        SocketAddr::new(self.address, self.port)
+    }
+
+    pub fn validate(&self, upstreams: &[UpstreamConfig]) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("proxy.port must be > 0".into());
+        }
+        if self.address.is_unspecified() {
+            return Err("proxy.address must not be unspecified".into());
+        }
+        if self.address.is_multicast() {
+            return Err("proxy.address must not be multicast".into());
+        }
+        if !(100..=60_000).contains(&self.connect_timeout_ms) {
+            return Err("proxy.connect_timeout_ms must be in 100..=60000".into());
+        }
+        if self.username.len() > 255 {
+            return Err("proxy.username must be <= 255 bytes".into());
+        }
+        if self.password.len() > 255 {
+            return Err("proxy.password must be <= 255 bytes".into());
+        }
+        if self.username.is_empty() && !self.password.is_empty() {
+            return Err("proxy.password requires proxy.username".into());
+        }
+        if self.username.contains(['\r', '\n', '\0']) || self.password.contains(['\r', '\n', '\0'])
+        {
+            return Err("proxy credentials must not contain control characters".into());
+        }
+        if self.enabled
+            && self.protocol == ProxyProtocol::HttpConnect
+            && upstreams
+                .iter()
+                .any(|u| u.enabled && u.protocol == Protocol::Udp)
+        {
+            return Err(
+                "proxy.protocol = \"http_connect\" tunnels TCP only, but an enabled upstream \
+                 uses UDP; switch those upstreams to TCP/DoT or use the SOCKS5 proxy protocol"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -754,16 +888,16 @@ impl Default for LoggingConfig {
 /// dashboard.
 ///
 /// DNS client addresses are operationally useful (abuse, ACL and rate-limit
-/// troubleshooting) but are personal data, so the default is to keep the
-/// network prefix and drop the host part.
+/// troubleshooting). The shipped default exposes the full address so the
+/// dashboard and Prometheus agree; operators handling personal data can
+/// explicitly opt into prefix masking or disable collection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientIpPrivacy {
-    /// Show the network part only: IPv4 → `10.0.0.x`, IPv6 → `2001:db8::x`
-    /// (default). Aggregates are still per real address internally.
-    #[default]
+    /// Show the network part only: IPv4 → `10.0.0.x`, IPv6 → `2001:db8::x`.
     Masked,
-    /// Expose the full address everywhere.
+    /// Expose the full address everywhere (default).
+    #[default]
     Full,
     /// Do not track client addresses at all (no top-client table, no address
     /// in events or logs).
@@ -811,7 +945,7 @@ pub struct MonitoringConfig {
     /// Maximum tracked queried names (bounded memory; `0` disables).
     pub top_domains_max: usize,
     /// How many top clients are exported as Prometheus series
-    /// (`res_client_*`, masked labels by default). `0` disables the
+    /// (`res_client_*`, following `client_ip_privacy`). `0` disables the
     /// export. Kept small so per-client metrics cannot explode in cardinality.
     pub client_metrics_max: usize,
 }
@@ -869,6 +1003,7 @@ impl MonitoringConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AppConfig {
     pub server: ServerConfig,
+    pub proxy: ProxyConfig,
     pub auth: AuthConfig,
     pub query: QueryConfig,
     pub acl: AclConfig,
@@ -1044,6 +1179,7 @@ impl AppConfig {
         if self.server.max_tcp_connections == 0 {
             return Err("server.max_tcp_connections must be > 0".into());
         }
+        self.proxy.validate(&self.upstreams)?;
         // Bounded scale: each upstream carries runtime state, probe tasks,
         // metric vectors and selector entries — an accidental 10k-entry list
         // (or a hostile config push) must fail validation, not OOM.
@@ -1226,6 +1362,25 @@ impl AppConfig {
                     .into(),
             );
         }
+        if self.proxy.enabled {
+            out.push(format!(
+                "upstream proxy enabled ({} {}): all upstream exchanges traverse the proxy; \
+                 disabling it restores direct connections immediately",
+                self.proxy.protocol,
+                self.proxy.endpoint()
+            ));
+        }
+        if self.server.require_encrypted_upstreams
+            && self.proxy.enabled
+            && self.proxy.protocol == ProxyProtocol::HttpConnect
+        {
+            out.push(
+                "proxy protocol http_connect carries TLS to the proxy but terminates the \
+                 CONNECT tunnel at the proxy; DoT certificate validation still protects \
+                 content, but the proxy can observe the upstream endpoint"
+                    .into(),
+            );
+        }
         if self.server.api_token.is_empty() {
             out.push(
                 "server.api_token is empty: API clients must sign in with a password \
@@ -1260,9 +1415,20 @@ impl AppConfig {
         out
     }
 
-    /// Serialize back to the TOML file format (used by export).
+    /// Serialize back to the TOML file format (used for persistence and
+    /// export). Contains every functional secret, including the proxy
+    /// password; API exports must use [`AppConfig::to_toml_redacted`].
     pub fn to_toml(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("serialize error: {e}"))
+    }
+
+    /// Serialize for human-facing export with credentials removed. Proxy
+    /// authentication is not usable after re-import until the password is
+    /// supplied again; the dashboard reports `password_set` separately.
+    pub fn to_toml_redacted(&self) -> Result<String, String> {
+        let mut redacted = self.clone();
+        redacted.proxy.password.clear();
+        redacted.to_toml()
     }
 
     /// Returns a copy with the given upstream list, validated.
@@ -1294,6 +1460,9 @@ pub struct RuntimeConfig {
     pub max_queries_per_tcp_conn: u32,
     pub tcp_idle_timeout: Duration,
     pub upstream_tcp_fallback: bool,
+    /// Active outbound proxy snapshot (None when disabled), shared cheaply
+    /// with every per-query forwarder.
+    pub proxy: Option<Arc<ProxyConfig>>,
     pub acl: AclRules,
     pub ratelimit: RateLimitConfig,
     pub rrl: RrlConfig,
@@ -1316,6 +1485,7 @@ impl RuntimeConfig {
             max_queries_per_tcp_conn: app.server.max_queries_per_tcp_conn,
             tcp_idle_timeout: Duration::from_millis(app.server.tcp_idle_timeout_ms),
             upstream_tcp_fallback: app.server.upstream_tcp_fallback,
+            proxy: app.proxy.enabled.then(|| Arc::new(app.proxy.clone())),
             acl: AclRules::parse(&app.acl)?,
             ratelimit: app.ratelimit.clone(),
             rrl: app.rrl.clone(),
@@ -1776,9 +1946,9 @@ mod tests {
     }
 
     #[test]
-    fn default_privacy_is_masked_with_bounded_tables() {
+    fn default_privacy_is_full_with_bounded_tables() {
         let m = MonitoringConfig::default();
-        assert_eq!(m.client_ip_privacy, ClientIpPrivacy::Masked);
+        assert_eq!(m.client_ip_privacy, ClientIpPrivacy::Full);
         assert_eq!(m.client_table_cap(), 4_096);
         assert_eq!(m.domain_table_cap(), 8_192);
         assert!(m.track_clients());
@@ -1840,7 +2010,33 @@ mod tests {
         let rt = RuntimeConfig::from_app(&parsed).expect("runtime");
         assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Full);
         let rt = RuntimeConfig::from_app(&base()).expect("runtime");
-        assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Masked);
+        assert_eq!(rt.client_ip_privacy, ClientIpPrivacy::Full);
+    }
+
+    #[test]
+    fn proxy_validation_rejects_udp_with_http_connect_and_redacts_debug() {
+        let mut cfg = base();
+        cfg.proxy.enabled = true;
+        cfg.proxy.protocol = ProxyProtocol::HttpConnect;
+        cfg.proxy.address = "192.0.2.10".parse().unwrap();
+        cfg.proxy.username = "user".into();
+        cfg.proxy.password = "super-secret".into();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("http_connect"), "{err}");
+
+        cfg.upstreams[0].protocol = Protocol::Tcp;
+        cfg.validate()
+            .expect("TCP upstream is valid through CONNECT");
+        let debug = format!("{:?}", cfg.proxy);
+        assert!(!debug.contains("super-secret"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+        let exported = cfg.to_toml_redacted().unwrap();
+        assert!(!exported.contains("super-secret"), "{exported}");
+        let persisted = cfg.to_toml().unwrap();
+        assert!(
+            persisted.contains("super-secret"),
+            "persistence keeps the secret"
+        );
     }
 
     #[test]

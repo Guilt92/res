@@ -12,7 +12,6 @@ use tokio::task::JoinHandle;
 
 use crate::api;
 use crate::config::AppConfig;
-use crate::dns::forward::Forwarder;
 use crate::dns::listener;
 use crate::dns::pipeline::Pipeline;
 use crate::shared::Shared;
@@ -20,7 +19,6 @@ use crate::upstream::health;
 
 pub struct Gateway {
     pub shared: Arc<Shared>,
-    pub forwarder: Forwarder,
     shutdown: watch::Sender<bool>,
     tasks: Vec<(&'static str, JoinHandle<()>)>,
 }
@@ -161,12 +159,6 @@ pub async fn start_with_auth(
         }
     }
 
-    // Forwarder used by the API's explicit probe endpoint (health checks).
-    // The query path builds its own per-request from the config snapshot
-    // (see `Prepared::tcp_fallback`); probes keep this startup flag, which
-    // matches config-at-probe time closely enough for an operator-triggered
-    // single exchange.
-    let forwarder = Forwarder::new(shared.app.load().server.upstream_tcp_fallback);
     let pipeline = Pipeline::new(Arc::clone(&shared));
 
     // Bind listeners before spawning anything so startup failures are clean.
@@ -228,7 +220,6 @@ pub async fn start_with_auth(
         "health_checker",
         tokio::spawn(health::run_health_checker(
             Arc::clone(&shared),
-            forwarder,
             shutdown_rx.clone(),
         )),
     ));
@@ -237,7 +228,7 @@ pub async fn start_with_auth(
         tokio::spawn(sampler(Arc::clone(&shared), shutdown_rx.clone())),
     ));
 
-    let router = api::router(Arc::clone(&shared), forwarder, auth);
+    let router = api::router(Arc::clone(&shared), auth);
     let api_shutdown = {
         let mut rx = shutdown_rx.clone();
         async move {
@@ -281,7 +272,6 @@ pub async fn start_with_auth(
 
     Ok(Gateway {
         shared,
-        forwarder,
         shutdown: shutdown_tx,
         tasks,
     })

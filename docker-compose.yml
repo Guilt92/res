@@ -67,8 +67,8 @@ services:
     ports:
       # Host publish port is overridable (e.g. systemd-resolved owns :53):
       #   RES_DNS_PUBLISH=5353 docker compose up -d
-      - "${RES_DNS_PUBLISH:-53}:53/udp"
-      - "${RES_DNS_PUBLISH:-53}:53/tcp"
+      - "${RES_DNS_PUBLISH:-153}:53/udp"
+      - "${RES_DNS_PUBLISH:-153}:53/tcp"
       - "8080:8080"
     # The gateway never writes to its root filesystem (config is a bind mount,
     # logs go to stdout/stderr). Keep it read-only and disallow privilege gain.

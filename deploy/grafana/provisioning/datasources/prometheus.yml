@@ -10,7 +10,7 @@ datasources:
     basicAuth: true
     basicAuthUser: prom
     secureJsonData:
-      basicAuthPassword: res-prometheus-pw
+      basicAuthPassword: change-me-prometheus-password
     isDefault: true
     editable: false
     uid: prometheus

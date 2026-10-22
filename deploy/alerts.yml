@@ -1,5 +1,5 @@
 groups:
-  - name: res-dns-gateway
+  - name: res
     rules:
       - alert: ResNoHealthyUpstreams
         expr: res_healthy_upstreams == 0

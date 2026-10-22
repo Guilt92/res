@@ -16,7 +16,7 @@ scrape_configs:
     # administrator API credential).
     authorization:
       type: Bearer
-      credentials: res-metrics-token
+      credentials: change-me-metrics-token
     static_configs:
       - targets: ["res:8080"]
 
@@ -27,6 +27,6 @@ scrape_configs:
     # RES_PROMETHEUS_PASSWORD in docker-compose.yml.
     basic_auth:
       username: prom
-      password: res-prometheus-pw
+      password: change-me-prometheus-password
     static_configs:
       - targets: ["localhost:9090"]

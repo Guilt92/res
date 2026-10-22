@@ -1,7 +1,9 @@
 # res full stack: gateway + Prometheus + Grafana. No database.
 #
-# Credentials are PLAIN TEXT in this file — intentional for this deployment
-# (no secrets manager). Set in one place, enforced by each application:
+# The credential values below are DEVELOPMENT PLACEHOLDERS, not repository
+# secrets. Change every password/token (and the matching hashes/values in the
+# deploy/ files) before exposing this stack to a network. For production, use
+# a Compose override or a secrets manager instead of editing tracked values:
 #   RES_ADMIN_PASSWORD / RES_VIEWER_PASSWORD   dashboard users "admin"/"viewer" :8080
 #   GF_SECURITY_ADMIN_PASSWORD                 Grafana user "admin"             :3000
 #   deploy/prometheus/web.config.yml           Prometheus user "prom"           :9090
@@ -24,9 +26,10 @@ services:
   res:
     build:
       context: .
-      # Host networking + proxy args let the builder reach crates.io behind a
-      # localhost-only HTTP proxy; harmless on networks without a proxy.
-      network: host
+      # Proxy arguments are forwarded to Cargo for restricted networks. Host
+      # networking lets the builder use a proxy bound to the host loopback;
+      # set BUILD_NETWORK=default where host networking is unavailable.
+      network: ${BUILD_NETWORK:-host}
       args:
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
@@ -39,17 +42,17 @@ services:
       # Prometheus enforces HTTP basic auth (deploy/prometheus/web.config.yml);
       # the gateway proxy authenticates its queries with these credentials.
       RES_PROMETHEUS_USERNAME: "prom"
-      RES_PROMETHEUS_PASSWORD: "res-prometheus-pw"
-      # Control-plane credentials (plain text by request for this deployment;
-      # hashed with argon2 at startup, never written to the TOML config —
-      # only argon2 hashes land in config/res.credentials, mode 0600).
+      RES_PROMETHEUS_PASSWORD: "change-me-prometheus-password"
+      # Development placeholders: change them before deployment. They are
+      # hashed with argon2 at startup and never written to the TOML config;
+      # only argon2 hashes land in config/res.credentials, mode 0600.
       # Users: "admin" (full access) and "viewer" (read-only).
-      RES_ADMIN_PASSWORD: "res-dashboard-pw"
-      RES_VIEWER_PASSWORD: "res-viewer-pw"
+      RES_ADMIN_PASSWORD: "change-me-admin-password"
+      RES_VIEWER_PASSWORD: "change-me-viewer-password"
       # Metrics are scraped by Prometheus with this dedicated, metrics-only
       # bearer token. It cannot read or change the API, and the admin/API
       # credentials cannot scrape metrics.
-      RES_METRICS_TOKEN: "res-metrics-token"
+      RES_METRICS_TOKEN: "change-me-metrics-token"
       RES_PROTECT_METRICS: "true"
     # The image defaults to UID/GID 10001; the host ./config bind mount is
     # what needs to be writable (atomic config rewrite + res.credentials), so
@@ -64,8 +67,8 @@ services:
     ports:
       # Host publish port is overridable (e.g. systemd-resolved owns :53):
       #   RES_DNS_PUBLISH=5353 docker compose up -d
-      - "${RES_DNS_PUBLISH:-153}:53/udp"
-      - "${RES_DNS_PUBLISH:-153}:53/tcp"
+      - "${RES_DNS_PUBLISH:-53}:53/udp"
+      - "${RES_DNS_PUBLISH:-53}:53/tcp"
       - "8080:8080"
     # The gateway never writes to its root filesystem (config is a bind mount,
     # logs go to stdout/stderr). Keep it read-only and disallow privilege gain.
@@ -113,11 +116,10 @@ services:
   grafana:
     image: grafana/grafana:11.1.4
     environment:
-      # Plain text by request for this deployment (see header comment).
-      # Grafana applies this admin password on every start (existing or
-      # fresh database), so the value in this file is always authoritative.
+      # Development placeholder (see header comment). Grafana applies this
+      # admin password on every start, so the value here is authoritative.
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: "res-grafana-pw"
+      GF_SECURITY_ADMIN_PASSWORD: "change-me-grafana-password"
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"

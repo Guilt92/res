@@ -47,7 +47,8 @@ COPY --from=builder --chown=res:res /build/target/release/res-loadtest /usr/loca
 COPY --chown=res:res config/res.toml /etc/res/res.toml
 COPY --chown=res:res dashboard /app/dashboard
 RUN chmod -R a+rX /app/dashboard
-COPY --chmod=0755 --chown=res:res docker/entrypoint.sh /usr/local/bin/res-entrypoint
+COPY --chown=res:res docker/entrypoint.sh /usr/local/bin/res-entrypoint
+RUN chmod 0755 /usr/local/bin/res-entrypoint
 
 WORKDIR /app
 # Run unprivileged. Docker's default `net.ipv4.ip_unprivileged_port_start=0`

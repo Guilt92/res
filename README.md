@@ -1,378 +1,86 @@
 # res
 
-`res` is a lightweight DNS gateway/proxy: one Rust binary owns the DNS data
-plane — UDP/TCP listeners, parsing, ACLs, rate limiting, optional caching,
-upstream selection, health checks and bounded failover — and forwards queries
-to configured upstream resolvers. Control plane: REST API, Prometheus
-metrics, a built-in JSON dashboard and an optional Grafana stack.
+`res` is a lightweight DNS gateway written in Rust. It forwards DNS queries to configured upstream resolvers and provides runtime configuration, health checks, monitoring, and a web dashboard.
 
-**Forwarder, not a recursive resolver.** `res` never performs iterative
-resolution, never queries root or authoritative servers and never walks the
-DNS hierarchy: every query (cache misses included) is sent to a configured
-upstream. DNS packets are parsed with `hickory-proto`; no resolver logic is
-implemented.
+**It is a forwarder, not a recursive resolver.**
 
-## Capabilities
+## Features
 
-* UDP + TCP DNS listeners (RFC 1035 via `hickory-proto`), EDNS-aware size
-  limits, TC=1 → TCP retry
-* Fail-closed ACL (IPv4, IPv6 and IPv4-mapped clients), per-IP/global
-  token-bucket rate limiting
-* Response cache, enabled by default: TTLs are never extended beyond what the
-  upstream advertised (they also decrement on every hit), RFC 2308 negative
-  caching for NXDOMAIN/NODATA, bounded by entry count and TTL caps. RD=0
-  queries bypass the cache (no cache snooping), and queries carrying any EDNS
-  option (ECS, COOKIE, padding, ...) bypass the shared cache and single-flight,
-  because their upstream replies may be client-specific; upstream-added EDNS
-  options are stripped before an option-free client receives a response
-* Upstream pools with priority tiers (strict by default, optional shared
-  traffic to keep lower tiers warm), weighted sharing, three selection
-  strategies, active health checks with hysteresis, selectable
-  DEGRADED policy (always usable, or last resort)
-* Bounded failover: total per-query deadline, per-attempt timeout, attempt
-  budget, one try per upstream; failover latency is measured
-  (`res_failover_latency_seconds`)
-* Load shedding (max in-flight UDP, max TCP connections), packet counters
-  with running maxima
-* Prometheus metrics, structured logs, bounded event/history rings
-* REST API: status, stats, diagnostics, upstream CRUD, config import/export,
-  client/domain tables, timeseries
-* Six Grafana dashboards (traffic, clients, upstreams, failures, packets,
-  analytics) provisioned from `deploy/grafana/`
+- UDP/TCP DNS forwarding
+- Configurable upstreams, health checks, selection, and failover
+- IPv4/IPv6 ACLs and rate limiting
+- Optional DNS cache with TTL-aware expiry
+- Bounded concurrency and response-rate limiting
+- REST API and web dashboard
+- Prometheus metrics and Grafana dashboards
+- Authentication, HTTPS, and optional DNS-over-TLS (DoT)
+- Optional SOCKS5 or HTTP CONNECT upstream proxy with write-only credentials
+- Full client IPs in the dashboard by default; prefix masking is opt-in
+- TOML configuration with validation, atomic updates, and backup recovery
 
-## Client ACLs
+## Requirements
 
-`[acl]` is fail-closed: an empty `allowed_cidrs` denies everyone, so an
-unconfigured instance can never become an open resolver. Add your customer
-networks explicitly — public CIDRs are fine:
+- Docker and Docker Compose, or
+- Rust toolchain for local builds
 
-```toml
-[acl]
-allowed_cidrs = ["127.0.0.0/8", "::1/128", "203.0.113.0/24", "2001:db8::/32"]
-denied_cidrs  = []          # evaluated first, wins over allowed_cidrs
+## Quick Start
+
+```bash
+docker compose up -d --build
+dig @127.0.0.1 example.com
 ```
 
-IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`, as seen on dual-stack sockets)
-are matched against both the IPv6 rules and the embedded IPv4 address.
+Dashboard/API: http://localhost:8080
 
-This is an **application-layer ACL**, not a host firewall: it decides what
-the gateway answers, not what reaches the machine. Keep the OS firewall
-tight around port 53 as well.
+Prometheus: `localhost:9090`  
+Grafana: `localhost:3000`
 
-## Quick start
+Configure credentials in `docker-compose.yml` before deployment.
 
-Docker stack — DNS `:53` (UDP+TCP), dashboard/API `:8080`,
-Prometheus `:9090` (localhost-only), Grafana `:3000` (auth required):
+If port 53 is already in use:
 
-```console
-$ docker compose up -d --build
-$ dig @127.0.0.1 -p 53 example.com
-$ open http://localhost:8080/        # log in as admin (password below)
+```bash
+RES_DNS_PUBLISH=5353 docker compose up -d --build
+dig @127.0.0.1 -p 5353 example.com
 ```
-
-The image refuses to start without explicit credentials or a persisted
-`res.credentials` file; it never generates and prints a password to the
-logs. It also runs unprivileged (UID 10001) and refuses an explicit root
-override; compose maps that UID to the host owner of `./config` so the
-atomic config rewrite and `res.credentials` stay writable. Docker's
-unprivileged-port default lets UID 10001 bind `:53`; compose sets
-`net.ipv4.ip_unprivileged_port_start=53` explicitly for stricter runtimes.
-Compose supplies the credentials shown below, so a bare
-`docker compose up -d` still works.
-
-All credentials are plain text in `docker-compose.yml` — intentional for
-this deployment (no secrets manager), defined in exactly one place:
-
-| Service | URL | User | Password (in the file named below) |
-|---|---|---|---|
-| Dashboard/API | `:8080` | `admin` (full), `viewer` (read-only) | `RES_ADMIN_PASSWORD` / `RES_VIEWER_PASSWORD` (`docker-compose.yml`) |
-| Grafana | `:3000` | `admin` | `GF_SECURITY_ADMIN_PASSWORD` (`docker-compose.yml`) |
-| Prometheus | `:9090` | `prom` | `deploy/prometheus/web.config.yml` (`--web.config.file`) |
-| Gateway metrics scrape | `res:8080/metrics` | bearer | `RES_METRICS_TOKEN` (`docker-compose.yml`, mirrored in `deploy/prometheus.yml`) |
-
-Each application enforces its own credential: the gateway rejects
-unauthenticated API requests with `401` (viewer mutations: `403`) and stores
-only argon2 hashes in `config/res.credentials` (mode `0600`, gitignored);
-Grafana applies its admin password on every start; Prometheus does **not**
-read auth from environment variables — HTTP basic auth comes from the web
-config file mounted in compose, so unauthenticated `/api/v1/*` and UI
-requests get `401`. The gateway's Prometheus proxy and the Grafana datasource
-both send the `prom` credentials automatically.
-
-If the host already owns port 53 (systemd-resolved, another resolver),
-do not edit the compose file — override the published port:
-
-```console
-$ RES_DNS_PUBLISH=5353 docker compose up -d --build
-$ dig @127.0.0.1 -p 5353 example.com
-```
-
-IPv6 is supported by all three listeners. Set the addresses to `[::]`
-(dual-stack, Linux default) or `[::1]` (loopback only), e.g.
-`udp_addr = "[::]:53"` and `api_addr = "[::1]:8080"`; ACL entries must
-likewise allow the client's IPv6 prefix (`::1/128` is already listed).
-Live IPv6 DNS/API tests skip automatically when the host has IPv6 disabled.
-
-Local binary (the default config binds `:53`, so root or
-`CAP_NET_BIND_SERVICE` is required):
-
-```console
-$ cargo build --release
-$ sudo ./target/release/res --config config/res.toml serve
-$ dig @127.0.0.1 example.com
-```
-
-Binaries: `res` (serve/probe), `res-loadtest`, `res-hotpath-bench`,
-`mock-upstream` (test double).
 
 ## Configuration
 
-Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
-`"500ms"`); sections `[server]`, `[query]`, `[acl]`, `[ratelimit]`, `[rrl]`,
-`[failover]`, `[health]`, `[selection]`, `[cache]`, `[auth]`, `[logging]`,
-`[monitoring]`, `[[upstreams]]`.
+The main configuration file is `config/res.toml`.
 
-* `[rrl]` enables bounded response-rate limiting (default: 50 identical
-  UDP responses/s with burst 100, keyed by client, question, qtype and
-  rcode). Exceeding a bucket returns TC=1 so the client retries over TCP;
-  set `action = "drop"` to send nothing instead. TCP is not RRL-limited
-  because it cannot be used for spoofed-source amplification, and normal
-  query/connection limits still apply.
-* The config directory must be writable: the API rewrites the file
-  atomically (temp + fsync + rename) and keeps `res.toml.backup` as the last
-  valid version, which is loaded automatically if the primary file is broken.
-* `RES_PROMETHEUS_URL` overrides `[monitoring].prometheus_url`;
-  `RES_PROMETHEUS_USERNAME` / `RES_PROMETHEUS_PASSWORD` (env-only, never in
-  the TOML) are sent as HTTP basic auth on every proxy query when the
-  Prometheus server requires it.
-* `RES_API_TOKEN` supplies the control-plane bearer token.
-  `RES_METRICS_TOKEN` supplies a separate metrics-only bearer token and is
-  never loaded from or written to TOML. `RES_PROTECT_METRICS`
-  (`true`/`false`) overrides `[auth].protect_metrics`; when protection is on,
-  only `RES_METRICS_TOKEN` is accepted and a missing token fails closed.
-  Compose sets both so Prometheus can scrape without an admin credential.
-* Directories mounted into containers must be directory mounts (compose uses
-  `./config:/etc/res:rw`).
+It defines listeners, upstreams, ACLs, rate limits, caching, health checks, selection policies, failover, authentication, and monitoring.
 
-### Authentication (dashboard & API)
+- An empty `allowed_cidrs` denies all DNS clients.
+- DNS-over-TLS upstreams use `protocol = "tls"` and typically port `853`.
+- Set `require_encrypted_upstreams = true` to reject enabled plaintext upstreams.
+- `[proxy]` can route every upstream exchange through a SOCKS5 or HTTP CONNECT
+  proxy. SOCKS5 supports TCP, DoT and UDP (`UDP ASSOCIATE`); HTTP CONNECT is
+  TCP-only, so validation rejects it while any enabled upstream uses UDP.
+  Proxying is mandatory when enabled: a proxy failure becomes an upstream
+  failure and never falls back to a direct connection.
+- The proxy password is stored in the TOML file for restart survival but is
+  redacted from `Debug`, API/diagnostics/events and configuration exports.
+- `monitoring.client_ip_privacy` defaults to `"full"` so the dashboard and
+  Prometheus agree. Use `"masked"` to hide host bits or `"off"` to disable
+  per-client tracking.
+- The configuration directory must be writable for runtime updates and backup recovery.
 
-Set by environment (`docker-compose.yml` sets them in plain text for this
-deployment), hashed with argon2id at startup and persisted in
-`res.credentials` (mode `0600`, next to the TOML config) — never written
-into the TOML itself:
-
-* `RES_ADMIN_PASSWORD` — `admin`, full access (login, mutations).
-* `RES_VIEWER_PASSWORD` — `viewer`, read-only (all `GET`s; every mutation is
-  rejected with 403).
-* Optional `[server].api_token` / `RES_API_TOKEN` — `Authorization: Bearer`
-  auth for scripts. When set, every API read and mutation requires either
-  this token or a password session (token-only deployments get a token login
-  in the dashboard).
-
-Behaviour: session cookie (`HttpOnly`, `SameSite=Strict`) plus a CSRF
-double-submit token for cookie-authenticated mutations; `[auth]` section
-controls session lifetime (`session_ttl`), lockout (`max_failed_attempts`
-within `lockout_window`, held for `lockout_duration`), per-IP login
-throttling (`login_rate_limit_per_minute`; `0` disables) and
-`secure_cookies` (set `true` behind HTTPS). Password rotation
-(`POST /api/auth/rotate-password`) re-hashes the credential **and revokes
-every existing session**. Credentials are required by default: startup fails
-when neither a password nor an API token is configured. Isolated development
-instances can set `[auth].allow_open_mode = true`; the gateway then logs a
-prominent warning and the dashboard labels the session as unauthenticated.
-
-## HTTPS, reverse proxies and encrypted upstreams
-
-The management API can terminate TLS itself, or sit behind a reverse proxy:
-
-* **Direct HTTPS** — set `[server].tls_cert` and `[server].tls_key` to PEM
-  files. The API, dashboard, and `/metrics` are served over TLS only (no
-  plaintext fallback); HSTS is sent and session cookies are forced `Secure`.
-  A certificate or key error aborts startup instead of downgrading.
-* **Reverse proxy** — nginx/Caddy/Traefik in front of `:8080` remains fully
-  supported. Forward `X-Forwarded-*` only from a trusted hop. The gateway
-  does **not** honour `X-Forwarded-For`: client-based limits (login throttle)
-  see the proxy's address, so rate-limit at the proxy too. Set
-  `[auth].secure_cookies = true` and add HSTS at the proxy.
-* API concurrency is bounded (256 in-flight, 5 s wait) and sheds load with
-  `503`; a reverse proxy can add its own connection limits.
-* `/metrics` is unauthenticated by default for Prometheus scrapes on the
-  internal network; set `[auth].protect_metrics = true` (or
-  `RES_PROTECT_METRICS=true`) if it is reachable more widely. Protected
-  metrics accept only the dedicated `RES_METRICS_TOKEN`, never the admin API
-  token or a dashboard session. A missing metrics token fails closed with
-  `401`. The bundled Compose stack enables this and Prometheus sends
-  `RES_METRICS_TOKEN`.
-
-**DNS-over-TLS upstreams:** set an upstream `protocol = "tls"`,
-`port = 853`, and `tls_server_name = "resolver.example"`. The certificate is
-verified against that name using the bundled public WebPKI roots, or against
-`tls_ca_file` when supplied. Certificate/SNI failures are hard upstream
-failures and never fall back to plaintext. Set
-`[server].require_encrypted_upstreams = true` to make transport encryption a
-startup/reload invariant: every enabled upstream must use `protocol = "tls"`,
-and validation names any enabled plaintext upstream instead of silently
-forwarding it. Health probes use the same configured transport. Disabled
-plaintext entries remain allowed because they carry no traffic, but enabling
-one fails validation. DoH (DNS-over-HTTPS) is **not**
-implemented; use DoT or a local DoH proxy if required. DNS responses retain
-upstream DNSSEC records/flags, but this gateway does **not** validate DNSSEC
-locally.
-
-## API & monitoring
-
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /` | dashboard (SPA; `/api/*` misses answer JSON 404) |
-| `GET /metrics` | Prometheus exposition |
-| `GET /api/health` | liveness (version) |
-| `GET /api/status`, `/api/stats`, `/api/diagnostics` | runtime state, counters, host/config diagnostics |
-| `GET/POST /api/upstreams`, `PATCH/DELETE /api/upstreams/{id}` | upstream CRUD, state, manual probes |
-| `POST /api/upstreams/{id}/test` | on-demand connectivity/DNS probe of one upstream |
-| `POST /api/auth/login`, `DELETE /api/auth/session`, `POST /api/auth/rotate-password` | login (cookie+CSRF), logout, password rotation (revokes all sessions) |
-| `GET/PUT /api/acl`, `POST/PATCH/DELETE /api/acl/entries` | structured client ACL with `source` per entry |
-| `GET/PUT /api/cache`, `POST /api/cache/clear` | TTL policy + byte/entry caps, live clear |
-| `GET/PUT /api/health/config`, `GET/PUT /api/selection` | probing cadence/recovery policy, traffic-selection policy |
-| `GET /api/config`, `PUT /api/config`, `POST /api/config/rollback` | export, validated hot import (`?generation=&confirm=`), backup restore |
-| `GET /api/config/events`, `/api/events` | config audit ring, merged event ring |
-| `GET /api/history`, `/api/timeseries`, `/api/monitoring` | bounded history, chart data, Prometheus fallback info |
-| `GET /api/clients`, `/api/domains` | top client addresses, top queried names |
-
-### Upstream management at runtime
-
-Upstream DNS servers can be added, edited, enabled/disabled, probed and
-removed **without restarting the service** — from the dashboard section
-"Upstream DNS management" (`http://localhost:8080/`) or directly via the
-API. Every change is validated as a complete configuration, applied
-atomically via an `ArcSwap` snapshot (in-flight queries finish on the old
-snapshot; new queries see the new pool immediately), then persisted with a
-temp-file + fsync + rename write that keeps `res.toml.backup`.
-
-Safety properties:
-
-* **Admin token** — set `[server].api_token` (or `RES_API_TOKEN`) to require
-  `Authorization: Bearer <token>` on API reads and mutations. Without a token
-  or password the gateway refuses to start unless
-  `[auth].allow_open_mode = true` is set explicitly. The dashboard keeps a
-  manually entered token in `sessionStorage` only.
-* **Optimistic concurrency** — mutations accept an optional `generation`
-  (from `GET /api/upstreams`); a stale generation is rejected with `409`.
-* **Last-upstream guard** — disabling or removing the last enabled upstream
-  requires an explicit `confirm=true`, otherwise `409 confirm_required`.
-* **Atomic persistence** — invalid changes never touch the running config
-  or the file; a persist failure is reported in the response, audited
-  (`persist_failed` / `applied_persist_failed` events) and visible in
-  `/api/diagnostics`.
-* **Audit trail** — every accepted and rejected change is recorded in the
-  config event ring (`GET /api/config/events`) with action, timestamp and
-  outcome.
-
-Prometheus scrapes `res:8080/metrics` every 5 s (`deploy/prometheus.yml`,
-15 days / 2 GB retention). Prometheus' own endpoints require HTTP basic auth
-(user `prom`, from `deploy/prometheus/web.config.yml` mounted via
-`--web.config.file` — Prometheus has no environment-variable auth;
-unauthenticated API/UI requests get `401`). Grafana (`:3000`) requires
-`admin` / `GF_SECURITY_ADMIN_PASSWORD`; anonymous access and sign-ups are
-disabled, and its Prometheus datasource sends the same `prom` credentials
-(`deploy/grafana/provisioning/datasources/prometheus.yml`). Six dashboards
-are provisioned in folder `res` from
-`deploy/grafana/dashboards/` every 30 s; regenerate the JSON with:
-
-```console
-$ python3 deploy/grafana/generate_dashboards.py
-```
-
-### Selection policy (`[selection]`)
-
-Every query scores the usable upstreams and picks among them:
-`strategy` (`weighted_reliability` default = weighted roulette over a
-health × reliability × latency × probe score; `best_score` = always the
-top scorer; `random_healthy` = uniform, for debugging), `tier_policy`
-(`strict` keeps lower priority tiers cold; `shared` routes
-`lower_tier_share` of traffic to them so they stay measured and warm),
-`degraded_policy` (`usable` or `last_resort`) and `min_probe_samples`
-(below this many completed probe rounds the probe term is neutral so a
-fresh upstream is not penalised). The dashboard's "Health checks &
-selection" panel edits both `[health]` and `[selection]` at runtime; the
-upstreams table shows each candidate's score, rank and the factors behind
-it (hover the score).
-
-## Operational notes & known limitations
-
-Deliberate scope decisions, so nothing here surprises an operator:
-
-* **The container is non-root by default** — the image runs as UID
-  10001/GID 10001, drops all capabilities in compose, keeps
-  `no-new-privileges`, and refuses `--user 0` via the entrypoint. The
-  `./config` bind mount (or named volume) must be writable by the
-  container UID (`RES_UID`/`RES_GID`, default 1000:1000 in compose).
-* **Compose credentials are plain text** — intentionally, per this
-  deployment's requirement (no secrets manager). The gateway still stores
-  only argon2 hashes at runtime; change the values by editing
-  `docker-compose.yml` and `deploy/prometheus/web.config.yml` together.
-* **No DNS-over-HTTPS/QUIC upstreams** — TLS transport is supported for the
-  management API and for DNS-over-TLS upstreams; terminate client-side DoH at
-  a separate proxy/frontend if required.
-* **ACL is application-layer only** — pair it with a host firewall.
-* **No DNSSEC validation** — `DO`/`CD` and DNSSEC records are passed through,
-  and `DO` queries bypass the shared cache because the gateway cannot assert
-  the authenticity of upstream data.
-* **Response-rate limiting is UDP-only and client-IP-keyed** — `[rrl]`
-  buckets `(client, lowercased name, qtype, rcode)` and replaces excess
-  repeated answers with TC=1 (or drops them, per `rrl.action`). This limits
-  cache/upstream-to-client amplification, but it is not a volumetric DDoS
-  defence: spoofed-source floods still reach the host, so pair it with network
-  filtering and never run as an open resolver.
-* **Upstream replies are fully decoded and strictly correlated** — QR=1,
-  Query opcode, exactly one matching question, and no trailing bytes. This is
-  deliberately stricter than accepting a matching transaction id alone.
-* **Upstream transaction ids are randomized per exchange**, but query-name
-  case randomization (0x20) is not implemented; source-port entropy comes from
-  the OS. Do not expose UDP service to untrusted networks without an upstream
-  path you trust.
-* **Zone transfers are refused locally** — `AXFR`/`IXFR` never reach an
-  upstream. `ANY` follows `query.any_policy` (`refuse` by default, per RFC
-  8482); set it to `forward` only if an application genuinely needs it.
-* **`X-Forwarded-For` is not trusted** — API-side per-IP limits (login
-  throttle) see the socket peer; rate-limit at the proxy for real client
-  IPs. DNS is unaffected.
-* **`/metrics` is open by default** (Prometheus scrape model);
-  `protect_metrics` requires the separate metrics-only `RES_METRICS_TOKEN`.
-  Admin tokens and sessions are deliberately rejected on `/metrics`.
-* **Top-clients/top-domains are bounded, not decaying** — capped by
-  configured entry limits and evicted FIFO; entries do not age out over
-  time on their own.
-* **Duplicate OPT records on receive are not answered with FORMERR** —
-  the serving path still emits exactly one OPT (duplicates are collapsed),
-  which is what clients depend on; strict per-query FORMERR was skipped as
-  not worth the hot-path cost.
-* **Extended rcodes are classified as success in statistics** — a
-  `BADVERS`-class reply passes through to the client but counts as `Ok`
-  in success/failure rate classification (the standard rcode set is
-  classified precisely).
-* **API concurrency is bounded** (256 in-flight, ≤5 s wait, then `503`)
-  and **no per-IP API rate limiter** exists beyond the login throttle —
-  front it with a reverse proxy for public exposure.
-* **Strict CSP with no inline scripts** — dashboard CSS/JavaScript is
-  served from `/app.css`, `/boot.js` and `/app.js`, allowing
-  `script-src 'self'` with no `unsafe-inline`/`unsafe-eval`.
-  `style-src-attr 'unsafe-inline'` remains for inline `style` attributes
-  used by chart/table markup; `nosniff`, `X-Frame-Options: DENY`,
-  `Referrer-Policy: no-referrer` and the rest of the CSP are set on every
-  response.
-* **Static-file fallback hardening** — unknown `/api/*` paths return JSON
-  404 (never the SPA page), dotfiles and `..` are never served, missing
-  assets 404 loudly.
-* The API server holds a startup-time forwarder snapshot for the
-  `/api/upstreams/{id}/test` button (probe *health checks* re-read the
-  live config every round); only `tcp_fallback` could be stale there
-  until the next restart — DNS data-plane selection always uses live
-  config.
+See `config/res.toml` for available options. Security-sensitive deployments
+should terminate/rate-limit at the network edge as well: application controls
+bound in-process memory and CPU, but cannot absorb a volumetric DDoS.
 
 ## Development
 
-```console
-$ cargo fmt --check
-$ cargo clippy --all-targets --all-features -- -D warnings
-$ cargo test
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
 ```
+
+## Limitations
+
+- No recursive resolution or local DNSSEC validation.
+- No native DNS-over-HTTPS (DoH) upstream transport.
+- Application-level rate limiting does not prevent volumetric DDoS attacks; network-level protection is required.
+- Restrict DNS access using ACLs and a host firewall. Do not expose an unrestricted DNS gateway.

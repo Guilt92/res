@@ -62,7 +62,7 @@ use crate::dns::forward::Forwarder;
 use crate::dns::msg::Rcode;
 use crate::events::Event;
 use crate::shared::Shared;
-use crate::upstream::{health::probe_once, HealthStatus};
+use crate::upstream::{health::probe_once, PoolCounts};
 
 /// Name of the session cookie (HttpOnly, SameSite=Strict).
 pub const SESSION_COOKIE: &str = "res_session";
@@ -1035,7 +1035,7 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
 
-    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(&st);
+    let counts = upstream_counts(&st);
     let cfg_state = st.shared.config_state();
 
     Json(json!({
@@ -1113,16 +1113,22 @@ async fn status(State(st): State<ApiState>) -> Json<Value> {
             "memory_bytes": st.shared.cache.memory_bytes(),
         },
         "upstreams": {
-            "total": total,
-            "enabled": enabled,
-            "healthy": healthy,
-            "degraded": degraded,
-            "recovering": recovering,
-            "down": down,
-            "unhealthy": down,
+            "total": counts.total,
+            "enabled": counts.enabled,
+            "disabled": counts.disabled,
+            "healthy": counts.healthy,
+            "degraded": counts.degraded,
+            "recovering": counts.recovering,
+            "usable": counts.usable,
+            "down": counts.unhealthy,
+            "unhealthy": counts.unhealthy,
         },
         "emergency": {
-            "no_healthy_upstreams": total > 0 && healthy == 0,
+            "no_active_upstreams": counts.enabled == 0,
+            "no_healthy_upstreams": counts.no_healthy(),
+            "no_usable_upstreams": counts.emergency(),
+            "active_upstreams": counts.enabled,
+            "usable_upstreams": counts.usable,
         },
         "proxy": {
             "enabled": app.proxy.enabled,
@@ -1179,7 +1185,7 @@ fn build_stats(st: &ApiState) -> Value {
     let errors = responses.saturating_sub(success);
 
     let lat = st.shared.global_latency_stats();
-    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(st);
+    let counts = upstream_counts(st);
 
     let hits = metrics.cache_hits_total.get();
     let misses = metrics.cache_misses_total.get();
@@ -1246,13 +1252,15 @@ fn build_stats(st: &ApiState) -> Value {
             "memory_capacity_bytes": st.shared.rt.load().cache.max_memory_bytes,
         },
         "upstreams": {
-            "total": total,
-            "enabled": enabled,
-            "healthy": healthy,
-            "degraded": degraded,
-            "recovering": recovering,
-            "down": down,
-            "unhealthy": down,
+            "total": counts.total,
+            "enabled": counts.enabled,
+            "disabled": counts.disabled,
+            "healthy": counts.healthy,
+            "degraded": counts.degraded,
+            "recovering": counts.recovering,
+            "usable": counts.usable,
+            "down": counts.unhealthy,
+            "unhealthy": counts.unhealthy,
         },
         "failovers": metrics.failovers_total.get(),
         "timeout_count": metrics.query_errors_total.with_label_values(&["deadline"]).get(),
@@ -1337,7 +1345,7 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
                 .expect("serializable")
         })
         .collect();
-    let (total, enabled, healthy, degraded, recovering, down) = upstream_counts(&st);
+    let counts = upstream_counts(&st);
 
     let metrics = &st.shared.metrics;
     let bound_addr = |a: Option<std::net::SocketAddr>| a.map(|x| x.to_string());
@@ -1369,13 +1377,15 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
             "retry_on_servfail": rt.failover.retry_on_servfail,
         },
         "upstreams": {
-            "total": total,
-            "enabled": enabled,
-            "healthy": healthy,
-            "degraded": degraded,
-            "recovering": recovering,
-            "down": down,
-            "unhealthy": down,
+            "total": counts.total,
+            "enabled": counts.enabled,
+            "disabled": counts.disabled,
+            "healthy": counts.healthy,
+            "degraded": counts.degraded,
+            "recovering": counts.recovering,
+            "usable": counts.usable,
+            "down": counts.unhealthy,
+            "unhealthy": counts.unhealthy,
             "list": upstreams,
         },
         "health_check": {
@@ -1416,7 +1426,11 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
         "failovers_total": metrics.failovers_total.get(),
         "config_errors_total": metrics.config_errors_total.get(),
         "emergency": {
-            "no_healthy_upstreams": total > 0 && healthy == 0,
+            "no_active_upstreams": counts.enabled == 0,
+            "no_healthy_upstreams": counts.no_healthy(),
+            "no_usable_upstreams": counts.emergency(),
+            "active_upstreams": counts.enabled,
+            "usable_upstreams": counts.usable,
         },
         "events": st.shared.events.counts(),
         "resources": {
@@ -1430,26 +1444,8 @@ async fn diagnostics(State(st): State<ApiState>) -> Json<Value> {
     }))
 }
 
-fn upstream_counts(st: &ApiState) -> (usize, usize, usize, usize, usize, usize) {
-    let snap = st.shared.registry.snapshot();
-    let total = snap.len();
-    let mut enabled = 0;
-    let mut healthy = 0;
-    let mut degraded = 0;
-    let mut recovering = 0;
-    let mut down = 0;
-    for u in &snap {
-        if u.is_enabled() {
-            enabled += 1;
-        }
-        match u.health_status() {
-            HealthStatus::Healthy => healthy += 1,
-            HealthStatus::Degraded => degraded += 1,
-            HealthStatus::Recovering => recovering += 1,
-            HealthStatus::Unhealthy => down += 1,
-        }
-    }
-    (total, enabled, healthy, degraded, recovering, down)
+fn upstream_counts(st: &ApiState) -> PoolCounts {
+    PoolCounts::from_snapshot(&st.shared.registry.snapshot())
 }
 
 async fn metrics_endpoint(State(st): State<ApiState>) -> Response {
@@ -3059,7 +3055,7 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
     // UNHEALTHY while any HEALTHY/RECOVERING upstream exists.
     let any_up = rows
         .iter()
-        .any(|r| matches!(r.health, HealthStatus::Healthy | HealthStatus::Recovering));
+        .any(|r| r.enabled && matches!(r.health, HealthStatus::Healthy | HealthStatus::Recovering));
     let degraded_last_resort =
         st.shared.rt.load().selection.degraded_policy == crate::config::DegradedPolicy::LastResort;
     let mut eligible = Vec::new();
@@ -3087,26 +3083,17 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
                 HealthStatus::Recovering => recovering += 1,
                 HealthStatus::Unhealthy => down += 1,
             }
-            let is_eligible = match r.health {
-                HealthStatus::Healthy | HealthStatus::Recovering => true,
-                HealthStatus::Unhealthy => !any_up,
-                HealthStatus::Degraded => !(any_up && degraded_last_resort),
-            };
+            let is_eligible =
+                crate::selection::candidate_eligible(r.health, any_up, degraded_last_resort);
             v["eligible"] = Value::Bool(is_eligible);
             sum_qps += r.qps;
-            let reason = if is_eligible {
-                match r.health {
-                    HealthStatus::Healthy => "healthy",
-                    HealthStatus::Recovering => "recovering",
-                    HealthStatus::Degraded => "degraded_usable",
-                    HealthStatus::Unhealthy => "unhealthy_last_resort",
-                }
-            } else {
-                match r.health {
-                    HealthStatus::Degraded => "degraded_last_resort",
-                    HealthStatus::Unhealthy => "unhealthy_fallback",
-                    _ => "not_eligible",
-                }
+            let reason = match (r.health, is_eligible) {
+                (HealthStatus::Healthy, true) => "healthy",
+                (HealthStatus::Recovering, true) => "recovering",
+                (HealthStatus::Degraded, true) => "degraded_usable",
+                (HealthStatus::Degraded, false) => "degraded_last_resort",
+                (HealthStatus::Unhealthy, _) => "unhealthy",
+                _ => "not_eligible",
             };
             (v, is_eligible, r.score.score, reason.into())
         })
@@ -3161,6 +3148,8 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
             v
         })
         .collect();
+    let usable = up + degraded + recovering;
+    let emergency = !rows.is_empty() && eligible.is_empty();
 
     Json(json!({
         "upstreams": upstreams,
@@ -3174,6 +3163,7 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
             "healthy": up,
             "degraded": degraded,
             "recovering": recovering,
+            "usable": usable,
             "unhealthy": down,
             "down": down,
             "disabled": disabled.len(),
@@ -3183,8 +3173,9 @@ async fn list_upstreams(State(st): State<ApiState>) -> Json<Value> {
             "avoided": avoided,
             "disabled_names": disabled,
             "total_qps": round2(sum_qps),
-            // Same rule as /api/status: no HEALTHY upstream while any exists.
-            "emergency": !rows.is_empty() && up == 0,
+            // Canonical emergency: no configured upstream can serve. A
+            // disabled-but-healthy upstream must not mask this.
+            "emergency": emergency,
         },
     }))
 }

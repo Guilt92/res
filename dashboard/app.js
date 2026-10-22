@@ -1167,9 +1167,9 @@ function renderKpis(){
 
   /* ---- Process & capacity (secondary) ---- */
   const infra = [
-    {k:"Upstreams", v:st.upstreams.healthy+" <small>/</small> "+st.upstreams.total,
-      cls: st.upstreams.healthy===0?"bad":st.upstreams.degraded>0?"":"good",
-      t:{txt:(st.upstreams.unhealthy||0)+" unhe · "+(st.upstreams.recovering||0)+" recov · "+st.upstreams.degraded+" degr", cls: (st.upstreams.unhealthy||st.upstreams.down)?"dn":"flat"}},
+    {k:"Upstreams", v:st.upstreams.healthy+" <small>/</small> "+st.upstreams.enabled,
+      cls: st.upstreams.usable===0?"bad":st.upstreams.healthy===0?"warn":st.upstreams.degraded>0?"":"good",
+      t:{txt:(st.upstreams.disabled||0)+" disabled · "+(st.upstreams.unhealthy||0)+" unhe · "+(st.upstreams.recovering||0)+" recov · "+st.upstreams.degraded+" degr", cls: (st.upstreams.unhealthy||st.upstreams.down)?"dn":"flat"}},
     {k:"In-flight", v:st.inflight.udp, t:{txt:st.inflight.tcp_connections+" tcp", cls:"flat"}},
     {k:"CPU", v:s.resources_cpu!=null?s.resources_cpu+"%":"N/A", t:{txt:"of one core", cls:"flat"}},
     {k:"Memory", v:(s.resources_rss!=null?(s.resources_rss/1048576).toFixed(0)+" <small>MB</small>":"N/A")},
@@ -1509,6 +1509,7 @@ function renderUpState(){
     {k:"Degraded", v:String(intOf(st.degraded)), cls:intOf(st.degraded)?"bad":""},
     {k:"Recovering", v:String(intOf(st.recovering)), cls:intOf(st.recovering)?"":""},
     {k:"Unhealthy", v:String(intOf(st.unhealthy)), cls:intOf(st.unhealthy)?"bad":""},
+    {k:"Usable", v:String(intOf(st.usable)), cls:intOf(st.usable)?"good":"bad"},
     {k:"Disabled", v:String(intOf(st.disabled))},
     {k:"Eligible for selection", v:String((st.eligible||[]).length)},
     {k:"Receiving traffic now", v:String((st.in_use||[]).length)},
@@ -1516,7 +1517,7 @@ function renderUpState(){
     {k:"Avoided (unhealthy, others healthy)", v:String((st.avoided||[]).length),
       cls:intOf(st.avoided)?"bad":""},
     {k:"Pool rate", v:fmtVal(st.total_qps,"qps")},
-    {k:"Emergency", v: st.emergency ? "YES — all SERVFAIL" : "no",
+    {k:"Emergency", v: st.emergency ? "YES — no usable upstream" : "no",
       cls: st.emergency ? "bad" : "good"},
   ]);
   $("up-eligible").innerHTML = nameList(st.eligible);
@@ -1573,10 +1574,12 @@ function renderVerdict(){
   if (!st || !s){ pill.className="pill warn"; txt.textContent="collecting…"; return; }
   let level = "ok", label = "HEALTHY";
   const cfgErr = st.config && st.config.error;
-  const emergency = st.emergency && st.emergency.no_healthy_upstreams;
+  const emergency = st.emergency && st.emergency.no_usable_upstreams;
+  const noHealthy = st.emergency && st.emergency.no_healthy_upstreams;
   const idle = !s.queries_total;
-  if (emergency){ level="crit"; label="CRITICAL · NO HEALTHY UPSTREAM"; }
+  if (emergency){ level="crit"; label="CRITICAL · NO USABLE UPSTREAM"; }
   else if (cfgErr){ level="warn"; label="DEGRADED · CONFIG FALLBACK"; }
+  else if (noHealthy){ level="warn"; label="DEGRADED · NO HEALTHY UPSTREAM"; }
   else if (s.error_rate != null && s.error_rate > 0.10){ level="crit"; label="CRITICAL · FAILING QUERIES"; }
   else if (s.error_rate != null && s.error_rate > 0.01){ level="warn"; label="DEGRADED · ERRORS >1%"; }
   else if (st.upstreams.down > 0){ level="warn"; label="DEGRADED · UPSTREAM DOWN"; }
@@ -1603,13 +1606,17 @@ function renderSignals(){
   const add = (level, tag, title, detail) => S.push({level, tag, title, detail});
 
   // 1. Is the gateway answering at all?
-  const emergency = st.emergency && st.emergency.no_healthy_upstreams;
+  const emergency = st.emergency && st.emergency.no_usable_upstreams;
+  const noHealthy = st.emergency && st.emergency.no_healthy_upstreams;
   if (emergency)
-    add("crit","DOWN","Every upstream is DOWN","clients receive SERVFAIL — check the upstream table and health events");
+    add("crit","DOWN","No usable upstream","clients receive SERVFAIL — every enabled upstream is unhealthy or disabled");
   else if (st.config.error)
     add("warn","CONFIG","Running on "+st.config.source+" configuration","parse error: "+st.config.error);
   else
     add("ok","OK","Gateway is serving","udp "+st.listeners.udp+", api "+st.listeners.api+", v"+st.version);
+  if (!emergency && noHealthy)
+    add("warn","DEGRADED","No fully healthy upstream",
+        "degraded/recovering upstreams are still serving; check health probes and upstream latency");
 
   // 2. Latency vs baseline (nothing to compare until a query was answered).
   const p95pts = seriesFrom(h,"p95_ms");
@@ -1640,13 +1647,15 @@ function renderSignals(){
   // 4. Upstream health.
   if (st.upstreams.total===0)
     add("crit","NO UP","No upstreams configured","add at least one upstream via /api/upstreams");
+  else if (st.upstreams.enabled===0)
+    add("crit","NO ACTIVE","No enabled upstreams", st.upstreams.disabled+" disabled upstream(s) cannot serve queries");
   else if (st.upstreams.down>0)
     add("warn","FAILOVER", st.upstreams.down+" upstream DOWN"+(st.upstreams.down>1?"s":""),
         "traffic is failing over — see upstream table and failover timeline");
   else if (st.upstreams.degraded>0)
     add("warn","DEGRAD", st.upstreams.degraded+" upstream DEGRADED","failing health probes but still receiving traffic");
   else
-    add("ok","OK", st.upstreams.healthy+"/"+st.upstreams.total+" upstreams healthy","active health checking "+(st.health_check.enabled?"on":"OFF"));
+    add("ok","OK", st.upstreams.healthy+"/"+st.upstreams.enabled+" upstreams healthy","active health checking "+(st.health_check.enabled?"on":"OFF"));
 
   // 5-7: window counters. An empty window is not evidence of "no timeouts",
   // it is an absence of measurement — say so instead of claiming a clean run.

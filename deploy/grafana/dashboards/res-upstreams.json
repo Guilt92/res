@@ -50,7 +50,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
-   "description": "HEALTHY (2) or RECOVERING (3) \u2014 both are selected for queries.",
+   "description": "Enabled HEALTHY, DEGRADED or RECOVERING upstreams \u2014 all can be selected for queries.",
    "id": 1,
    "gridPos": {
     "x": 0,
@@ -70,7 +70,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "sum(res_upstream_state >= 2)",
+     "expr": "sum(res_usable_upstreams)",
      "instant": true,
      "range": false
     }
@@ -141,7 +141,7 @@
   },
   {
    "type": "stat",
-   "title": "Availability (5m, UP=100%)",
+   "title": "Healthy share (5m)",
    "fieldConfig": {
     "defaults": {
      "noValue": "No data",
@@ -178,6 +178,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
+   "description": "Share of enabled upstreams that were fully HEALTHY over the window; disabled upstreams are excluded.",
    "id": 3,
    "gridPos": {
     "x": 8,
@@ -197,7 +198,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "100 * avg(avg_over_time(res_upstream_health[5m]))",
+     "expr": "100 * sum(avg_over_time(res_healthy_upstreams[5m])) / clamp_min(sum(avg_over_time(res_active_upstreams[5m])), 1)",
      "range": true
     }
    ]
@@ -884,7 +885,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "res_upstream_state",
+     "expr": "res_upstream_state and on(upstream) res_upstream_enabled == 1",
      "range": true
     }
    ]

@@ -144,33 +144,30 @@ impl From<&crate::config::SelectionConfig> for Policies {
     }
 }
 
-/// Keep only usable candidates (UP / DEGRADED, honouring the degraded
-/// policy) and apply the tier policy.
+/// Whether a candidate may be selected. `any_up` must be computed over
+/// *enabled* upstreams only. UNHEALTHY is never eligible; unlike DEGRADED it
+/// has no last-resort policy because sending queries to a failing upstream
+/// would mask the outage instead of surfacing it.
+pub fn candidate_eligible(health: HealthStatus, any_up: bool, degraded_last_resort: bool) -> bool {
+    match health {
+        HealthStatus::Healthy | HealthStatus::Recovering => true,
+        HealthStatus::Degraded => !(any_up && degraded_last_resort),
+        HealthStatus::Unhealthy => false,
+    }
+}
+
+/// Keep only usable candidates (UP / RECOVERING / DEGRADED, honouring the
+/// degraded policy) and apply the tier policy.
 fn eligible(candidates: &[StateView], p: &Policies) -> Vec<StateView> {
+    let any_up = candidates
+        .iter()
+        .any(|c| matches!(c.health, HealthStatus::Healthy | HealthStatus::Recovering));
+    let degraded_last_resort = p.degraded_policy == DegradedPolicy::LastResort;
     let usable: Vec<StateView> = candidates
         .iter()
         .copied()
-        .filter(|c| c.health.is_usable())
+        .filter(|c| candidate_eligible(c.health, any_up, degraded_last_resort))
         .collect();
-    // `last_resort`: degraded only when nothing is UP.
-    let usable = match p.degraded_policy {
-        DegradedPolicy::Usable => usable,
-        DegradedPolicy::LastResort => {
-            if usable
-                .iter()
-                .any(|c| matches!(c.health, HealthStatus::Healthy | HealthStatus::Recovering))
-            {
-                usable
-                    .into_iter()
-                    .filter(|c| {
-                        matches!(c.health, HealthStatus::Healthy | HealthStatus::Recovering)
-                    })
-                    .collect()
-            } else {
-                usable
-            }
-        }
-    };
     let Some(best) = usable.iter().map(|c| c.priority).min() else {
         return Vec::new();
     };
@@ -366,6 +363,16 @@ mod tests {
             latency_reference_ms: 50.0,
             policies: p,
         }
+    }
+
+    #[test]
+    fn eligibility_matches_selection_semantics() {
+        assert!(candidate_eligible(HealthStatus::Healthy, false, false));
+        assert!(candidate_eligible(HealthStatus::Recovering, true, true));
+        assert!(candidate_eligible(HealthStatus::Degraded, false, true));
+        assert!(!candidate_eligible(HealthStatus::Degraded, true, true));
+        assert!(candidate_eligible(HealthStatus::Degraded, true, false));
+        assert!(!candidate_eligible(HealthStatus::Unhealthy, false, false));
     }
 
     #[test]

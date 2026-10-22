@@ -702,6 +702,70 @@ pub fn classify_rcode(rcode: Rcode) -> OutcomeKind {
     }
 }
 
+/// Canonical, enabled-only pool counts shared by the API, Grafana gauges and
+/// emergency detection. Disabled upstreams never contribute to health or
+/// availability: their last observed state is historical, not operational.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolCounts {
+    pub total: usize,
+    pub enabled: usize,
+    pub disabled: usize,
+    pub healthy: usize,
+    pub degraded: usize,
+    pub recovering: usize,
+    pub unhealthy: usize,
+    /// Enabled upstreams in a state selection may use (HEALTHY, DEGRADED or
+    /// RECOVERING). This is the broad pool availability, independent of the
+    /// `degraded_policy` preference.
+    pub usable: usize,
+}
+
+impl PoolCounts {
+    pub fn from_snapshot(snapshot: &[Arc<UpstreamRuntime>]) -> Self {
+        Self::from_states(
+            snapshot
+                .iter()
+                .map(|u| (u.config().enabled, u.health_status())),
+        )
+    }
+
+    pub fn from_states(states: impl IntoIterator<Item = (bool, HealthStatus)>) -> Self {
+        let mut counts = Self::default();
+        for (enabled, health) in states {
+            counts.total += 1;
+            if !enabled {
+                counts.disabled += 1;
+                continue;
+            }
+            counts.enabled += 1;
+            match health {
+                HealthStatus::Healthy => counts.healthy += 1,
+                HealthStatus::Degraded => counts.degraded += 1,
+                HealthStatus::Recovering => counts.recovering += 1,
+                HealthStatus::Unhealthy => counts.unhealthy += 1,
+            }
+            if health.is_usable() {
+                counts.usable += 1;
+            }
+        }
+        counts
+    }
+
+    /// No enabled upstream is in the fully healthy state. Operationally this
+    /// is degraded (degraded/recovering upstreams may still serve), not an
+    /// outage by itself.
+    pub fn no_healthy(&self) -> bool {
+        self.enabled > 0 && self.healthy == 0
+    }
+
+    /// No upstream can serve a query: either every configured upstream is
+    /// disabled or every enabled upstream is UNHEALTHY. A completely empty
+    /// pool is a configuration problem, reported separately by the API.
+    pub fn emergency(&self) -> bool {
+        self.total > 0 && self.usable == 0
+    }
+}
+
 /// Atomic map of upstream id -> shared runtime state.
 #[derive(Default)]
 pub struct Registry {
@@ -779,6 +843,53 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_counts_ignore_disabled_upstreams() {
+        let counts = PoolCounts::from_states([
+            (true, HealthStatus::Healthy),
+            (true, HealthStatus::Degraded),
+            (true, HealthStatus::Unhealthy),
+            (false, HealthStatus::Healthy),
+        ]);
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.enabled, 3);
+        assert_eq!(counts.disabled, 1);
+        assert_eq!(counts.healthy, 1);
+        assert_eq!(counts.degraded, 1);
+        assert_eq!(counts.unhealthy, 1);
+        assert_eq!(counts.usable, 2);
+        assert!(!counts.no_healthy());
+        assert!(!counts.emergency());
+    }
+
+    #[test]
+    fn disabled_or_unhealthy_pool_is_an_emergency() {
+        let disabled = PoolCounts::from_states([
+            (false, HealthStatus::Healthy),
+            (false, HealthStatus::Recovering),
+        ]);
+        assert_eq!(disabled.healthy, 0);
+        assert_eq!(disabled.usable, 0);
+        assert!(disabled.emergency());
+
+        let unhealthy = PoolCounts::from_states([
+            (true, HealthStatus::Unhealthy),
+            (true, HealthStatus::Unhealthy),
+        ]);
+        assert!(unhealthy.no_healthy());
+        assert!(unhealthy.emergency());
+    }
+
+    #[test]
+    fn degraded_or_recovering_upstream_keeps_the_pool_available() {
+        for health in [HealthStatus::Degraded, HealthStatus::Recovering] {
+            let counts = PoolCounts::from_states([(true, health)]);
+            assert!(counts.no_healthy());
+            assert!(!counts.emergency());
+            assert_eq!(counts.usable, 1);
+        }
+    }
 
     fn cfg(id: i64, name: &str) -> UpstreamConfig {
         UpstreamConfig {

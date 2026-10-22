@@ -23,7 +23,7 @@ use crate::dns::forward::Forwarder;
 use crate::dns::msg::{self, Rcode};
 use crate::metrics::Metrics;
 use crate::shared::Shared;
-use crate::upstream::{HealthStatus, HealthTransition, UpstreamRuntime};
+use crate::upstream::{HealthStatus, HealthTransition, PoolCounts, UpstreamRuntime};
 
 /// Thresholds for the health state machine.
 #[derive(Debug, Clone, Copy)]
@@ -394,35 +394,31 @@ fn log_transition(name: &str, t: HealthTransition, error: &Option<String>) {
     }
 }
 
-/// Refresh the derived gauges (active / healthy counts + per-upstream state)
-/// and emit a system event when the pool enters/leaves total failure.
-pub fn refresh_gauges(shared: &Arc<Shared>, metrics: &Arc<Metrics>) {
+/// Refresh the derived gauges (active / healthy / usable counts, per-upstream
+/// state and enabled labels) and emit a system event when the pool enters or
+/// leaves total failure.
+pub fn refresh_gauges(shared: &Shared, metrics: &Arc<Metrics>) {
     let snapshot = shared.registry.snapshot();
-    let mut active = 0i64;
-    let mut healthy = 0i64;
-    let total = snapshot.len() as i64;
+    let counts = PoolCounts::from_snapshot(&snapshot);
     for up in &snapshot {
         let cfg = up.config();
-        if cfg.enabled {
-            active += 1;
-        }
         let status = up.health_status();
-        if status == HealthStatus::Healthy {
-            healthy += 1;
-        }
+        metrics.set_upstream_enabled(&cfg.name, cfg.enabled);
         metrics.set_upstream_health(
             &cfg.name,
-            status == HealthStatus::Healthy,
+            cfg.enabled && status == HealthStatus::Healthy,
             status.state_value(),
         );
     }
-    metrics.active_upstreams.set(active);
-    metrics.healthy_upstreams.set(healthy);
+    metrics.active_upstreams.set(counts.enabled as i64);
+    metrics.healthy_upstreams.set(counts.healthy as i64);
+    metrics.usable_upstreams.set(counts.usable as i64);
 
-    // Emergency: every upstream is DOWN while at least one exists — clients
-    // are receiving SERVFAIL. Emit exactly once per transition (the sampler
-    // calls this every second, so no cooldown is needed).
-    let emergency = total > 0 && healthy == 0;
+    // Emergency: no configured upstream can serve — all disabled or all
+    // enabled upstreams UNHEALTHY. Degraded/recovering upstreams remain
+    // selectable, so they are not an emergency. Emit exactly once per
+    // transition (the sampler calls this every second).
+    let emergency = counts.emergency();
     let was = shared.emergency.load(std::sync::atomic::Ordering::Relaxed);
     if emergency != was {
         shared
@@ -432,22 +428,39 @@ pub fn refresh_gauges(shared: &Arc<Shared>, metrics: &Arc<Metrics>) {
             shared.push_system_event(
                 "all_upstreams_down",
                 serde_json::json!({
-                    "active": active,
-                    "total": total,
-                    "detail": "no healthy upstream remains - clients are getting SERVFAIL",
+                    "active": counts.enabled,
+                    "total": counts.total,
+                    "usable": counts.usable,
+                    "healthy": counts.healthy,
+                    "detail": "no enabled usable upstream remains - clients are getting SERVFAIL",
                 }),
                 None,
                 None,
             );
-            tracing::error!(event = "emergency_no_healthy_upstreams", active, total);
+            tracing::error!(
+                event = "emergency_no_usable_upstreams",
+                active = counts.enabled,
+                total = counts.total,
+                usable = counts.usable
+            );
         } else {
             shared.push_system_event(
                 "all_upstreams_recovered",
-                serde_json::json!({ "active": active, "healthy": healthy }),
+                serde_json::json!({
+                    "active": counts.enabled,
+                    "total": counts.total,
+                    "usable": counts.usable,
+                    "healthy": counts.healthy,
+                }),
                 None,
                 None,
             );
-            tracing::info!(event = "emergency_cleared", healthy, total);
+            tracing::info!(
+                event = "emergency_cleared",
+                healthy = counts.healthy,
+                usable = counts.usable,
+                total = counts.total
+            );
         }
     }
 }

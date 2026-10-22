@@ -410,9 +410,10 @@ def overview():
         "Upstream pool & failovers",
         [
             target("res_healthy_upstreams", legend="healthy upstreams", ref="A"),
-            target("res_active_upstreams", legend="active upstreams", ref="B"),
+            target("res_usable_upstreams", legend="usable upstreams", ref="B"),
+            target("res_active_upstreams", legend="active upstreams", ref="C"),
             target(f"60 * rate(res_failovers_total{RI})",
-                   legend="failovers / min", ref="C"),
+                   legend="failovers / min", ref="D"),
         ],
         0, 18, 12, 8, unit="short", thresholds=[
             {"color": "red", "value": None}, {"color": "green", "value": 1},
@@ -533,16 +534,18 @@ def upstreams():
         ["res", "dns", "upstreams"],
     )
 
-    d.stat("Usable upstreams", "sum(res_upstream_state >= 2)",
+    d.stat("Usable upstreams", "sum(res_usable_upstreams)",
            0, 0, 4, 2, unit="short",
            thresholds=[{"color": "red", "value": None}, {"color": "green", "value": 1}],
            instant=True,
-           description="HEALTHY (2) or RECOVERING (3) — both are selected for queries.")
+           description="Enabled HEALTHY, DEGRADED or RECOVERING upstreams — all can be selected for queries.")
     d.stat("Active upstreams", "res_active_upstreams",
            4, 0, 4, 2, unit="short", thresholds=GREEN, instant=True)
-    d.stat("Availability (5m, UP=100%)",
-           "100 * avg(avg_over_time(res_upstream_health[5m]))",
-           8, 0, 4, 2, unit="percent", decimals=1, thresholds=GREEN)
+    d.stat("Healthy share (5m)",
+           "100 * sum(avg_over_time(res_healthy_upstreams[5m])) "
+           "/ clamp_min(sum(avg_over_time(res_active_upstreams[5m])), 1)",
+           8, 0, 4, 2, unit="percent", decimals=1, thresholds=GREEN,
+           description="Share of enabled upstreams that were fully HEALTHY over the window; disabled upstreams are excluded.")
     d.stat("Forwarded in range", f"sum(increase(res_upstream_queries_total{RG}))",
            12, 0, 4, 2, unit="short", thresholds=GREEN, instant=True)
     d.stat("Failovers in range", f"sum(increase(res_upstream_failovers_total{RG}))",
@@ -596,7 +599,8 @@ def upstreams():
 
     d.state_timeline(
         "Upstream health state (0=UNHEALTHY, 1=DEGRADED, 2=HEALTHY, 3=RECOVERING)",
-        "res_upstream_state", 0, 20, 12, 8,
+        "res_upstream_state and on(upstream) res_upstream_enabled == 1",
+        0, 20, 12, 8,
     )
     d.timeseries(
         "Health-check results (rate)",
@@ -788,16 +792,16 @@ def failures():
 
     d.stat(
         "Emergency (all upstreams down)",
-        "(sum(res_active_upstreams) > bool 0) * (sum(res_healthy_upstreams) == bool 0)",
+        "(sum(res_active_upstreams) > bool 0) * (sum(res_usable_upstreams) == bool 0)",
         0, 26, 4, 4, unit="short", instant=True,
         mappings=[{"type": "value", "options": {
             "0": {"text": "OK", "color": "green"},
             "1": {"text": "EMERGENCY", "color": "red"}}}],
         thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
-        description="1 when at least one upstream is configured but none is HEALTHY "
-                    "(clients are receiving SERVFAIL).",
+        description="1 when at least one upstream is enabled but none is HEALTHY, "
+                    "DEGRADED or RECOVERING (clients are receiving SERVFAIL).",
     )
-    d.stat("Unhealthy upstreams", "sum(res_active_upstreams) - sum(res_healthy_upstreams)",
+    d.stat("Unusable upstreams", "sum(res_active_upstreams) - sum(res_usable_upstreams)",
            4, 26, 4, 4, unit="short", instant=True,
            thresholds=[{"color": "green", "value": None}, {"color": "yellow", "value": 1},
                        {"color": "red", "value": 3}])

@@ -69,8 +69,9 @@ pub struct Shared {
     /// Actual bound listener addresses (filled in at startup; differs from
     /// the configured address when port 0 is used, e.g. in tests).
     pub bound: std::sync::RwLock<BoundAddrs>,
-    /// True while every enabled upstream is DOWN (SERVFAIL for all clients).
-    /// Toggled by the health checker's gauge refresh.
+    /// True while no enabled upstream can serve (all disabled or all
+    /// UNHEALTHY; degraded/recovering still count as usable). Toggled by the
+    /// health checker's gauge refresh.
     pub emergency: AtomicBool,
     /// Monotonic counter bumped on every successful `replace_config`; the
     /// API returns it so clients can detect stale updates (optimistic
@@ -263,6 +264,7 @@ impl Shared {
         self.metrics
             .cache_memory_bytes
             .set(self.cache.memory_bytes() as i64);
+        crate::upstream::health::refresh_gauges(self, &self.metrics);
         self.config_generation.fetch_add(1, Ordering::Release);
         self.metrics.config_reloads_total.inc();
         tracing::info!(event = "configuration_reloaded");

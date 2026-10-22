@@ -1209,7 +1209,7 @@
     "graphMode": "none",
     "justifyMode": "auto"
    },
-   "description": "1 when at least one upstream is configured but none is HEALTHY (clients are receiving SERVFAIL).",
+   "description": "1 when at least one upstream is enabled but none is HEALTHY, DEGRADED or RECOVERING (clients are receiving SERVFAIL).",
    "id": 15,
    "gridPos": {
     "x": 0,
@@ -1229,7 +1229,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "(sum(res_active_upstreams) > bool 0) * (sum(res_healthy_upstreams) == bool 0)",
+     "expr": "(sum(res_active_upstreams) > bool 0) * (sum(res_usable_upstreams) == bool 0)",
      "instant": true,
      "range": false
     }
@@ -1237,7 +1237,7 @@
   },
   {
    "type": "stat",
-   "title": "Unhealthy upstreams",
+   "title": "Unusable upstreams",
    "fieldConfig": {
     "defaults": {
      "noValue": "No data",
@@ -1300,7 +1300,7 @@
      },
      "refId": "A",
      "editorMode": "code",
-     "expr": "sum(res_active_upstreams) - sum(res_healthy_upstreams)",
+     "expr": "sum(res_active_upstreams) - sum(res_usable_upstreams)",
      "instant": true,
      "range": false
     }

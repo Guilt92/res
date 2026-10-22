@@ -332,23 +332,28 @@ async fn sampler(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
 /// Sample per-upstream selection score and rank into Prometheus gauges.
 ///
 /// Mirrors the eligibility rules used by `/api/upstreams` and the selector:
-/// disabled upstreams score 0; UNHEALTHY is scored 0 while any HEALTHY/
-/// RECOVERING upstream exists; DEGRADED is scored 0 under
-/// `degraded_policy = last_resort` in the same situation. Rank is assigned
-/// only to eligible upstreams (1 = highest score).
+/// disabled upstreams never participate, UNHEALTHY is never eligible, and
+/// DEGRADED is ineligible only under `degraded_policy = last_resort` while a
+/// HEALTHY/RECOVERING upstream exists. Rank is assigned only to eligible
+/// upstreams (1 = highest score).
 fn sample_score_rank(shared: &Shared) {
     let rt = shared.rt.load();
-    let views: Vec<crate::selection::StateView> = shared
-        .registry
-        .snapshot()
+    let snapshot = shared.registry.snapshot();
+    let views: Vec<_> = snapshot
         .iter()
-        .map(|u| crate::selection::StateView::from_runtime(u, rt.selection.min_probe_samples))
+        .map(|u| {
+            (
+                u,
+                crate::selection::StateView::from_runtime(u, rt.selection.min_probe_samples),
+            )
+        })
         .collect();
-    let any_up = views.iter().any(|v| {
-        matches!(
-            v.health,
-            crate::upstream::HealthStatus::Healthy | crate::upstream::HealthStatus::Recovering
-        )
+    let any_up = views.iter().any(|(u, v)| {
+        u.config().enabled
+            && matches!(
+                v.health,
+                crate::upstream::HealthStatus::Healthy | crate::upstream::HealthStatus::Recovering
+            )
     });
     let degraded_last_resort =
         rt.selection.degraded_policy == crate::config::DegradedPolicy::LastResort;
@@ -356,33 +361,23 @@ fn sample_score_rank(shared: &Shared) {
     // Score every upstream; collect eligible ones for ranking.
     let mut scores: Vec<(i64, String, f64, bool)> = Vec::with_capacity(views.len());
     let mut eligible: Vec<(i64, f64)> = Vec::new();
-    for v in &views {
-        let up = shared.registry.get(v.id);
-        let name = up
-            .as_ref()
-            .map(|u| u.config().name.clone())
-            .unwrap_or_default();
-        let enabled = up.as_ref().map(|u| u.config().enabled).unwrap_or(false);
-        if !enabled {
-            scores.push((v.id, name, 0.0, false));
+    for (up, view) in &views {
+        let name = up.config().name.clone();
+        if !up.config().enabled {
+            scores.push((view.id, name, 0.0, false));
             continue;
         }
-        let is_eligible = match v.health {
-            crate::upstream::HealthStatus::Healthy | crate::upstream::HealthStatus::Recovering => {
-                true
-            }
-            crate::upstream::HealthStatus::Unhealthy => !any_up,
-            crate::upstream::HealthStatus::Degraded => !(any_up && degraded_last_resort),
-        };
+        let is_eligible =
+            crate::selection::candidate_eligible(view.health, any_up, degraded_last_resort);
         let score = if is_eligible {
-            v.score(rt.selection.latency_reference_ms)
+            view.score(rt.selection.latency_reference_ms)
         } else {
             0.0
         };
         if is_eligible {
-            eligible.push((v.id, score));
+            eligible.push((view.id, score));
         }
-        scores.push((v.id, name, score, is_eligible));
+        scores.push((view.id, name, score, is_eligible));
     }
 
     // Rank eligible by score desc (ties by id for determinism).

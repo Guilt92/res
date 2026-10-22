@@ -1018,6 +1018,17 @@
      },
      "refId": "B",
      "editorMode": "code",
+     "expr": "res_usable_upstreams",
+     "legendFormat": "usable upstreams",
+     "range": true
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prometheus"
+     },
+     "refId": "C",
+     "editorMode": "code",
      "expr": "res_active_upstreams",
      "legendFormat": "active upstreams",
      "range": true
@@ -1027,7 +1038,7 @@
       "type": "prometheus",
       "uid": "prometheus"
      },
-     "refId": "C",
+     "refId": "D",
      "editorMode": "code",
      "expr": "60 * rate(res_failovers_total[$__rate_interval])",
      "legendFormat": "failovers / min",

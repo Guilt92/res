@@ -435,13 +435,19 @@ pub fn global_exprs(w: &str) -> Vec<(&'static str, String)> {
         ("healthy", "res_healthy_upstreams".into()),
         (
             "degraded",
-            "sum(res_upstream_state == 1) or vector(0)".into(),
+            "sum(res_upstream_state == 1 and on(upstream) res_upstream_enabled == 1) or vector(0)"
+                .into(),
         ),
         (
             "recovering",
-            "sum(res_upstream_state == 3) or vector(0)".into(),
+            "sum(res_upstream_state == 3 and on(upstream) res_upstream_enabled == 1) or vector(0)"
+                .into(),
         ),
-        ("down", "sum(res_upstream_state == 0) or vector(0)".into()),
+        (
+            "down",
+            "sum(res_upstream_state == 0 and on(upstream) res_upstream_enabled == 1) or vector(0)"
+                .into(),
+        ),
         ("cache_entries", "res_cache_entries".into()),
         ("cache_capacity", "res_cache_capacity".into()),
         ("cache_memory_bytes", "res_cache_memory_bytes".into()),

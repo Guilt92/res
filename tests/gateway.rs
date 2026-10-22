@@ -1189,7 +1189,11 @@ fn body_health(body: &str, name: &str) -> Option<String> {
 /// Value of one exact `name{labels}` line from a Prometheus exposition
 /// (`None` when the series was never exported).
 fn metric_f64(text: &str, name: &str, labels: &str) -> Option<f64> {
-    let head = format!("{name}{{{labels}}}");
+    let head = if labels.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}{{{labels}}}")
+    };
     text.lines().find_map(|l| {
         let mut it = l.split_whitespace();
         (it.next()? == head)
@@ -1459,6 +1463,83 @@ async fn config_mutations_persist_atomically_with_backup() {
     let _ = std::fs::remove_dir_all(&dir);
     gw.shutdown().await;
     fake.stop().await;
+}
+
+/// Disabled upstreams keep historical health, but that state must never
+/// count as availability or hide an all-disabled outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_upstreams_are_excluded_from_health_and_emergency_counts() {
+    let live = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    let mut enabled = live.config("enabled");
+    enabled.priority = 1;
+    let mut disabled = live.config("disabled");
+    disabled.enabled = false;
+    disabled.priority = 2;
+    cfg.upstreams.push(enabled);
+    cfg.upstreams.push(disabled);
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let udp = gw.udp_addr().expect("udp addr");
+
+    let resp = udp_query(udp, "counts.test").await.expect("response");
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+
+    let (status, body) = http("GET", api, "/api/status", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["upstreams"]["total"], 2, "{body}");
+    assert_eq!(v["upstreams"]["enabled"], 1, "{body}");
+    assert_eq!(v["upstreams"]["disabled"], 1, "{body}");
+    assert_eq!(v["upstreams"]["healthy"], 1, "{body}");
+    assert_eq!(v["upstreams"]["usable"], 1, "{body}");
+    assert_eq!(v["emergency"]["no_usable_upstreams"], false, "{body}");
+    assert_eq!(v["emergency"]["no_healthy_upstreams"], false, "{body}");
+
+    let (status, body) = http("GET", api, "/metrics", None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        metric_f64(&body, "res_active_upstreams", ""),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        metric_f64(&body, "res_healthy_upstreams", ""),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        metric_f64(&body, "res_usable_upstreams", ""),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        metric_f64(&body, "res_upstream_enabled", r#"upstream="disabled""#),
+        Some(0.0),
+        "{body}"
+    );
+
+    gw.shutdown().await;
+    live.stop().await;
+
+    // All-disabled is a real outage even though historical health was OK.
+    let only_disabled = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    let mut disabled = only_disabled.config("only-disabled");
+    disabled.enabled = false;
+    cfg.upstreams.push(disabled);
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+    let (status, body) = http("GET", api, "/api/status", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["upstreams"]["healthy"], 0, "{body}");
+    assert_eq!(v["upstreams"]["enabled"], 0, "{body}");
+    assert_eq!(v["emergency"]["no_active_upstreams"], true, "{body}");
+    assert_eq!(v["emergency"]["no_usable_upstreams"], true, "{body}");
+
+    gw.shutdown().await;
+    only_disabled.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -73,6 +73,8 @@ pub struct Metrics {
     pub upstream_latency: HistogramVec,
     pub upstream_health: IntGaugeVec,
     pub upstream_state: IntGaugeVec,
+    /// Whether the upstream is enabled (1) or administratively disabled (0).
+    pub upstream_enabled: IntGaugeVec,
     /// Health-check probe rounds by result (`success` / `failure`).
     pub healthcheck_total: IntCounterVec,
     /// Latency of successful health-check probe rounds.
@@ -96,6 +98,7 @@ pub struct Metrics {
     pub healthcheck_reason_total: IntCounterVec,
     pub active_upstreams: IntGauge,
     pub healthy_upstreams: IntGauge,
+    pub usable_upstreams: IntGauge,
     pub failovers_total: IntCounter,
     /// Extra latency paid by clients because earlier upstream attempts failed
     /// (observed only when failover eventually succeeded).
@@ -309,6 +312,14 @@ impl Metrics {
             &["upstream"],
         )
         .expect("metric");
+        let upstream_enabled = IntGaugeVec::new(
+            Opts::new(
+                "res_upstream_enabled",
+                "Whether the upstream is enabled (1) or administratively disabled (0)",
+            ),
+            &["upstream"],
+        )
+        .expect("metric");
         let healthcheck_total = mk1(
             "res_healthcheck_total",
             "Health-check probe rounds by result",
@@ -369,7 +380,12 @@ impl Metrics {
         .expect("metric");
         let healthy_upstreams = IntGauge::with_opts(Opts::new(
             "res_healthy_upstreams",
-            "Upstreams in the UP state",
+            "Enabled upstreams in the UP state",
+        ))
+        .expect("metric");
+        let usable_upstreams = IntGauge::with_opts(Opts::new(
+            "res_usable_upstreams",
+            "Enabled upstreams selectable by the pool (HEALTHY, DEGRADED or RECOVERING)",
         ))
         .expect("metric");
         let failovers_total = mk(
@@ -558,6 +574,7 @@ impl Metrics {
         for g in [
             &upstream_health,
             &upstream_state,
+            &upstream_enabled,
             &healthcheck_last_success_timestamp_seconds,
             &upstream_score,
             &upstream_rank,
@@ -567,6 +584,7 @@ impl Metrics {
         for g in [
             &active_upstreams,
             &healthy_upstreams,
+            &usable_upstreams,
             &cache_entries,
             &cache_capacity,
             &cache_memory_bytes,
@@ -622,6 +640,7 @@ impl Metrics {
             upstream_latency,
             upstream_health,
             upstream_state,
+            upstream_enabled,
             healthcheck_total,
             healthcheck_duration_seconds,
             healthcheck_last_success_timestamp_seconds,
@@ -632,6 +651,7 @@ impl Metrics {
             healthcheck_reason_total,
             active_upstreams,
             healthy_upstreams,
+            usable_upstreams,
             failovers_total,
             failover_latency,
             proxy_enabled,
@@ -695,11 +715,19 @@ impl Metrics {
         }
     }
 
+    /// Record whether an upstream is administratively enabled.
+    pub fn set_upstream_enabled(&self, name: &str, enabled: bool) {
+        self.upstream_enabled
+            .with_label_values(&[name])
+            .set(i64::from(enabled));
+    }
+
     /// Remove every per-upstream series for a deleted upstream (bounded rcode
     /// label set — the only values [`crate::dns::msg::Rcode`] can produce).
     pub fn drop_upstream(&self, name: &str) {
         let _ = self.upstream_health.remove_label_values(&[name]);
         let _ = self.upstream_state.remove_label_values(&[name]);
+        let _ = self.upstream_enabled.remove_label_values(&[name]);
         let _ = self.upstream_queries_total.remove_label_values(&[name]);
         let _ = self.upstream_failures_total.remove_label_values(&[name]);
         let _ = self.upstream_timeouts_total.remove_label_values(&[name]);
@@ -893,7 +921,9 @@ mod tests {
             .observe(0.001);
         m.upstream_health.with_label_values(&["warmup"]).set(1);
         m.upstream_state.with_label_values(&["warmup"]).set(2);
+        m.upstream_enabled.with_label_values(&["warmup"]).set(1);
         m.set_upstream_health("warmup", true, 2);
+        m.set_upstream_enabled("warmup", true);
         m.healthcheck_total
             .with_label_values(&["warmup", "success"])
             .inc();
@@ -930,6 +960,9 @@ mod tests {
             "res_cache_capacity",
             "res_cache_memory_bytes",
             "res_active_upstreams",
+            "res_healthy_upstreams",
+            "res_usable_upstreams",
+            "res_upstream_enabled",
             "res_failovers_total",
             "res_failover_latency_seconds",
             "res_acl_denied_total",

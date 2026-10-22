@@ -1,26 +1,53 @@
 groups:
   - name: res
     rules:
-      - alert: ResNoHealthyUpstreams
-        expr: res_healthy_upstreams == 0
+      - alert: ResMetricsAbsent
+        expr: absent(up{job="res"}) or up{job="res"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway metrics are unavailable"
+          description: "Prometheus has not scraped res successfully for over a minute; availability, error and capacity signals are blind."
+
+      - alert: ResNoActiveUpstreams
+        expr: sum(res_active_upstreams) == 0
         for: 30s
         labels:
           severity: critical
         annotations:
-          summary: "No healthy upstreams"
-          description: "All upstreams are unhealthy/degraded; the gateway cannot answer new queries."
+          summary: "No enabled upstreams"
+          description: "Every configured upstream is disabled or none is configured; the gateway cannot resolve queries."
+
+      - alert: ResNoUsableUpstreams
+        expr: sum(res_active_upstreams) > 0 and sum(res_usable_upstreams) == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "No usable upstreams"
+          description: "Every enabled upstream is UNHEALTHY; clients are receiving SERVFAIL."
+
+      - alert: ResNoHealthyUpstreams
+        expr: sum(res_active_upstreams) > 0 and sum(res_healthy_upstreams) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No fully healthy upstreams"
+          description: "Degraded or recovering upstreams may still be serving; investigate why no upstream passes its health checks."
 
       - alert: ResSingleHealthyUpstream
-        expr: res_healthy_upstreams == 1
+        expr: sum(res_healthy_upstreams) == 1
         for: 2m
         labels:
           severity: warning
         annotations:
           summary: "Only one healthy upstream"
-          description: "Redundancy is lost; a second failure will trigger emergency mode."
+          description: "Redundancy is lost; a second failure may leave only degraded/recovering upstreams or trigger an outage."
 
       - alert: ResUpstreamUnhealthy
-        expr: res_upstream_state == 0
+        expr: res_upstream_state == 0 and on(upstream) res_upstream_enabled == 1
         for: 1m
         labels:
           severity: warning
@@ -29,7 +56,7 @@ groups:
           description: "State has been unhealthy for over a minute."
 
       - alert: ResUpstreamFlapping
-        expr: increase(res_upstream_state_changes_total[10m]) > 4
+        expr: increase(res_upstream_state_changes_total[10m]) > 4 and on(upstream) res_upstream_enabled == 1
         for: 0s
         labels:
           severity: warning

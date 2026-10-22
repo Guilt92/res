@@ -3896,7 +3896,9 @@ async fn api_cache_reports_and_updates_byte_cap() {
 /// served, security headers on every response.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dashboard_fallback_is_hardened() {
-    let dash = std::env::current_dir().expect("cwd").join("dashboard");
+    // Use the same relative directory as `config/res.toml`; this catches
+    // regressions where the dashboard is silently treated as disabled.
+    let dash = std::path::PathBuf::from("dashboard");
     assert!(
         dash.join("index.html").exists(),
         "repo dashboard must exist"

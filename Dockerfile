@@ -30,18 +30,23 @@ COPY src ./src
 RUN touch src/main.rs src/lib.rs src/bin/*.rs && cargo build --release
 
 FROM debian:trixie-slim
+# /app must stay traversable by the runtime UID: the dashboard path is relative
+# to WORKDIR and compose may run the process as another UID. /etc/res stays
+# private and writable only by the image user (the bind mount overrides it).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 res && \
     useradd --uid 10001 --gid 10001 --no-create-home \
         --home-dir /nonexistent --shell /usr/sbin/nologin res && \
-    install -d -o res -g res -m 0750 /etc/res /app
+    install -d -o res -g res -m 0750 /etc/res && \
+    install -d -o res -g res -m 0755 /app
 
 COPY --from=builder --chown=res:res /build/target/release/res /usr/local/bin/res
 COPY --from=builder --chown=res:res /build/target/release/res-loadtest /usr/local/bin/res-loadtest
 COPY --chown=res:res config/res.toml /etc/res/res.toml
 COPY --chown=res:res dashboard /app/dashboard
+RUN chmod -R a+rX /app/dashboard
 COPY --chmod=0755 --chown=res:res docker/entrypoint.sh /usr/local/bin/res-entrypoint
 
 WORKDIR /app

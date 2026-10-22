@@ -292,36 +292,37 @@ impl Pipeline {
                 // adaptation: what one client is allowed to receive (UDP
                 // size limits, EDNS presence) must not define what every
                 // later client reads out of the shared cache.
+                let mut response = success.response;
                 if let Some(key) = &prepared.cache_key {
                     // Positive caching (NOERROR with answers) and RFC 2308
                     // negative caching (NXDOMAIN / NODATA with an SOA).
                     let entry = if success.rcode == Rcode::NoError && !success.truncated {
                         msg::cacheable_ttl(
-                            &success.response,
+                            &response,
                             prepared.cache_cfg.min_ttl_secs,
                             prepared.cache_cfg.max_ttl_secs,
                         )
                         .map(|t| (t, Rcode::NoError))
                         .or_else(|| {
-                            msg::negative_ttl(
-                                &success.response,
-                                prepared.cache_cfg.negative_max_ttl_secs,
-                            )
-                            .map(|t| (t, success.rcode))
+                            msg::negative_ttl(&response, prepared.cache_cfg.negative_max_ttl_secs)
+                                .map(|t| (t, success.rcode))
                         })
                     } else if success.rcode == Rcode::NXDomain && !success.truncated {
-                        msg::negative_ttl(
-                            &success.response,
-                            prepared.cache_cfg.negative_max_ttl_secs,
-                        )
-                        .map(|t| (t, Rcode::NXDomain))
+                        msg::negative_ttl(&response, prepared.cache_cfg.negative_max_ttl_secs)
+                            .map(|t| (t, Rcode::NXDomain))
                     } else {
                         None
                     };
                     if let Some((ttl, rcode)) = entry {
+                        // Clamp the wire TTLs to the cache lifetime *before*
+                        // storing. Otherwise the first client (and later hits)
+                        // would see the upstream TTL, which can exceed the
+                        // configured cap and disagree with cache expiry.
+                        let ceiling = ttl.min(u64::from(u32::MAX)) as u32;
+                        msg::clamp_ttls(&mut response, ceiling);
                         let evicted = self.shared.cache.put(
                             key.clone(),
-                            success.response.clone(),
+                            response.clone(),
                             Duration::from_secs(ttl),
                             rcode,
                             &prepared.cache_cfg,
@@ -341,7 +342,6 @@ impl Pipeline {
                 // limits. An unalignable packet is answered with SERVFAIL
                 // rather than forwarded mis-wired (traffic already recorded
                 // above — this stays one query).
-                let mut response = success.response;
                 if !msg::align_response_to_query(&mut response, &prepared.parsed, query_raw) {
                     tracing::debug!(event = "response_align_failed");
                     return Some(msg::error_response(&prepared.parsed, Rcode::ServFail));

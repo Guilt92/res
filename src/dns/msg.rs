@@ -370,6 +370,25 @@ pub fn cacheable_ttl(resp_bytes: &[u8], min_ttl: u64, max_ttl: u64) -> Option<u6
     if msg.answers.is_empty() {
         return None;
     }
+    // A NOERROR response whose answer section contains only CNAMEs is
+    // *positive* only when a CNAME was actually requested. For every other
+    // qtype the CNAME(s) are an alias chain and any SOA in the authority
+    // section marks NODATA: negative caching must use the shorter SOA
+    // MINIMUM-derived lifetime instead of the CNAME's own TTL.
+    let qtype = msg.queries[0].query_type();
+    let has_requested_data = msg.answers.iter().any(|r| {
+        r.record_type() != RecordType::CNAME
+            || qtype == RecordType::CNAME
+            || qtype == RecordType::ANY
+    });
+    if !has_requested_data
+        && msg
+            .authorities
+            .iter()
+            .any(|r| r.record_type() == RecordType::SOA)
+    {
+        return None;
+    }
     // RFC 2181 §5.2: TTLs of *every* section bound the cache lifetime —
     // a long-lived answer paired with a short-lived authority/additional
     // record must not be served beyond the shortest of them. The OPT
@@ -395,12 +414,22 @@ pub fn cacheable_ttl(resp_bytes: &[u8], min_ttl: u64, max_ttl: u64) -> Option<u6
 /// (truncated, missing SOA, other rcodes, ...).
 pub fn negative_ttl(resp_bytes: &[u8], negative_max_ttl: u64) -> Option<u64> {
     let msg = Message::from_vec(resp_bytes).ok()?;
-    if msg.metadata.truncation {
+    if msg.metadata.truncation || msg.queries.len() != 1 {
         return None;
     }
+    let qtype = msg.queries[0].query_type();
     match msg.metadata.response_code {
         ResponseCode::NoError => {
-            if !msg.answers.is_empty() {
+            // NODATA is NOERROR with no data for the requested type. A CNAME
+            // chain may precede the (absent) target data; it must still be
+            // negatively cached when the authority section carries an SOA.
+            // A CNAME answer is real data when CNAME (or ANY) was requested.
+            let has_requested_data = msg.answers.iter().any(|r| {
+                r.record_type() != RecordType::CNAME
+                    || qtype == RecordType::CNAME
+                    || qtype == RecordType::ANY
+            });
+            if has_requested_data {
                 return None; // positive answers are handled by cacheable_ttl
             }
         }
@@ -420,9 +449,6 @@ pub fn negative_ttl(resp_bytes: &[u8], negative_max_ttl: u64) -> Option<u64> {
         }
         _ => return None, // SERVFAIL / REFUSED / ... are never cached
     }
-    if msg.queries.len() != 1 {
-        return None;
-    }
     let soa = msg
         .authorities
         .iter()
@@ -433,6 +459,24 @@ pub fn negative_ttl(resp_bytes: &[u8], negative_max_ttl: u64) -> Option<u64> {
         _ => 0,
     };
     Some(soa_ttl.min(minimum).min(negative_max_ttl))
+}
+
+/// Clamp every non-OPT record TTL in a response to `ceiling` (seconds).
+///
+/// Cached responses are stored with these clamped TTLs so the first client,
+/// and every later cache hit, sees the same operator-configured upper bound.
+/// Doing this in the wire buffer keeps the bytes and the cache expiry in
+/// agreement. Returns `false` when the message layout cannot be walked (the
+/// caller will not be able to cache it either).
+pub fn clamp_ttls(resp_bytes: &mut [u8], ceiling: u32) -> bool {
+    let Some(slots) = collect_ttl_slots(resp_bytes) else {
+        return false;
+    };
+    for (off, ttl) in slots {
+        let clamped = ttl.min(ceiling);
+        resp_bytes[off..off + 4].copy_from_slice(&clamped.to_be_bytes());
+    }
+    true
 }
 
 /// Positions (byte offsets) and original values of every record TTL in the
@@ -1061,6 +1105,114 @@ mod tests {
         bare.queries = query.queries.clone();
         bare.metadata.response_code = ResponseCode::NXDomain;
         assert_eq!(negative_ttl(&bare.to_vec().unwrap(), 300), None);
+    }
+
+    #[test]
+    fn noerror_cname_chain_with_soa_is_negative_nodata() {
+        let query = parse_query(&sample_query()).unwrap();
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.queries = query.queries.clone();
+        resp.answers.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("www.example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                Name::from_ascii("alias.example.com").unwrap(),
+            )),
+        ));
+        resp.authorities.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns.example.com").unwrap(),
+                Name::from_ascii("admin.example.com").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                60,
+            )),
+        ));
+        let bytes = resp.to_vec().unwrap();
+
+        // NOERROR + CNAME-only answers + SOA is NODATA below the alias:
+        // it must use RFC 2308 negative caching, not the CNAME's TTL.
+        assert_eq!(cacheable_ttl(&bytes, 0, 3600), None);
+        assert_eq!(negative_ttl(&bytes, 300), Some(60));
+
+        // Without an SOA there is no negative answer to cache; the CNAME is
+        // a legal positive answer and may be cached as such.
+        resp.authorities.clear();
+        let cname_only = resp.to_vec().unwrap();
+        assert_eq!(cacheable_ttl(&cname_only, 0, 3600), Some(300));
+        assert_eq!(negative_ttl(&cname_only, 300), None);
+
+        // When the client asked for CNAME, that same answer is positive.
+        let cname_query = parse_query(&build_query("www.example.com", "CNAME").unwrap()).unwrap();
+        let mut cname_resp = Message::response(cname_query.id, OpCode::Query);
+        cname_resp.queries = cname_query.queries.clone();
+        cname_resp
+            .answers
+            .push(hickory_proto::rr::Record::from_rdata(
+                Name::from_ascii("www.example.com").unwrap(),
+                300,
+                hickory_proto::rr::RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                    Name::from_ascii("alias.example.com").unwrap(),
+                )),
+            ));
+        cname_resp
+            .authorities
+            .push(resp.authorities.first().cloned().unwrap_or_else(|| {
+                hickory_proto::rr::Record::from_rdata(
+                    Name::from_ascii("example.com").unwrap(),
+                    300,
+                    hickory_proto::rr::RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                        Name::from_ascii("ns.example.com").unwrap(),
+                        Name::from_ascii("admin.example.com").unwrap(),
+                        1,
+                        7200,
+                        3600,
+                        1_209_600,
+                        60,
+                    )),
+                )
+            }));
+        let cname_bytes = cname_resp.to_vec().unwrap();
+        assert_eq!(cacheable_ttl(&cname_bytes, 0, 3600), Some(300));
+        assert_eq!(cacheable_ttl(&cname_bytes, 0, 100), Some(100));
+        assert_eq!(negative_ttl(&cname_bytes, 300), None);
+    }
+
+    #[test]
+    fn clamp_ttls_caps_every_section() {
+        let query = parse_query(&sample_query()).unwrap();
+        let mut resp = Message::response(query.id, OpCode::Query);
+        resp.queries = query.queries.clone();
+        resp.answers.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("example.com").unwrap(),
+            600,
+            hickory_proto::rr::RData::A("1.2.3.4".parse().unwrap()),
+        ));
+        resp.authorities.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("example.com").unwrap(),
+            300,
+            hickory_proto::rr::RData::NS(hickory_proto::rr::rdata::NS(
+                Name::from_ascii("ns.example.com").unwrap(),
+            )),
+        ));
+        resp.additionals.push(hickory_proto::rr::Record::from_rdata(
+            Name::from_ascii("ns.example.com").unwrap(),
+            120,
+            hickory_proto::rr::RData::A("1.2.3.5".parse().unwrap()),
+        ));
+        let mut bytes = resp.to_vec().unwrap();
+        assert!(clamp_ttls(&mut bytes, 30));
+        let decoded = Message::from_vec(&bytes).unwrap();
+        assert_eq!(decoded.answers[0].ttl, 30);
+        assert_eq!(decoded.authorities[0].ttl, 30);
+        assert_eq!(decoded.additionals[0].ttl, 30);
+
+        let mut malformed = [0u8; 3];
+        assert!(!clamp_ttls(&mut malformed, 30));
     }
 
     #[test]

@@ -1972,6 +1972,104 @@ async fn cache_positive_answer_serves_decremented_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_max_ttl_clamps_forwarded_and_cached_answers() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.max_entries = 128;
+    cfg.cache.max_ttl_secs = 10;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let r1 = udp_query(addr, "clamp.test").await.expect("first answer");
+    let ttl1 = r1.answers.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    assert_eq!(ttl1, 10, "first (uncached) reply must respect max_ttl");
+
+    let r2 = udp_query(addr, "clamp.test").await.expect("cached answer");
+    let ttl2 = r2.answers.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    assert!(ttl2 <= 10, "cached reply must respect max_ttl: {ttl2}");
+    assert_eq!(fake.hits(), 1, "second query must be a cache hit");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_negative_max_ttl_clamps_soa_on_forward_and_hit() {
+    let fake = FakeUpstream::start().await;
+    fake.set_nxdomain(true);
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.max_entries = 128;
+    cfg.cache.negative_max_ttl_secs = 5;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    let r1 = udp_query(addr, "negclamp.test")
+        .await
+        .expect("first nxdomain");
+    let ttl1 = r1.authorities.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    assert!(
+        ttl1 <= 5,
+        "negative SOA TTL must respect negative_max_ttl: {ttl1}"
+    );
+
+    let r2 = udp_query(addr, "negclamp.test")
+        .await
+        .expect("cached nxdomain");
+    let ttl2 = r2.authorities.first().map(|r| r.ttl).unwrap_or(u32::MAX);
+    assert!(
+        ttl2 <= 5,
+        "cached negative SOA TTL must respect negative_max_ttl: {ttl2}"
+    );
+    assert_eq!(fake.hits(), 1, "second query must be a negative-cache hit");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_negative_cname_nodata_uses_soa_lifetime() {
+    let fake = FakeUpstream::start().await;
+    fake.set_nodata_cname(true);
+    let mut cfg = base_config();
+    cfg.cache.enabled = true;
+    cfg.cache.max_entries = 128;
+    cfg.cache.max_ttl_secs = 3600;
+    cfg.cache.negative_max_ttl_secs = 5;
+    cfg.upstreams.push(fake.config("fake-1"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    // NOERROR with only a CNAME answer and an SOA is NODATA below the alias.
+    // It must be cached using the RFC 2308 negative lifetime, not the CNAME
+    // record's 300s TTL.
+    let r1 = udp_query(addr, "alias.test").await.expect("first nodata");
+    assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
+    let soa1 = r1.authorities.first().expect("SOA on first response");
+    assert!(
+        soa1.ttl <= 5,
+        "negative SOA TTL must use the SOA-derived cap: {}",
+        soa1.ttl
+    );
+
+    let r2 = udp_query(addr, "alias.test").await.expect("cached nodata");
+    assert_eq!(r2.metadata.response_code, ResponseCode::NoError);
+    let soa2 = r2.authorities.first().expect("SOA on cache hit");
+    assert!(
+        soa2.ttl <= 5,
+        "cached negative SOA TTL must stay capped: {}",
+        soa2.ttl
+    );
+    assert_eq!(fake.hits(), 1, "second query must be a negative-cache hit");
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cache_is_disabled_by_base_config_and_misses_when_off() {
     let fake = FakeUpstream::start().await;
     let mut cfg = base_config(); // cache.enabled = false by default in base_config

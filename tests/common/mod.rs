@@ -29,6 +29,9 @@ pub struct FakeUpstream {
     /// Answer NXDOMAIN (with an SOA in the authority section) instead of an
     /// A record — exercises RFC 2308 negative caching.
     nxdomain: Arc<AtomicBool>,
+    /// Answer NOERROR with a CNAME chain plus an SOA (NODATA below the
+    /// alias) — exercises CNAME-aware negative caching.
+    nodata_cname: Arc<AtomicBool>,
     /// Artificial response delay in milliseconds (simulates a slow upstream).
     delay_ms: Arc<AtomicUsize>,
     tasks: Vec<JoinHandle<()>>,
@@ -50,6 +53,7 @@ impl FakeUpstream {
         let answering = Arc::new(AtomicBool::new(true));
         let truncate_udp = Arc::new(AtomicBool::new(false));
         let nxdomain = Arc::new(AtomicBool::new(false));
+        let nodata_cname = Arc::new(AtomicBool::new(false));
         let delay_ms = Arc::new(AtomicUsize::new(0));
 
         let mut tasks = Vec::new();
@@ -59,6 +63,7 @@ impl FakeUpstream {
             let answering = Arc::clone(&answering);
             let truncate_udp = Arc::clone(&truncate_udp);
             let nxdomain = Arc::clone(&nxdomain);
+            let nodata_cname = Arc::clone(&nodata_cname);
             let delay_ms = Arc::clone(&delay_ms);
             tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 65_535];
@@ -82,7 +87,8 @@ impl FakeUpstream {
                     }
                     let truncate = truncate_udp.load(Ordering::SeqCst);
                     let nx = nxdomain.load(Ordering::SeqCst);
-                    if let Some(resp) = build_response(&query, truncate, ip, nx) {
+                    let nodata = nodata_cname.load(Ordering::SeqCst);
+                    if let Some(resp) = build_response(&query, truncate, ip, nx, nodata) {
                         let _ = udp.send_to(&resp, peer).await;
                     }
                 }
@@ -93,6 +99,7 @@ impl FakeUpstream {
             let hits = Arc::clone(&hits);
             let answering = Arc::clone(&answering);
             let nxdomain = Arc::clone(&nxdomain);
+            let nodata_cname = Arc::clone(&nodata_cname);
             let delay_ms = Arc::clone(&delay_ms);
             tasks.push(tokio::spawn(async move {
                 loop {
@@ -102,11 +109,19 @@ impl FakeUpstream {
                     let hits = Arc::clone(&hits);
                     let answering = Arc::clone(&answering);
                     let nxdomain = Arc::clone(&nxdomain);
+                    let nodata_cname = Arc::clone(&nodata_cname);
                     let delay_ms = Arc::clone(&delay_ms);
                     tokio::spawn(async move {
-                        let _ =
-                            handle_tcp_conn(stream, &hits, &answering, &nxdomain, &delay_ms, ip)
-                                .await;
+                        let _ = handle_tcp_conn(
+                            stream,
+                            &hits,
+                            &answering,
+                            &nxdomain,
+                            &nodata_cname,
+                            &delay_ms,
+                            ip,
+                        )
+                        .await;
                     });
                 }
             }));
@@ -118,6 +133,7 @@ impl FakeUpstream {
             answering,
             truncate_udp,
             nxdomain,
+            nodata_cname,
             delay_ms,
             tasks,
         }
@@ -156,6 +172,10 @@ impl FakeUpstream {
         self.nxdomain.store(on, Ordering::SeqCst);
     }
 
+    pub fn set_nodata_cname(&self, on: bool) {
+        self.nodata_cname.store(on, Ordering::SeqCst);
+    }
+
     pub fn set_delay_ms(&self, ms: u64) {
         self.delay_ms.store(ms as usize, Ordering::SeqCst);
     }
@@ -172,6 +192,7 @@ async fn handle_tcp_conn(
     hits: &AtomicU64,
     answering: &AtomicBool,
     nxdomain: &AtomicBool,
+    nodata_cname: &AtomicBool,
     delay_ms: &AtomicUsize,
     ip: Ipv4Addr,
 ) -> std::io::Result<()> {
@@ -194,7 +215,13 @@ async fn handle_tcp_conn(
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay as u64)).await;
     }
-    let Some(resp) = build_response(&query, false, ip, nxdomain.load(Ordering::SeqCst)) else {
+    let Some(resp) = build_response(
+        &query,
+        false,
+        ip,
+        nxdomain.load(Ordering::SeqCst),
+        nodata_cname.load(Ordering::SeqCst),
+    ) else {
         return Ok(());
     };
     let mut frame = Vec::with_capacity(2 + resp.len());
@@ -209,6 +236,7 @@ fn build_response(
     truncate: bool,
     ip: Ipv4Addr,
     nxdomain: bool,
+    nodata_cname: bool,
 ) -> Option<Vec<u8>> {
     let mut resp = Message::response(query.metadata.id, query.metadata.op_code);
     resp.metadata.recursion_desired = query.metadata.recursion_desired;
@@ -231,6 +259,28 @@ fn build_response(
                 3600,
                 1_209_600,
                 30, // MINIMUM → negative TTL 30s
+            )),
+        ));
+    } else if nodata_cname {
+        let q = query.queries.first()?;
+        resp.answers.push(Record::from_rdata(
+            q.name().clone(),
+            300,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                Name::from_ascii("target.fake.test.").unwrap(),
+            )),
+        ));
+        resp.authorities.push(Record::from_rdata(
+            q.name().clone(),
+            300,
+            RData::SOA(hickory_proto::rr::rdata::SOA::new(
+                Name::from_ascii("ns.fake.test.").unwrap(),
+                Name::from_ascii("admin.fake.test.").unwrap(),
+                1,
+                7200,
+                3600,
+                1_209_600,
+                30,
             )),
         ));
     } else if !truncate {
@@ -305,7 +355,7 @@ impl FakeTlsUpstream {
                             return;
                         };
                         hits.fetch_add(1, Ordering::SeqCst);
-                        let Some(resp) = build_response(&query, false, ANSWER, false) else {
+                        let Some(resp) = build_response(&query, false, ANSWER, false, false) else {
                             return;
                         };
                         let mut frame = Vec::with_capacity(2 + resp.len());

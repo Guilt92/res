@@ -42,7 +42,10 @@ Significant fixes in this audit:
 9. **Panel usability/accessibility.** Sticky header/sidebar behavior was
    repaired, scroll-spy thresholds corrected, sections made keyboard-operable
    and collapsible with persisted state, secondary panels collapsed by default,
-   and the mobile drawer given a focus trap and body lock.
+   and the mobile drawer given a focus trap and body lock. The overview was
+   then restructured around six primary health cards, a detailed-metrics
+   disclosure, two promoted live-trend charts, semantic health states,
+   sparklines, a live/stale badge, and a collapsible desktop sidebar.
 
 ## Trust Model and Architecture Boundary
 
@@ -134,9 +137,19 @@ Significant fixes in this audit:
 - Sections are generated as accessible `<section>` elements with labelled
   headings, `aria-controls`, `aria-expanded`, and inert collapsed bodies.
 - Collapse state persists in `localStorage["res-collapsed-sections"]`.
-- Default posture: 9 critical sections expanded (DNS service, statistics, top
-  clients, traffic, assessment, current upstream state, failover monitoring,
-  upstreams, incident timeline); 9 routine management/history panels collapsed.
+- Default posture: 6 overview sections expanded (DNS service, assessment,
+  current upstream state, failover monitoring, upstreams, incident timeline);
+  12 high-volume tables, histories and management panels collapsed.
+- DNS service opens with six primary cards (queries, success, P95, QPS, cache
+  hit, error rate). The remaining 13 counters live behind a native
+  `<details>` disclosure; measured zeros are visually de-emphasised.
+- Query-rate and client-latency charts are promoted into the overview with
+  larger canvases, explicit titles and value legends. The long-tail history
+  charts stay in the collapsed history panel.
+- The desktop sidebar can be hidden and restored with persisted state; the
+  mobile drawer remains independent.
+- A live/stale badge reflects control-plane fetch failures, and six primary
+  cards carry dependency-free sparklines when history exists.
 - Expanding a collapsed history panel redraws its canvases.
 - Mobile drawer locks body scroll, makes page content inert, moves focus to the
   first nav link, traps Tab/Shift+Tab, closes on Escape/backdrop, and returns
@@ -172,7 +185,7 @@ Significant fixes in this audit:
 | PANEL-01 | Medium | Layout | `overflow-x:hidden` broke sticky header/sidebar behavior | Fixed: `overflow-x:clip`; verified sticky top matches header |
 | PANEL-02 | Low | Navigation | Scroll-spy offset and final section selection were wrong | Fixed: measured header height + bottom detection |
 | PANEL-03 | Low | Accessibility | Collapsible sections/mobile drawer lacked complete focus/ARIA handling | Fixed: labelled regions, inert bodies, persisted state, focus trap |
-| PANEL-04 | Low | Information architecture | All 18 sections expanded on first load | Fixed: 9 critical sections expanded, 9 secondary collapsed by default |
+| PANEL-04 | Low | Information architecture | All 18 sections expanded on first load | Fixed: 6 overview sections expanded, 12 detailed panels collapsed; primary KPIs separated from a detailed-metrics disclosure |
 
 ## Verification
 
@@ -247,8 +260,15 @@ Targeted regression coverage added or updated:
     `aria-controls`, page errors, or horizontal body overflow.
   - Sticky header and sidebar top offsets remain locked while scrolling
     (`overflow-x: clip`).
-  - Default 9 expanded / 9 collapsed sections; nav clicks expand targets;
+  - Default 6 expanded / 12 collapsed sections; nav clicks expand targets;
     collapse state survives reload.
+  - DNS service renders 6 primary and 13 detailed KPI cards, 6 sparkline
+    canvases, two promoted trend charts, and a collapsed detailed-metrics
+    disclosure with no duplicate IDs or horizontal overflow.
+  - Desktop sidebar collapse/restore persists in `localStorage`; mobile drawer
+    remains usable with the collapsed preference present.
+  - The live badge switches to `Stale` on control-plane failure and back to
+    `Live` after a successful refresh.
   - Collapsed history chart canvases redraw on expansion with nonzero width.
   - Mobile drawer: body scroll locked, content inert, focus trapped, Escape
     closes and restores focus to the toggle.
@@ -305,7 +325,9 @@ Targeted regression coverage added or updated:
   - `4c8f914` align fallback config with hardened defaults
   - `faabc39` cached EDNS option stripping test
   - `17f4035` shared-tier test reliability
-- This report is the final documentation commit; no push was performed.
+  - `6f19ba9` final security/panel audit report
+- This report was updated alongside the overview-panel redesign; no push was
+  performed.
 - Pre-existing untracked `bench/audit.sh` and `bench/bench-cache.toml` remain
   untouched.
 

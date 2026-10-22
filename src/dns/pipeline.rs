@@ -925,6 +925,79 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_strips_upstream_edns_options_for_option_free_clients() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+
+        let mut app = AppConfig::default();
+        app.cache.enabled = true;
+        app.ratelimit.enabled = false;
+        let p = pipeline_with(app);
+
+        // A plain EDNS query (no options) is eligible for the shared cache.
+        let base = query_bytes("example.com", "A");
+        let base_parsed = msg::parse_query(&base).expect("parse base query");
+        let mut query = Message::query();
+        query.metadata.id = base_parsed.id;
+        query.metadata.recursion_desired = true;
+        query.queries = base_parsed.queries.clone();
+        let mut qedns = Edns::new();
+        qedns.set_max_payload(1232);
+        query.set_edns(qedns);
+        let raw = query.to_vec().expect("encode query");
+        let parsed = msg::parse_query(&raw).expect("parse query");
+        assert!(parsed.has_edns);
+        assert!(!parsed.has_edns_options);
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+
+        // Cached bytes contain an upstream ECS option, as could happen when a
+        // resolver answers an option-free exchange with client-context data.
+        let mut stored = Message::response(999, OpCode::Query);
+        stored.queries = parsed.queries.clone();
+        stored.answers.push(Record::from_rdata(
+            parsed.question().name().clone(),
+            300,
+            RData::A(rdata::A::from(std::net::Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+        let mut sedns = Edns::new();
+        sedns.set_max_payload(4096);
+        sedns
+            .options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "198.51.100.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        stored.set_edns(sedns);
+        let cache_cfg = p.shared.rt.load().cache.clone();
+        p.shared.cache.put(
+            key,
+            stored.to_vec().expect("encode cached response"),
+            Duration::from_secs(300),
+            Rcode::NoError,
+            &cache_cfg,
+        );
+
+        match p.precheck(client(), Transport::Udp, &raw, Instant::now()) {
+            Precheck::Reply(out) => {
+                let view = Message::from_vec(&out).expect("decode cached reply");
+                let edns = view.edns.expect("EDNS response");
+                assert!(
+                    edns.options().as_ref().is_empty(),
+                    "cached ECS option must not be served to an option-free client"
+                );
+                assert_eq!(edns.max_payload(), 1232);
+            }
+            _ => panic!("expected cache-hit reply"),
+        }
+        assert_eq!(p.shared.metrics.cache_hits_total.get(), 1);
+    }
+
+    #[test]
     fn edns_option_queries_bypass_the_shared_cache() {
         use hickory_proto::op::Edns;
         use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};

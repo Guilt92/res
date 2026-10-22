@@ -201,7 +201,20 @@
 
   <!-- ============ TOP CLIENTS ============ -->
   <h2>Top clients <span class="sub">per-client outcomes, rates and payload volume <span class="chip" id="privacy-chip">—</span> · click a header to sort</span></h2>
-  <div style="overflow-x:auto">
+  <div class="table-tools">
+    <span class="tpsub">Top <b id="cl-top-limit">100</b> clients · full addresses follow <span class="mono">client_ip_privacy</span></span>
+    <div class="table-tools-right">
+      <label class="inline-field">Rows
+        <select id="cl-page-size"><option value="10">10</option><option value="20" selected>20</option></select>
+      </label>
+      <div class="pager">
+        <button class="ghost" id="cl-prev" type="button">Prev</button>
+        <span class="mono" id="cl-page-info">1 / 1</span>
+        <button class="ghost" id="cl-next" type="button">Next</button>
+      </div>
+    </div>
+  </div>
+  <div class="scroll-x">
   <table id="cl-table">
     <thead><tr>
       <th data-sort="requests" class="sortable">Client</th>
@@ -260,7 +273,7 @@
     <div class="chart" id="w-ch-packets"><div class="chead"><span class="ctitle">Packet rate (UDP in/out)</span><span class="legend" data-legend="ch-packets"></span></div><canvas id="ch-packets"></canvas></div>
     <div class="chart" id="w-ch-size"><div class="chead"><span class="ctitle">Payload size (avg bytes)</span><span class="legend" data-legend="ch-size"></span></div><canvas id="ch-size"></canvas></div>
   </div>
-  <div class="grid" style="margin-top:10px">
+  <div class="grid grid-gap-top">
     <div class="chart" id="w-ch-errors"><div class="chead"><span class="ctitle">Error breakdown (%)</span><span class="legend" data-legend="ch-errors"></span></div><canvas id="ch-errors"></canvas></div>
     <div class="chart" id="w-ch-rcodes"><div class="chead"><span class="ctitle">Response codes (%)</span><span class="legend" data-legend="ch-rcodes"></span></div><canvas id="ch-rcodes"></canvas></div>
     <div class="chart" id="w-ch-failovers"><div class="chead"><span class="ctitle">Failovers (per min)</span><span class="legend" data-legend="ch-failovers"></span></div><canvas id="ch-failovers"></canvas></div>
@@ -325,7 +338,7 @@
 
   <!-- ============ UPSTREAMS ============ -->
   <h2>Upstreams <span class="sub">troubleshooting table · click a row to highlight it in the charts</span></h2>
-  <div style="overflow-x:auto">
+  <div class="scroll-x">
   <table id="up-table">
     <thead><tr>
       <th>State</th><th>Use</th><th>Name</th><th>Address</th><th class="num">Pri/Wt</th>
@@ -344,16 +357,16 @@
   <div class="tgrid">
     <div class="tpanel">
       <div class="tptitle">Admin token</div>
-      <div class="umg-token" style="padding:8px 12px 0">
+      <div class="umg-token panel-pad-top">
         <input type="password" id="umg-token" placeholder="Bearer token (only if server.api_token is set)" autocomplete="off">
         <button class="ghost" id="umg-token-save">Save</button>
       </div>
-      <div class="tpsub" style="padding:0 12px 10px">Stored in this tab (sessionStorage; cleared on sign-out), sent as <span class="mono">Authorization: Bearer …</span> on every change. <span id="umg-auth" class="mono"></span></div>
+      <div class="tpsub panel-msg">Stored in this tab (sessionStorage; cleared on sign-out), sent as <span class="mono">Authorization: Bearer …</span> on every change. <span id="umg-auth" class="mono"></span></div>
     </div>
     <div class="tpanel">
       <div class="tptitle">Active configuration</div>
-      <div class="stats" id="umg-meta" style="padding:8px 12px 0"><div class="empty" style="padding:6px 0">loading…</div></div>
-      <div style="padding:4px 12px 10px"><button class="ghost" id="umg-viewcfg">View active upstream TOML</button></div>
+      <div class="stats panel-pad-top" id="umg-meta"><div class="empty empty-sm">loading…</div></div>
+      <div class="panel-actions"><button class="ghost" id="umg-viewcfg">View active upstream TOML</button></div>
     </div>
   </div>
   <div id="umg-msg"></div>
@@ -390,7 +403,7 @@
     </div>
   </details>
 
-  <div style="overflow-x:auto;margin-top:10px">
+  <div class="scroll-x-gap">
   <table id="umg-table">
     <thead><tr>
       <th>Name</th><th>Address</th><th class="num">Pri/Wt</th><th>State</th>
@@ -401,7 +414,7 @@
   </table>
   </div>
 
-  <details class="cfg" id="umg-cfgview" style="margin-top:10px">
+  <details class="cfg details-gap" id="umg-cfgview">
     <summary>Active upstream configuration (TOML)</summary>
     <div id="umg-cfgmeta"></div>
     <pre id="umg-cfgtext">loading…</pre>
@@ -412,7 +425,7 @@
   <div class="tgrid">
     <div class="tpanel">
       <div class="tptitle">Add entry</div>
-      <div class="umg-form" style="padding:8px 12px 12px">
+      <div class="umg-form panel-pad">
         <label>IP or CIDR <input id="acl-cidr" placeholder="192.0.2.10, 198.51.100.0/24, 2001:db8::/48"></label>
         <label>Action <select id="acl-action"><option value="allow">allow</option><option value="deny">deny</option></select></label>
         <label class="chk"><input type="checkbox" id="acl-enabled" checked> enabled</label>
@@ -421,18 +434,18 @@
           <button class="ghost" id="acl-reload">Reload</button>
         </div>
       </div>
-      <div id="acl-msg" style="padding:0 12px 10px"></div>
-      <div class="tpsub" style="padding:0 12px 6px">Precedence: <b>deny</b> is evaluated first and wins over any
+      <div id="acl-msg" class="panel-msg"></div>
+      <div class="tpsub panel-note">Precedence: <b>deny</b> is evaluated first and wins over any
         matching allow. If no allow matches (or the allow list is empty) the client is refused — fail-closed, so an
         unconfigured gateway is never an open resolver. Bare IPs become /32 or /128; IPv4-mapped IPv6 clients are
         matched against both v6 and embedded-v4 rules. Disabled entries are kept but never evaluated.</div>
     </div>
     <div class="tpanel">
       <div class="tptitle">Current effective policy</div>
-      <div class="stats" id="acl-summary" style="padding:8px 12px 0"><div class="empty" style="padding:6px 0">loading…</div></div>
+      <div class="stats panel-pad-top" id="acl-summary"><div class="empty empty-sm">loading…</div></div>
     </div>
   </div>
-  <div style="overflow-x:auto;margin-top:10px">
+  <div class="scroll-x-gap">
   <table id="acl-table">
     <thead><tr>
       <th>ID</th><th>Entry (IP / CIDR)</th><th>Action</th><th>Enabled</th><th>Source</th><th>Actions</th>
@@ -446,22 +459,56 @@
   <div class="tgrid">
     <div class="tpanel">
       <div class="tptitle">Current usage</div>
-      <div class="stats" id="cache-stats" style="padding:8px 12px 4px"><div class="empty" style="padding:6px 0">loading…</div></div>
-      <div style="padding:4px 12px 10px;display:flex;gap:8px">
+      <div class="stats panel-pad" id="cache-stats"><div class="empty empty-sm">loading…</div></div>
+      <div class="panel-actions">
         <button class="danger" id="cache-clear">Clear cache</button>
         <button class="ghost" id="cache-reload">Reload settings</button>
       </div>
-      <div id="cache-msg" style="padding:0 12px 10px"></div>
+      <div id="cache-msg" class="panel-msg"></div>
     </div>
     <div class="tpanel">
       <div class="tptitle">Settings (applied at runtime)</div>
-      <div class="umg-form" style="padding:8px 12px 12px">
+      <div class="umg-form panel-pad">
         <label class="chk"><input type="checkbox" id="cache-enabled"> caching enabled</label>
-        <label>Min TTL secs <input id="cache-min" type="number" min="0" max="86400"
-          title="Skip threshold: answers with a shorter TTL are not cached (never extended)"></label>
-        <label>Max TTL secs <input id="cache-max" type="number" min="1" max="604800"
-          title="Upper cap; never extends an authoritative TTL. Default ≥ 300s (5 min)."></label>
-        <label>Negative max TTL <input id="cache-negmax" type="number" min="0" max="86400"></label>
+
+        <label class="ttl-label">Min TTL
+          <span class="ttl-edit">
+            <input id="cache-min" type="number" min="0" step="any"
+              title="Skip threshold: answers with a shorter TTL are not cached (never extended)">
+            <select id="cache-min-unit" aria-label="Minimum TTL unit">
+              <option value="sec">seconds</option><option value="min">minutes</option>
+              <option value="hour">hours</option><option value="day">days</option>
+            </select>
+          </span>
+        </label>
+        <input class="ttl-slider" id="cache-min-slider" type="range" min="0" max="86400" step="1"
+          aria-label="Minimum TTL slider">
+
+        <label class="ttl-label">Max TTL
+          <span class="ttl-edit">
+            <input id="cache-max" type="number" min="0" step="any"
+              title="Upper cap; never extends an authoritative TTL. Default ≥ 300s (5 min).">
+            <select id="cache-max-unit" aria-label="Maximum TTL unit">
+              <option value="sec">seconds</option><option value="min">minutes</option>
+              <option value="hour">hours</option><option value="day">days</option>
+            </select>
+          </span>
+        </label>
+        <input class="ttl-slider" id="cache-max-slider" type="range" min="1" max="604800" step="1"
+          aria-label="Maximum TTL slider">
+
+        <label class="ttl-label">Negative max TTL
+          <span class="ttl-edit">
+            <input id="cache-negmax" type="number" min="0" step="any">
+            <select id="cache-negmax-unit" aria-label="Negative maximum TTL unit">
+              <option value="sec">seconds</option><option value="min">minutes</option>
+              <option value="hour">hours</option><option value="day">days</option>
+            </select>
+          </span>
+        </label>
+        <input class="ttl-slider" id="cache-negmax-slider" type="range" min="0" max="86400" step="1"
+          aria-label="Negative maximum TTL slider">
+
         <label>Max entries <input id="cache-maxent" type="number" min="1" max="1000000"></label>
         <label>Max memory bytes <input id="cache-maxmem" type="number" min="1" max="1073741824"
           title="Hard cap on cached payload bytes (entries + per-entry overhead); the count cap alone cannot bound memory"></label>
@@ -469,8 +516,46 @@
           <button class="primary" id="cache-save">Apply settings</button>
         </div>
       </div>
-      <div class="tpsub" style="padding:0 12px 8px">min_ttl acts as a cacheability threshold only — the gateway never
+      <div class="tpsub panel-pad-bottom">min_ttl acts as a cacheability threshold only — the gateway never
         extends a record's remaining TTL. max_ttl only caps longer TTLs downwards.</div>
+    </div>
+  </div>
+
+  <!-- ============ UPSTREAM PROXY ============ -->
+  <h2>Upstream proxy <span class="sub">SOCKS5 or HTTP CONNECT · credentials stay write-only · test the real tunnel without changing health state</span></h2>
+  <div class="tgrid">
+    <div class="tpanel">
+      <div class="tptitle">Current route</div>
+      <div class="stats panel-pad" id="proxy-stats"><div class="empty empty-sm">loading…</div></div>
+      <div class="panel-actions">
+        <button class="ghost" id="proxy-test">Test route</button>
+        <button class="ghost" id="proxy-reload">Reload settings</button>
+      </div>
+      <div id="proxy-msg" class="panel-msg"></div>
+      <div id="proxy-test-msg" class="panel-msg"></div>
+    </div>
+    <div class="tpanel">
+      <div class="tptitle">Settings (applied at runtime)</div>
+      <div class="umg-form panel-pad">
+        <label class="chk wide"><input type="checkbox" id="proxy-enabled"> route all upstream traffic through a proxy</label>
+        <label>Protocol <select id="proxy-protocol" title="SOCKS5 supports UDP ASSOCIATE; HTTP CONNECT is TCP-only">
+          <option value="socks5">SOCKS5</option>
+          <option value="http_connect">HTTP CONNECT</option>
+        </select></label>
+        <label>Address <input id="proxy-address" placeholder="192.0.2.10 (IP literal)" autocomplete="off"></label>
+        <label>Port <input id="proxy-port" type="number" min="1" max="65535"></label>
+        <label>Username <input id="proxy-user" maxlength="255" autocomplete="username"></label>
+        <label>Password <input id="proxy-pass" type="password" maxlength="255"
+          autocomplete="new-password" placeholder="leave blank to keep the stored password"></label>
+        <label class="chk"><input type="checkbox" id="proxy-clear-pass"> clear stored password</label>
+        <label>Connect timeout ms <input id="proxy-timeout" type="number" min="100" max="60000"></label>
+        <div class="umg-actions">
+          <button class="primary" id="proxy-save">Apply proxy</button>
+        </div>
+      </div>
+      <div class="tpsub panel-pad-bottom">SOCKS5 relays DNS over UDP using UDP ASSOCIATE and TCP/DoT using CONNECT.
+        HTTP CONNECT cannot carry UDP, so validation rejects it while any enabled upstream uses UDP. The proxy is
+        mandatory whenever enabled: a proxy failure is an upstream failure, never a silent direct connection.</div>
     </div>
   </div>
 
@@ -479,7 +564,7 @@
   <div class="tgrid">
     <div class="tpanel">
       <div class="tptitle">Health checks</div>
-      <div class="umg-form" style="padding:8px 12px 12px">
+      <div class="umg-form panel-pad">
         <label class="chk"><input type="checkbox" id="hlt-enabled"> active probing enabled</label>
         <label>Interval ms <input id="hlt-interval" type="number" min="100" max="600000"
           title="Interval between probe rounds (min 100ms)"></label>
@@ -501,13 +586,13 @@
           <button class="ghost" id="hlt-reload">Reload</button>
         </div>
       </div>
-      <div id="hlt-msg" style="padding:0 12px 10px"></div>
-      <div class="tpsub" style="padding:0 12px 8px">Thresholds and intervals are validated even while probing is
+      <div id="hlt-msg" class="panel-msg"></div>
+      <div class="tpsub panel-pad-bottom">Thresholds and intervals are validated even while probing is
         off — nonsense never persists and then bites when re-enabled.</div>
     </div>
     <div class="tpanel">
       <div class="tptitle">Selection policy</div>
-      <div class="umg-form" style="padding:8px 12px 12px">
+      <div class="umg-form panel-pad">
         <label>Strategy <select id="sel-strategy">
           <option value="weighted_reliability">weighted_reliability</option>
           <option value="best_score">best_score</option>
@@ -532,8 +617,8 @@
           <button class="ghost" id="sel-reload">Reload</button>
         </div>
       </div>
-      <div id="sel-msg" style="padding:0 12px 10px"></div>
-      <div class="tpsub" style="padding:0 12px 8px">Changes take effect on the next query — in-flight queries keep
+      <div id="sel-msg" class="panel-msg"></div>
+      <div class="tpsub panel-pad-bottom">Changes take effect on the next query — in-flight queries keep
         the snapshot they started with.</div>
     </div>
   </div>

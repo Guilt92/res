@@ -17,7 +17,8 @@ const state = {
   histAt: 0,
   status: null, stats: null, upstreams: [], upState: null,
   generation: null,
-  clients: null, clientSort: "requests",
+  clients: null, clientSort: "requests", clientPage: 0, clientPageSize: 20,
+  proxy: null,
   events: [], monitoring: null,
   focus: null,         // focused upstream name
   filter: "all",
@@ -46,18 +47,29 @@ const SECTION_IDS = {
   "Upstream DNS management": "upstream-dns-management",
   "Client ACL": "client-acl",
   "Cache": "cache",
+  "Upstream proxy": "upstream-proxy",
   "Health checks & selection": "health-checks-selection",
   "Incident timeline": "incident-timeline",
   "Configuration": "configuration",
 };
-const NAV_GROUPS = [
-  ["Overview", [["dns-service","DNS service"],["assessment","Assessment"]]],
-  ["Traffic", [["service-statistics","Service statistics"],["top-clients","Top clients"],["traffic","Traffic"]]],
-  ["Resolver", [["current-upstream-state","Current upstream state"],["failover-monitoring","Failover monitoring"],["upstreams","Upstreams"],["upstream-dns-management","Upstream DNS management"]]],
-  ["Protection", [["client-acl","Client ACL"],["cache","Cache"],["health-checks-selection","Health checks & selection"]]],
-  ["Observability", [["dns-service-history","DNS service history"],["upstream-history","Upstream history"],["incident-timeline","Incident timeline"]]],
-  ["System", [["process-capacity","Process & capacity"],["process-history","Process history"],["configuration","Configuration"]]],
-];
+// Group labels are assigned by section id, but navigation order itself is
+// derived from the rendered document. A heading is emitted whenever the
+// DOM order crosses into a different group, so the sidebar can never drift
+// away from the page.
+const NAV_GROUP_OF = {
+  "dns-service": "Overview",
+  "service-statistics": "Traffic", "top-clients": "Traffic", "traffic": "Traffic",
+  "assessment": "Assessment",
+  "process-capacity": "Process & capacity",
+  "dns-service-history": "Service history", "upstream-history": "Upstream history",
+  "process-history": "Process history",
+  "current-upstream-state": "Resolver", "failover-monitoring": "Resolver",
+  "upstreams": "Resolver", "upstream-dns-management": "Resolver",
+  "client-acl": "Protection", "cache": "Protection", "upstream-proxy": "Protection",
+  "health-checks-selection": "Protection",
+  "incident-timeline": "Incidents",
+  "configuration": "System",
+};
 
 function sectionTitle(h2){
   const clone = h2.cloneNode(true);
@@ -155,27 +167,33 @@ function buildSections(){
 function buildNav(){
   const links = $("sidenav-links");
   let n = 0;
-  for (const [group, items] of NAV_GROUPS){
-    const wrap = document.createElement("div");
-    wrap.className = "nav-group";
-    const title = document.createElement("div");
-    title.className = "nav-group-title";
-    title.textContent = group;
-    wrap.appendChild(title);
-    for (const [id, label] of items){
-      const a = document.createElement("a");
-      a.className = "nav-link";
-      a.href = "#" + id;
-      a.dataset.section = id;
-      const idx = document.createElement("span");
-      idx.className = "nav-idx";
-      idx.textContent = String(++n).padStart(2, "0");
-      const text = document.createElement("span");
-      text.textContent = label;
-      a.appendChild(idx); a.appendChild(text);
-      wrap.appendChild(a);
+  let group = null;
+  let wrap = null;
+  for (const sec of navSections()){
+    const labelEl = sec.querySelector(".sec-title");
+    const label = labelEl ? labelEl.textContent.trim() : sec.id;
+    const nextGroup = NAV_GROUP_OF[sec.id] || "Other";
+    if (nextGroup !== group){
+      group = nextGroup;
+      wrap = document.createElement("div");
+      wrap.className = "nav-group";
+      const title = document.createElement("div");
+      title.className = "nav-group-title";
+      title.textContent = group;
+      wrap.appendChild(title);
+      links.appendChild(wrap);
     }
-    links.appendChild(wrap);
+    const a = document.createElement("a");
+    a.className = "nav-link";
+    a.href = "#" + sec.id;
+    a.dataset.section = sec.id;
+    const idx = document.createElement("span");
+    idx.className = "nav-idx";
+    idx.textContent = String(++n).padStart(2, "0");
+    const text = document.createElement("span");
+    text.textContent = label;
+    a.appendChild(idx); a.appendChild(text);
+    wrap.appendChild(a);
   }
 }
 function navSections(){
@@ -634,7 +652,11 @@ function applyRoleGating(){
     "umg-enabled","umg-confirm","umg-probes","umg-submit",
     "acl-cidr","acl-action","acl-enabled","acl-add",
     "cache-enabled","cache-min","cache-max","cache-negmax","cache-maxent","cache-maxmem",
+    "cache-min-unit","cache-max-unit","cache-negmax-unit",
+    "cache-min-slider","cache-max-slider","cache-negmax-slider",
     "cache-save","cache-clear",
+    "proxy-enabled","proxy-protocol","proxy-address","proxy-port","proxy-user",
+    "proxy-pass","proxy-clear-pass","proxy-timeout","proxy-save","proxy-test",
     "hlt-enabled","hlt-interval","hlt-timeout","hlt-fail","hlt-rec","hlt-minsucc",
     "hlt-tcp","hlt-dwell","hlt-probes","hlt-save",
     "sel-strategy","sel-latref","sel-tier","sel-lshare","sel-degraded","sel-minsamples","sel-save",
@@ -702,7 +724,7 @@ function startLiveTimers(){
   state.monTimer = setInterval(() => { if (state.auto) fetchMonitoring(); }, 30000);
   state.cfgTimer = setInterval(() => {
     if (state.auto && AUTH.role){
-      loadAcl(); loadCache(); loadHealthSelection();
+      loadAcl(); loadCache(); loadProxy(); loadHealthSelection();
     }
   }, 15000);
   state.sessionTimer = setInterval(() => { checkSession(true); }, 60000);
@@ -718,7 +740,7 @@ function stopLiveTimers(){
 async function startPortal(){
   await Promise.all([fetchCurrent(), fetchMonitoring()]);
   await Promise.all([fetchHistory(), loadConfig()]);
-  await Promise.all([loadAcl(), loadCache(), loadHealthSelection()]);
+  await Promise.all([loadAcl(), loadCache(), loadProxy(), loadHealthSelection()]);
   startLiveTimers();
 }
 async function refreshAll(){
@@ -727,7 +749,7 @@ async function refreshAll(){
   btn.textContent = "Refreshing…";
   try {
     await Promise.allSettled([fetchCurrent(), fetchMonitoring(), fetchHistory(),
-      loadConfig(), loadAcl(), loadCache(), loadHealthSelection()]);
+      loadConfig(), loadAcl(), loadCache(), loadProxy(), loadHealthSelection()]);
   } finally {
     btn.disabled = false;
     btn.textContent = "Refresh now";
@@ -769,6 +791,20 @@ function fmtUptime(secs){
 }
 /* `null`/undefined means "not measured yet" — never render it as a number.
    Zero is only ever shown when the gateway actually counted zero. */
+
+function rateClass(rate){
+  if (rate == null) return "";
+  if (rate >= 0.99) return "ok-num";
+  if (rate >= 0.95) return "warn-num";
+  return "bad-num";
+}
+function hydrateStyles(root){
+  if (!root || !root.querySelectorAll) return;
+  for (const el of root.querySelectorAll("[data-bg]")) el.style.backgroundColor = el.dataset.bg;
+  for (const el of root.querySelectorAll("[data-color]")) el.style.color = el.dataset.color;
+  for (const el of root.querySelectorAll("[data-width]")) el.style.width = el.dataset.width + "%";
+}
+
 function fmtVal(v, unit){
   if (v==null || !isFinite(v)) return "N/A";
   if (unit==="B") return fmtBytes(v);
@@ -940,9 +976,10 @@ function drawChart(def){
     const lv = lastVal(s.points);
     const m = Object.values(META).find(v => v[0]===s.name);
     const u = def.up ? (def.up.endsWith("_ms")?"ms":def.up.endsWith("_pct")?"%":"") : (m?m[1]:"");
-    return '<span><i style="background:'+s.color+'"></i>'+s.name+
+    return '<span><i data-bg="'+s.color+'"></i>'+s.name+
       ' <span class="lv">'+fmtVal(lv,u)+'</span></span>';
   }).join("");
+  hydrateStyles(legendEl);
 
   chartHover[def.id] = {xs: series, t0, t1, L, R, W, box: canvas.getBoundingClientRect()};
 }
@@ -989,9 +1026,10 @@ document.addEventListener("mousemove", e => {
     const p = s.points.find(p => p[0]===bestT);
     const v = p ? p[1] : null;
     if (v==null) continue;
-    html += '<div class="row"><span><i style="background:'+s.color+'"></i>'+s.name+'</span><b>'+fmtVal(v,"")+'</b></div>';
+    html += '<div class="row"><span><i data-bg="'+s.color+'"></i>'+s.name+'</span><b>'+fmtVal(v,"")+'</b></div>';
   }
   tip.innerHTML = html;
+  hydrateStyles(tip);
   tip.style.display = "block";
   const tw = tip.offsetWidth;
   tip.style.left = Math.min(e.clientX+14, window.innerWidth-tw-8)+"px";
@@ -1187,8 +1225,8 @@ function barRows(rows, denom){
     return '<div class="br">'+
       '<span class="lab" title="'+escapeHtml(r.label)+'">'+escapeHtml(r.label)+'</span>'+
       '<span class="val">'+r.value+'<i>'+(r.value>0 ? share.toFixed(1)+"%" : "")+'</i></span>'+
-      '<span class="track"><span class="fill" style="width:'+pct.toFixed(1)+
-        '%;background:'+PALETTE[i%PALETTE.length]+'"></span></span>'+
+      '<span class="track"><span class="fill" data-bg="'+PALETTE[i%PALETTE.length]+
+        '" data-width="'+pct.toFixed(1)+'"></span></span>'+
       '</div>';
   }).join("");
 }
@@ -1201,7 +1239,7 @@ function renderTraffic(){
   const s = state.stats;
   if (!s) return;
   const t = s.traffic || {};
-  const priv = t.client_ip_privacy || "masked";
+  const priv = t.client_ip_privacy || "full";
   const chip = $("privacy-chip");
   chip.textContent = "ip: " + priv;
   chip.className = "chip " + (priv === "off" ? "stale" : "native");
@@ -1384,7 +1422,7 @@ function renderClientTable(){
   const s = state.stats;
   if (!s) return;
   const t = s.traffic || {};
-  const priv = t.client_ip_privacy || "masked";
+  const priv = t.client_ip_privacy || "full";
   const meta = t.clients || {};
   const c = state.clients;
   for (const th of document.querySelectorAll("#cl-table th.sortable")){
@@ -1404,18 +1442,26 @@ function renderClientTable(){
       'every per-client counter is 0</td></tr>';
     $("cl-table-meta").innerHTML = metaBits([
       ["tracked","0 / "+intOf(meta.cap)], ["requests","0"], ["privacy",priv]]);
+    renderClientPager(0, 0, 0);
     return;
   }
-  $("cl-rows").innerHTML = rows.map(r => {
+  const pageSize = state.clientPageSize === 10 ? 10 : 20;
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+  if (state.clientPage >= pages) state.clientPage = pages - 1;
+  if (state.clientPage < 0) state.clientPage = 0;
+  const start = state.clientPage * pageSize;
+  const visible = rows.slice(start, start + pageSize);
+  renderClientPager(start, visible.length, rows.length);
+  $("cl-rows").innerHTML = visible.map(r => {
     const failed = intOf(r.failed), timeouts = intOf(r.timeouts);
     return '<tr>'+
       '<td class="mono ip">'+escapeHtml(String(r.client))+'</td>'+
       '<td class="num">'+intOf(r.requests)+'</td>'+
       '<td class="num">'+(r.share==null?"N/A":(r.share*100).toFixed(1)+"%")+'</td>'+
       '<td class="num">'+fmtVal(r.rps,"qps")+'</td>'+
-      '<td class="num" style="color:'+(intOf(r.ok)?"#7ee787":"inherit")+'">'+intOf(r.ok)+'</td>'+
-      '<td class="num" style="color:'+(failed?"#e3b341":"inherit")+'">'+failed+'</td>'+
-      '<td class="num" style="color:'+(timeouts?"#ff7b72":"inherit")+'">'+timeouts+'</td>'+
+      '<td class="num'+(intOf(r.ok)?" ok-num":"")+'">'+intOf(r.ok)+'</td>'+
+      '<td class="num'+(failed?" warn-num":"")+'">'+failed+'</td>'+
+      '<td class="num'+(timeouts?" bad-num":"")+'">'+timeouts+'</td>'+
       '<td class="num">'+intOf(r.rate_limited)+'</td>'+
       '<td class="num">'+intOf(r.acl_denied)+'</td>'+
       '<td class="num">'+fmtVal(r.avg_ms,"ms")+'</td>'+
@@ -1432,6 +1478,17 @@ function renderClientTable(){
   ]) + (intOf(meta.skipped_requests) > 0
     ? '<span class="warnbit">table full — '+intOf(meta.skipped_requests)+' unattributed</span>'
     : "");
+}
+function renderClientPager(start, shown, total){
+  const pages = total ? Math.max(1, Math.ceil(total / state.clientPageSize)) : 1;
+  const page = total ? Math.floor(start / state.clientPageSize) + 1 : 1;
+  const info = $("cl-page-info");
+  if (info) info.textContent = total
+    ? page+" / "+pages+" · "+(start+1)+"–"+(start+shown)+" of "+total
+    : "0 / 0";
+  const prev = $("cl-prev"), next = $("cl-next");
+  if (prev) prev.disabled = !total || state.clientPage <= 0;
+  if (next) next.disabled = !total || state.clientPage >= pages - 1;
 }
 
 /* =========================================================================
@@ -1716,36 +1773,35 @@ function renderUpstreams(){
     return '<tr data-up="'+escapeHtml(u.name)+'" class="'+(state.focus===u.name?"focus":"")+'">'+
       '<td>'+stateChip(u)+'</td>'+
       '<td>'+use+'</td>'+
-      '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d" style="background:'+color+'"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
+      '<td><span class="state '+u.health+' state-name"><span class="d" data-bg="'+color+'"></span></span> '+escapeHtml(u.name)+'</td>'+
+      '<td class="mono ip dim">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td class="num">'+fmtVal(u.qps,"qps")+'</td>'+
       '<td class="num">'+u.queries+'</td>'+
       '<td class="num">'+u.ok+'</td>'+
-      '<td class="num" style="color:'+(u.failures>0?"#e3b341":"inherit")+'">'+u.failures+'</td>'+
-      '<td class="num" style="color:'+(u.timeouts>0?"#ff7b72":"inherit")+'">'+u.timeouts+'</td>'+
-      '<td class="num" style="color:'+(u.success_rate==null?"inherit":u.success_rate>=0.99?"#7ee787":u.success_rate>=0.95?"#e3b341":"#ff7b72")+'">'+
+      '<td class="num'+(u.failures>0?" warn-num":"")+'">'+u.failures+'</td>'+
+      '<td class="num'+(u.timeouts>0?" bad-num":"")+'">'+u.timeouts+'</td>'+
+      '<td class="num '+rateClass(u.success_rate)+'">'+
         (u.success_rate==null?"N/A":(u.success_rate*100).toFixed(1)+"%")+'</td>'+
-      '<td class="num" style="color:'+(u.failure_rate==null?"inherit":u.failure_rate>0?"#ff7b72":"#7ee787")+'">'+
+      '<td class="num '+(u.failure_rate==null?"":u.failure_rate>0?"bad-num":"ok-num")+'">'+
         (u.failure_rate==null?"N/A":(u.failure_rate*100).toFixed(1)+"%")+'</td>'+
-      '<td class="num" style="color:'+(u.timeout_rate==null?"inherit":u.timeout_rate>0.01?"#ff7b72":"inherit")+'">'+
+      '<td class="num '+(u.timeout_rate==null?"":u.timeout_rate>0.01?"bad-num":"")+'">'+
         (u.timeout_rate==null?"N/A":(u.timeout_rate*100).toFixed(1)+"%")+'</td>'+
       '<td class="num">'+fmtVal(u.latency.avg_ms,"ms")+'</td>'+
       '<td class="num">'+fmtVal(u.latency.p50_ms,"ms")+'</td>'+
       '<td class="num">'+fmtVal(u.latency.p95_ms,"ms")+'</td>'+
       '<td class="num">'+fmtVal(u.latency.p99_ms,"ms")+'</td>'+
-      '<td class="num" style="color:'+(u.failovers>0?"#e3b341":"inherit")+'">'+u.failovers+'</td>'+
-      '<td class="num mono" title="'+escapeHtml(scoreReason(u))+'" style="color:'+
-        ((u.score&&u.score.score||0)>0?"#7ee787":"var(--dim)")+'">'+
+      '<td class="num'+(u.failovers>0?" warn-num":"")+'">'+u.failovers+'</td>'+
+      '<td class="num mono '+((u.score&&u.score.score||0)>0?"ok-num":"dim")+'" title="'+escapeHtml(scoreReason(u))+'">'+
         (u.score ? u.score.score.toFixed(3) : "—")+'</td>'+
       '<td class="num">'+(rankOf[u.id]||"—")+'</td>'+
       '<td class="num" title="completed health-check rounds">'+u.health_rounds+'</td>'+
-      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_success_ago_secs)+'</td>'+
-      '<td class="mono" style="color:'+(u.last_failure_ago_secs!=null&&u.last_failure_ago_secs<30?"#e3b341":"var(--dim)")+'">'+fmtAgo(u.last_failure_ago_secs)+'</td>'+
-      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_state_change_ago_secs)+'</td>'+
-      '<td class="mono" style="color:var(--dim)">'+fmtAgo(u.last_check_ago_secs)+'</td>'+
-      '<td>'+hc+'<span class="mono" style="color:var(--faint);font-size:11px">'+hlat+'</span></td>'+
-      '<td class="mono" style="color:var(--dim);max-width:260px;overflow:hidden;text-overflow:ellipsis">'+escapeHtml(u.last_error||"—")+'</td>'+
+      '<td class="mono dim">'+fmtAgo(u.last_success_ago_secs)+'</td>'+
+      '<td class="mono '+((u.last_failure_ago_secs!=null&&u.last_failure_ago_secs<30)?"warn-num":"dim")+'">'+fmtAgo(u.last_failure_ago_secs)+'</td>'+
+      '<td class="mono dim">'+fmtAgo(u.last_state_change_ago_secs)+'</td>'+
+      '<td class="mono dim">'+fmtAgo(u.last_check_ago_secs)+'</td>'+
+      '<td>'+hc+'<span class="mono small-mono">'+hlat+'</span></td>'+
+      '<td class="mono dim truncate">'+escapeHtml(u.last_error||"—")+'</td>'+
     '</tr>';
   });
   $("up-rows").innerHTML = rows.length
@@ -1943,7 +1999,7 @@ async function fetchCurrent(){
       getJSON("/api/stats"),
       getJSON("/api/upstreams"),
       getJSON("/api/events?limit=160"),
-      getJSON("/api/clients?limit=25&sort="+encodeURIComponent(state.clientSort), 6000)
+      getJSON("/api/clients?limit=100&sort="+encodeURIComponent(state.clientSort), 6000)
         .catch(() => null),
     ]);
     state.status = status;
@@ -1972,6 +2028,7 @@ async function fetchCurrent(){
     renderVerdict(); renderKpis(); renderTraffic(); renderStatsBlocks();
     renderClientTable(); renderUpState(); renderFailovers();
     renderSignals(); renderUpstreams(); renderEvents(); renderUpstreamMgr();
+    hydrateStyles(document);
     $("foot-ev").textContent = state.events.length + " recent";
     maybeReady();
   } catch (e) {
@@ -2116,13 +2173,13 @@ function umgHandleError(e, what){
 function umgRenderMeta(){
   const st = state.status;
   const el = $("umg-meta");
-  if (!st){ el.innerHTML = '<div class="empty" style="padding:6px 0">loading…</div>'; return; }
+  if (!st){ el.innerHTML = '<div class="empty empty-sm">loading…</div>'; return; }
   const a = st.auth || {}, c = st.config || {}, u = st.upstreams || {};
   $("umg-auth").textContent = a.required ? "gateway requires a token" : "gateway: no token configured";
   el.innerHTML =
-    '<div class="cfgmeta" style="padding-bottom:4px">'+
-      '<span>generation <b style="color:var(--fg)">'+(state.generation != null ? state.generation : "—")+'</b></span>'+
-      '<span>upstreams <b style="color:var(--fg)">'+(u.enabled!=null?u.enabled+"/"+u.total:(u.total!=null?u.total:"?"))+'</b> enabled</span>'+
+    '<div class="cfgmeta cfgmeta-pad">'+
+      '<span>generation <b class="fg">'+(state.generation != null ? state.generation : "—")+'</b></span>'+
+      '<span>upstreams <b class="fg">'+(u.enabled!=null?u.enabled+"/"+u.total:(u.total!=null?u.total:"?"))+'</b> enabled</span>'+
       '<span>source '+(c.source||"—")+'</span>'+
       '<span>path '+(c.path ? escapeHtml(c.path) : "(in-memory)")+'</span>'+
     '</div>';
@@ -2149,15 +2206,15 @@ function renderUpstreamMgr(){
         '<button data-act="remove-no">Cancel</button>'
       : '<button class="danger" data-act="remove">Remove</button>';
     return '<tr data-id="'+u.id+'">'+
-      '<td><span class="state '+u.health+'" style="text-transform:none"><span class="d"></span></span> '+escapeHtml(u.name)+'</td>'+
-      '<td class="mono ip" style="color:var(--dim)">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
+      '<td><span class="state '+u.health+' state-name"><span class="d"></span></span> '+escapeHtml(u.name)+'</td>'+
+      '<td class="mono ip dim">'+escapeHtml(u.address)+':'+u.port+' · '+escapeHtml(protoLabel(u))+'</td>'+
       '<td class="num">'+u.priority+'/'+u.weight+'</td>'+
       '<td>'+(u.enabled?stateChip(u):'<span class="state disabled"><span class="d"></span>off</span>')+'</td>'+
       '<td class="num mono">'+lat+'</td>'+
-      '<td class="num" style="color:'+(u.success_rate==null?"inherit":u.success_rate>=0.99?"#7ee787":u.success_rate>=0.95?"#e3b341":"#ff7b72")+'">'+sr+'</td>'+
+      '<td class="num '+rateClass(u.success_rate)+'">'+sr+'</td>'+
       '<td class="num">'+u.failures+'</td>'+
       '<td class="num">'+u.timeouts+'</td>'+
-      '<td>'+hc+' <span class="mono" style="color:var(--faint);font-size:11px">'+fmtAgo(u.last_check_ago_secs)+'</span></td>'+
+      '<td>'+hc+' <span class="mono small-mono">'+fmtAgo(u.last_check_ago_secs)+'</span></td>'+
       '<td><div class="uact">'+acts+'<button data-act="test">Test</button>'+toggle+rm+'</div></td>'+
     '</tr>';
   });
@@ -2406,11 +2463,11 @@ async function loadAcl(){
 function renderAcl(j){
   const rows = aclState.entries.map(e =>
     '<tr data-id="'+escapeHtml(e.id)+'">'+
-      '<td class="mono" style="color:var(--faint)">'+escapeHtml(e.id)+'</td>'+
+      '<td class="mono faint">'+escapeHtml(e.id)+'</td>'+
       '<td class="mono ip">'+escapeHtml(e.cidr)+'</td>'+
       '<td><span class="tag '+(e.action==="deny"?"bad":"ok")+'">'+escapeHtml(e.action)+'</span></td>'+
       '<td>'+(e.enabled?'<span class="tag ok">on</span>':'<span class="tag">off</span>')+'</td>'+
-      '<td style="color:var(--faint)">'+(e.source?escapeHtml(e.source):"—")+'</td>'+
+      '<td class="faint">'+(e.source?escapeHtml(e.source):"—")+'</td>'+
       '<td><div class="uact">'+
         '<button data-act="acl-toggle">'+(e.enabled?"Disable":"Enable")+'</button>'+
         '<button class="danger" data-act="acl-remove">Remove</button>'+
@@ -2477,6 +2534,30 @@ async function loadCache(){
     renderCache(j);
   } catch(e){ if (e.status !== 401) cacheMsg("load failed: "+e.message, "err"); }
 }
+const CACHE_TTL_UNITS = { sec: 1, min: 60, hour: 3600, day: 86400 };
+const CACHE_TTL_MAX = { min: 86400, max: 604800, negmax: 86400 };
+const cacheTtlUnit = { min: "sec", max: "sec", negmax: "sec" };
+function cacheTtlSeconds(id){
+  const factor = CACHE_TTL_UNITS[cacheTtlUnit[id]] || 1;
+  const n = Number($("cache-"+id).value);
+  return Number.isFinite(n) ? Math.round(n * factor) : NaN;
+}
+function renderCacheTtl(id, seconds){
+  const factor = CACHE_TTL_UNITS[cacheTtlUnit[id]] || 1;
+  const input = $("cache-"+id), slider = $("cache-"+id+"-slider");
+  const value = Math.max(0, Number(seconds) || 0) / factor;
+  input.value = Number(value.toFixed(3));
+  slider.min = "0";
+  slider.max = String(Math.ceil(CACHE_TTL_MAX[id] / factor));
+  slider.value = String(value);
+}
+function setCacheTtlUnit(id, unit){
+  if (!(unit in CACHE_TTL_UNITS)) unit = "sec";
+  const before = cacheTtlSeconds(id);
+  cacheTtlUnit[id] = unit;
+  $("cache-"+id+"-unit").value = unit;
+  renderCacheTtl(id, Number.isFinite(before) ? before : 0);
+}
 function renderCache(j){
   const cs = (state.stats && state.stats.cache) || null;
   const hit = cs ? cs.hit_ratio : null;
@@ -2494,9 +2575,12 @@ function renderCache(j){
     '<div class="sr"><span class="k">negative max TTL</span><span class="v">'+j.negative_max_ttl_secs+'s</span></div>'+
     '<div class="sr"><span class="k">generation</span><span class="v">'+(j.generation ?? "—")+'</span></div>';
   $("cache-enabled").checked = !!j.enabled;
-  $("cache-min").value = j.min_ttl_secs;
-  $("cache-max").value = j.max_ttl_secs;
-  $("cache-negmax").value = j.negative_max_ttl_secs;
+  for (const id of ["min","max","negmax"]){
+    $("cache-"+id+"-unit").value = cacheTtlUnit[id];
+  }
+  renderCacheTtl("min", j.min_ttl_secs);
+  renderCacheTtl("max", j.max_ttl_secs);
+  renderCacheTtl("negmax", j.negative_max_ttl_secs);
   $("cache-maxent").value = j.max_entries;
   $("cache-maxmem").value = j.max_memory_bytes;
   syncGeneration(j.generation);
@@ -2506,9 +2590,9 @@ async function cacheSave(){
   try {
     const j = await umgApi("PUT", "/api/cache", {
       enabled: $("cache-enabled").checked,
-      min_ttl_secs: parseInt($("cache-min").value, 10),
-      max_ttl_secs: parseInt($("cache-max").value, 10),
-      negative_max_ttl_secs: parseInt($("cache-negmax").value, 10),
+      min_ttl_secs: cacheTtlSeconds("min"),
+      max_ttl_secs: cacheTtlSeconds("max"),
+      negative_max_ttl_secs: cacheTtlSeconds("negmax"),
       max_entries: parseInt($("cache-maxent").value, 10),
       max_memory_bytes: parseInt($("cache-maxmem").value, 10),
       generation: aclState.generation,
@@ -2527,6 +2611,96 @@ async function cacheClear(){
     cacheMsg("cleared "+j.entries_dropped+" entries ("+fmtBytes(j.memory_bytes_freed||0)+" freed)", "ok");
     await loadCache();
   } catch(e){ cacheMsg("rejected: "+e.message, "err"); }
+}
+
+/* =========================================================================
+ * Upstream proxy (SOCKS5 / HTTP CONNECT)
+ * ====================================================================== */
+function proxyMsg(text, cls, target){
+  const m = $(target || "proxy-msg");
+  if (!m) return;
+  m.textContent = text || "";
+  m.className = "panel-msg " + (cls || "");
+}
+async function loadProxy(){
+  try {
+    const j = await getJSON("/api/proxy");
+    renderProxy(j);
+  } catch(e){ if (e.status !== 401) proxyMsg("load failed: "+e.message, "err"); }
+}
+function renderProxy(j){
+  state.proxy = j;
+  const auth = j.username ? (j.password_set ? "username + password" : "username only") :
+    (j.password_set ? "password without username (invalid)" : "none");
+  const warn = !j.udp_supported && state.upstreams.some(u => u.enabled && u.protocol === "udp")
+    ? "HTTP CONNECT cannot carry enabled UDP upstreams; switch them to TCP/DoT or use SOCKS5."
+    : "";
+  $("proxy-stats").innerHTML = statRows([
+    {k:"enabled", v:j.enabled ? "yes" : "no", cls:j.enabled ? "good" : ""},
+    {k:"protocol", v:j.protocol === "http_connect" ? "HTTP CONNECT" : "SOCKS5"},
+    {k:"endpoint", v:j.address+":"+j.port},
+    {k:"authentication", v:auth, cls:auth.includes("invalid") ? "bad" : ""},
+    {k:"connect timeout", v:j.connect_timeout_ms+" ms"},
+    {k:"UDP relay", v:j.udp_supported ? "supported" : "not supported"},
+    {k:"generation", v:String(j.generation ?? "—")},
+  ]) + (warn ? '<div class="warnbit">'+escapeHtml(warn)+'</div>' : "");
+  $("proxy-enabled").checked = !!j.enabled;
+  $("proxy-protocol").value = j.protocol;
+  $("proxy-address").value = j.address;
+  $("proxy-port").value = j.port;
+  $("proxy-user").value = j.username || "";
+  $("proxy-pass").value = "";
+  $("proxy-clear-pass").checked = false;
+  $("proxy-timeout").value = j.connect_timeout_ms;
+  $("proxy-pass").placeholder = j.password_set
+    ? "stored password — leave blank to keep it"
+    : "no password stored";
+  syncGeneration(j.generation);
+}
+async function proxySave(){
+  const pass = $("proxy-pass").value;
+  if (pass && $("proxy-clear-pass").checked){
+    proxyMsg("choose either a replacement password or clear; not both", "err");
+    return;
+  }
+  const body = {
+    enabled: $("proxy-enabled").checked,
+    protocol: $("proxy-protocol").value,
+    address: $("proxy-address").value.trim(),
+    port: parseInt($("proxy-port").value, 10),
+    username: $("proxy-user").value,
+    connect_timeout_ms: parseInt($("proxy-timeout").value, 10),
+    generation: state.proxy ? state.proxy.generation : state.generation,
+  };
+  if (pass) body.password = pass;
+  if ($("proxy-clear-pass").checked) body.clear_password = true;
+  proxyMsg("applying…","");
+  try {
+    const j = await umgApi("PUT", "/api/proxy", body);
+    renderProxy(j);
+    proxyMsg("proxy applied"+(j.persisted?" + persisted":"")+
+      (j.persist_error?" — persist error: "+j.persist_error:""),
+      j.persist_error ? "err" : "ok");
+    await fetchCurrent();
+  } catch(e){ proxyMsg("rejected: "+e.message, "err"); }
+}
+async function proxyTest(){
+  const btn = $("proxy-test");
+  btn.disabled = true;
+  proxyMsg("testing real tunnel…","","proxy-test-msg");
+  try {
+    const j = await umgApi("POST", "/api/proxy/test", {});
+    const detail = j.reachable
+      ? "reachable via "+(j.tunnel === "udp_associate" ? "UDP ASSOCIATE" : "TCP tunnel")+
+        " to "+j.upstream+" ("+j.target+") in "+j.latency_ms+" ms"
+      : "not reachable: "+(j.error || "unknown error")+
+        " — no DNS query was sent and health state was not changed";
+    proxyMsg(detail, j.reachable ? "ok" : "err", "proxy-test-msg");
+  } catch(e){
+    proxyMsg("test rejected: "+e.message, "err", "proxy-test-msg");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 /* =========================================================================
@@ -2683,7 +2857,21 @@ function wire(){
     const th = e.target.closest("th.sortable");
     if (!th) return;
     state.clientSort = th.getAttribute("data-sort") || "requests";
+    state.clientPage = 0;
     fetchCurrent();
+  });
+  $("cl-page-size").addEventListener("change", e => {
+    state.clientPageSize = e.target.value === "10" ? 10 : 20;
+    state.clientPage = 0;
+    renderClientTable();
+  });
+  $("cl-prev").addEventListener("click", () => {
+    if (state.clientPage > 0){ state.clientPage--; renderClientTable(); }
+  });
+  $("cl-next").addEventListener("click", () => {
+    const rows = state.clients && Array.isArray(state.clients.rows) ? state.clients.rows.length : 0;
+    const pages = Math.max(1, Math.ceil(rows / state.clientPageSize));
+    if (state.clientPage < pages - 1){ state.clientPage++; renderClientTable(); }
   });
   $("cfg-apply").addEventListener("click", applyConfig);
   $("cfg-reload").addEventListener("click", loadConfig);
@@ -2715,9 +2903,23 @@ function wire(){
     aclRowAction(tr.getAttribute("data-id"), b.getAttribute("data-act"));
   });
   // Cache
+  for (const id of ["min","max","negmax"]){
+    $("cache-"+id+"-unit").addEventListener("change", e => setCacheTtlUnit(id, e.target.value));
+    $("cache-"+id+"-slider").addEventListener("input", e => {
+      $("cache-"+id).value = e.target.value;
+    });
+    $("cache-"+id).addEventListener("input", e => {
+      const slider = $("cache-"+id+"-slider");
+      if (e.target.value !== "") slider.value = e.target.value;
+    });
+  }
   $("cache-clear").addEventListener("click", cacheClear);
   $("cache-reload").addEventListener("click", loadCache);
   $("cache-save").addEventListener("click", cacheSave);
+  // Upstream proxy
+  $("proxy-save").addEventListener("click", proxySave);
+  $("proxy-reload").addEventListener("click", loadProxy);
+  $("proxy-test").addEventListener("click", proxyTest);
   // Health checks & selection
   $("hlt-save").addEventListener("click", saveHealth);
   $("hlt-reload").addEventListener("click", loadHealthSelection);

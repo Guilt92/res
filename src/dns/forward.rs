@@ -914,6 +914,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_does_not_accept_another_query_response() {
+        let (sock, addr) = start_udp_peer().await;
+        let raw_a = msg::build_query("a.example.com", "A").unwrap();
+        let parsed_a = msg::parse_query(&raw_a).unwrap();
+        let raw_b = msg::build_query("b.example.com", "A").unwrap();
+        let parsed_b = msg::parse_query(&raw_b).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let mut buf = vec![0u8; 2048];
+                let (n, peer) = sock.recv_from(&mut buf).await.expect("receive query");
+                let query = Message::from_vec(&buf[..n]).expect("decode query");
+                let name = query.queries[0].name().to_ascii().to_lowercase();
+                seen.push((name, peer, reply_for(&query, query.metadata.id)));
+            }
+            let a_pos = seen
+                .iter()
+                .position(|(name, _, _)| name.starts_with('a'))
+                .expect("query a");
+            let a = seen.remove(a_pos);
+            let b = seen.pop().expect("query b");
+
+            sock.send_to(&b.2, a.1).await.expect("swap b to a");
+            sock.send_to(&a.2, b.1).await.expect("swap a to b");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            sock.send_to(&a.2, a.1).await.expect("valid a");
+            sock.send_to(&b.2, b.1).await.expect("valid b");
+        });
+
+        let forwarder = Forwarder::new(false);
+        let up = upstream(addr, Protocol::Udp);
+        let (result_a, result_b) = tokio::join!(
+            forwarder.exchange(&up, &parsed_a, &raw_a, Duration::from_secs(1)),
+            forwarder.exchange(&up, &parsed_b, &raw_b, Duration::from_secs(1)),
+        );
+        assert_eq!(
+            result_a
+                .expect("a reply")
+                .view
+                .question
+                .expect("question")
+                .0,
+            "a.example.com."
+        );
+        assert_eq!(
+            result_b
+                .expect("b reply")
+                .view
+                .question
+                .expect("question")
+                .0,
+            "b.example.com."
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn udp_discards_replies_from_a_different_source() {
         let (target, target_addr) = start_udp_peer().await;
         let (attacker, _attacker_addr) = start_udp_peer().await;

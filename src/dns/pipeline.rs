@@ -1154,6 +1154,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dnssec_queries_bypass_the_shared_cache() {
+        use hickory_proto::op::Edns;
+
+        let mut app = AppConfig::default();
+        app.cache.enabled = true;
+        app.ratelimit.enabled = false;
+        let p = pipeline_with(app);
+
+        let raw = query_bytes("example.com", "A");
+        let parsed = msg::parse_query(&raw).expect("parse query");
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+        let mut stored = Message::response(999, OpCode::Query);
+        stored.queries = parsed.queries.clone();
+        stored.answers.push(Record::from_rdata(
+            parsed.question().name().clone(),
+            300,
+            RData::A(rdata::A::from(std::net::Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+        let cache_cfg = p.shared.rt.load().cache.clone();
+        p.shared.cache.put(
+            key,
+            stored.to_vec().expect("encode cached response"),
+            Duration::from_secs(300),
+            Rcode::NoError,
+            &cache_cfg,
+        );
+
+        let mut m = Message::query();
+        m.metadata.id = parsed.id;
+        m.queries = parsed.queries.clone();
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        edns.set_dnssec_ok(true);
+        m.set_edns(edns);
+        let do_raw = m.to_vec().expect("encode DO query");
+        let do_query = msg::parse_query(&do_raw).expect("parse DO query");
+        assert!(do_query.dnssec_ok);
+
+        match p.precheck(client(), Transport::Udp, &do_raw, Instant::now()) {
+            Precheck::Proceed(prepared) => assert!(
+                prepared.cache_key.is_none(),
+                "DO queries must not join cache/single-flight"
+            ),
+            Precheck::Reply(_) => panic!("DO query must not be served from the cache"),
+            Precheck::Drop => panic!("DO query must be forwarded"),
+        }
+        assert_eq!(p.shared.metrics.cache_hits_total.get(), 0);
+    }
+
+    #[test]
+    fn checking_disabled_queries_use_a_separate_cache_key() {
+        let mut app = AppConfig::default();
+        app.cache.enabled = true;
+        app.ratelimit.enabled = false;
+        let p = pipeline_with(app);
+
+        let raw = query_bytes("example.com", "A");
+        let parsed = msg::parse_query(&raw).expect("parse query");
+        let key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+        let mut stored = Message::response(999, OpCode::Query);
+        stored.queries = parsed.queries.clone();
+        stored.answers.push(Record::from_rdata(
+            parsed.question().name().clone(),
+            300,
+            RData::A(rdata::A::from(std::net::Ipv4Addr::new(192, 0, 2, 53))),
+        ));
+        let cache_cfg = p.shared.rt.load().cache.clone();
+        p.shared.cache.put(
+            key.clone(),
+            stored.to_vec().expect("encode cached response"),
+            Duration::from_secs(300),
+            Rcode::NoError,
+            &cache_cfg,
+        );
+
+        let mut cd_raw = raw;
+        cd_raw[3] |= 0x10;
+        let cd_query = msg::parse_query(&cd_raw).expect("parse CD query");
+        assert!(cd_query.checking_disabled);
+
+        match p.precheck(client(), Transport::Udp, &cd_raw, Instant::now()) {
+            Precheck::Proceed(prepared) => {
+                let cd_key = prepared.cache_key.expect("CD queries stay cacheable");
+                assert_ne!(cd_key, key, "CD must not reuse the validating entry");
+            }
+            Precheck::Reply(_) => panic!("CD query must not be served from the base entry"),
+            Precheck::Drop => panic!("CD query must be forwarded"),
+        }
+        assert_eq!(p.shared.metrics.cache_hits_total.get(), 0);
+    }
+
     #[tokio::test]
     async fn query_without_upstreams_returns_servfail() {
         let p = pipeline_with(AppConfig::default());

@@ -1195,11 +1195,20 @@ function sectionTitle(h2){
   return clone.textContent.trim();
 }
 const COLLAPSE_KEY = "res-collapsed-sections";
+// Keep the live query path, resolver state and incident views visible on a
+// fresh browser; routine management/history panels stay one click away.
+const DEFAULT_COLLAPSED_SECTIONS = new Set([
+  "process-capacity", "dns-service-history", "upstream-history",
+  "process-history", "upstream-dns-management", "client-acl", "cache",
+  "health-checks-selection", "configuration",
+]);
 function readCollapsedSections(){
   try {
-    const value = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "[]");
+    const stored = localStorage.getItem(COLLAPSE_KEY);
+    if (stored === null) return new Set(DEFAULT_COLLAPSED_SECTIONS);
+    const value = JSON.parse(stored);
     return new Set(Array.isArray(value) ? value.filter(x => typeof x === "string") : []);
-  } catch(_) { return new Set(); }
+  } catch(_) { return new Set(DEFAULT_COLLAPSED_SECTIONS); }
 }
 function persistCollapsedSections(){
   const ids = navSections().filter(sec => sec.classList.contains("collapsed")).map(sec => sec.id);

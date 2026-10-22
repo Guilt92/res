@@ -211,6 +211,33 @@ impl Stats {
     }
 }
 
+fn account_udp_response(stats: &mut Stats, outstanding: &mut HashMap<u16, Instant>, packet: &[u8]) {
+    if packet.len() < 2 {
+        return;
+    }
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    let Some(sent_at) = outstanding.remove(&id) else {
+        return;
+    };
+    match parse_response(packet, id) {
+        Ok(rcode) => {
+            stats.received += 1;
+            *stats.rcodes.entry(rcode).or_default() += 1;
+            stats
+                .latencies
+                .record(sent_at.elapsed().as_secs_f64() * 1000.0);
+        }
+        Err(ResponseError::Rcode(rcode)) => {
+            stats.failed += 1;
+            *stats.rcodes.entry(rcode).or_default() += 1;
+        }
+        Err(ResponseError::Malformed(reason)) => {
+            stats.failed += 1;
+            stats.last_error = Some(format!("malformed response: {reason}"));
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct LoadResult {
     timestamp: u64,
@@ -674,31 +701,16 @@ async fn udp_worker(
         // Receive whatever arrives (short poll to keep the loop responsive and
         // let expired requests be accounted for promptly).
         match timeout(REQUEST_TIMEOUT, sock.recv(&mut recv_buf)).await {
-            Ok(Ok(n)) if n >= 2 => {
-                let id = u16::from_be_bytes([recv_buf[0], recv_buf[1]]);
-                if let Some(sent_at) = outstanding.remove(&id) {
-                    match parse_response(&recv_buf[..n], id) {
-                        Ok(rcode) => {
-                            stats.received += 1;
-                            *stats.rcodes.entry(rcode).or_default() += 1;
-                            stats
-                                .latencies
-                                .record(sent_at.elapsed().as_secs_f64() * 1000.0);
-                        }
-                        Err(ResponseError::Rcode(rcode)) => {
-                            stats.failed += 1;
-                            *stats.rcodes.entry(rcode).or_default() += 1;
-                        }
-                        Err(ResponseError::Malformed(reason)) => {
-                            stats.failed += 1;
-                            stats.last_error = Some(format!("malformed response: {reason}"));
-                        }
-                    }
-                }
-            }
-            Ok(Ok(_)) => {}
+            Ok(Ok(n)) => account_udp_response(&mut stats, &mut outstanding, &recv_buf[..n]),
             Ok(Err(e)) => return Err(format!("recv: {e}")),
             Err(_) => {}
+        }
+        loop {
+            match sock.try_recv(&mut recv_buf) {
+                Ok(n) => account_udp_response(&mut stats, &mut outstanding, &recv_buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(format!("recv: {e}")),
+            }
         }
 
         // Expire timed-out queries.
@@ -728,9 +740,15 @@ async fn tcp_worker(
     let mut seq: u16 = fastrand::u16(..);
     let mut name_seq: u64 = 0;
     let mut connection: Option<TcpStream> = None;
+    let mut next_send = Instant::now();
 
     while Instant::now() < deadline {
-        let started = Instant::now();
+        if next_send > Instant::now() {
+            tokio::time::sleep(next_send - Instant::now()).await;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
         stats.attempted += 1;
         match one_tcp_query(&args, &mut seq, worker, &mut name_seq, &mut connection).await {
             Ok((elapsed, rcode)) => {
@@ -747,9 +765,9 @@ async fn tcp_worker(
                 stats.last_error = Some(error.message);
             }
         }
-        let spent = started.elapsed();
-        if spent < interval {
-            tokio::time::sleep(interval - spent).await;
+        next_send += interval;
+        if next_send < Instant::now() - Duration::from_millis(100) {
+            next_send = Instant::now() + interval;
         }
     }
     Ok(stats)
@@ -1022,5 +1040,27 @@ mod tests {
         merged.merge_from(&samples);
         assert_eq!(merged.observed, 1000);
         assert_eq!(merged.values.len(), 10);
+    }
+
+    #[test]
+    fn udp_accounting_ignores_late_ids_and_counts_failures() {
+        let mut stats = Stats::new(10);
+        let mut outstanding = HashMap::new();
+        outstanding.insert(7u16, Instant::now());
+
+        account_udp_response(&mut stats, &mut outstanding, &response(8, 0, false));
+        assert_eq!(stats.received, 0);
+        assert!(outstanding.contains_key(&7));
+
+        account_udp_response(&mut stats, &mut outstanding, &response(7, 0, false));
+        assert_eq!(stats.received, 1);
+        assert!(!outstanding.contains_key(&7));
+
+        outstanding.insert(9u16, Instant::now());
+        let mut malformed = response(9, 0, false);
+        malformed.truncate(14);
+        account_udp_response(&mut stats, &mut outstanding, &malformed);
+        assert_eq!(stats.failed, 1);
+        assert!(stats.last_error.is_some());
     }
 }

@@ -11,13 +11,16 @@ dashboard_dir = "dashboard"
 max_udp_packet_size = 4096
 max_inflight_udp = 8192
 max_tcp_connections = 512
-max_queries_per_tcp_conn = 100
+max_queries_per_tcp_conn = 1000
 tcp_idle_timeout_ms = 10000
 upstream_tcp_fallback = false
 shutdown_grace_ms = 2000
 
 # 3 attempts x 500ms fit inside the 2s deadline, so failover can use every
 # attempt the configuration asks for.
+[auth]
+allow_open_mode = true
+
 [query]
 timeout = "2s"
 upstream_timeout = "500ms"

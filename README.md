@@ -196,6 +196,8 @@ integration, or scrape the rules from your central monitoring system.
 
 - No recursive resolution or local DNSSEC validation.
 - No native DNS-over-HTTPS (DoH) upstream transport.
+- ACLs, rate limits, caching, and health state are per-process; multi-instance
+  deployments need consistent configuration and edge-level protection.
 - The application layer cannot absorb a volumetric DDoS attack.
 
 ## License

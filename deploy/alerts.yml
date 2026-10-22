@@ -118,13 +118,40 @@ groups:
           description: "The cache is barely helping under real traffic; check TTL settings and query diversity."
 
       - alert: ResMemoryHigh
-        expr: res_resident_memory_bytes > 512 * 1024 * 1024
+        expr: res_resident_memory_bytes > 384 * 1024 * 1024
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Gateway memory above 512 MiB"
-          description: "Resident memory is high; check cache max_entries and traffic volume."
+          summary: "Gateway memory above 384 MiB"
+          description: "Resident memory is above 75% of the default 512 MiB Compose limit; check cache max_entries and traffic volume. Update this rule if RES_MEMORY_LIMIT is overridden."
+
+      - alert: ResMemoryCritical
+        expr: res_resident_memory_bytes > 460 * 1024 * 1024
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway memory near its container limit"
+          description: "Resident memory is above ~90% of the default 512 MiB Compose limit; an OOM kill is imminent. Raise RES_MEMORY_LIMIT or reduce cache/traffic tables."
+
+      - alert: ResCPUSaturated
+        expr: res_cpu_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway CPU sustained above 80% of one core"
+          description: "The process has exceeded 80% of one core for 10 minutes; the default Compose CPU limit is 1.0. Raise RES_CPU_LIMIT or investigate query load/failover loops."
+
+      - alert: ResFileDescriptorsHigh
+        expr: res_open_fds > 48000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway file descriptors above 48000"
+          description: "Open FDs are approaching the 65536 Compose ulimit; check for TCP connection leaks or raise the nofile limit."
 
       - alert: ResOverloadDrops
         expr: increase(res_overload_dropped_total[5m]) > 100

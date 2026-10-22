@@ -59,6 +59,28 @@ The gateway container runs unprivileged. The bind-mounted `./config`
 directory must be writable by the container UID; override it with `RES_UID`
 and `RES_GID` if needed.
 
+### Resource limits
+
+Compose applies CPU, memory, PID and file-descriptor bounds to every service:
+
+| Service | CPU | Memory | PIDs | Other |
+|---|---|---|---|---|
+| `res` | 1.0 | 512 MiB | 256 | `nofile` 65536, read-only rootfs |
+| `prometheus` | 0.5 | 512 MiB | 512 | 2 GB / 15 day TSDB cap |
+| `grafana` | 0.5 | 256 MiB | 512 | — |
+
+Override them without editing the file, for example:
+
+```bash
+RES_CPU_LIMIT=2 RES_MEMORY_LIMIT=1G \
+PROMETHEUS_MEMORY_LIMIT=1G GRAFANA_MEMORY_LIMIT=512M \
+docker compose up -d
+```
+
+The memory alert thresholds in `deploy/alerts.yml` (warning at 384 MiB,
+critical at 460 MiB) assume the default 512 MiB `res` limit. If you raise or
+lower `RES_MEMORY_LIMIT`, adjust those rules to match.
+
 ## Configuration
 
 The main configuration file is `config/res.toml`. It defines listeners,
@@ -152,6 +174,12 @@ to `bench/results/` (ignored by Git).
 ```bash
 python3 deploy/grafana/generate_dashboards.py
 ```
+
+Critical rules cover a missing gateway scrape, Prometheus itself being down,
+zero enabled upstreams, zero usable upstreams, and imminent container OOM.
+The stack evaluates rules in Prometheus but does not ship Alertmanager or a
+notification destination: connect an existing Alertmanager/PagerDuty/Slack
+integration, or scrape the rules from your central monitoring system.
 
 ## Security notes
 

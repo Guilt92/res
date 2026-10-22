@@ -84,6 +84,26 @@ services:
     # is 0; this makes it explicit and works on stricter runtimes too).
     sysctls:
       net.ipv4.ip_unprivileged_port_start: "53"
+    # Bounded production footprint. Override through the environment when the
+    # host has different capacity; the matching alert thresholds in
+    # deploy/alerts.yml assume the 512 MiB default (warning 384 MiB, critical
+    # 460 MiB), so update both together.
+    deploy:
+      resources:
+        limits:
+          cpus: "${RES_CPU_LIMIT:-1.0}"
+          memory: "${RES_MEMORY_LIMIT:-512M}"
+          pids: 256
+        reservations:
+          cpus: "${RES_CPU_RESERVATION:-0.25}"
+          memory: "${RES_MEMORY_RESERVATION:-64M}"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # The process handles SIGTERM and drains for up to server.shutdown_grace_ms
+    # (5s by default); leave room for in-flight forwards.
+    stop_grace_period: 20s
     restart: unless-stopped
 
   prometheus:
@@ -111,6 +131,16 @@ services:
       - "127.0.0.1:9090:9090"
     depends_on:
       - res
+    deploy:
+      resources:
+        limits:
+          cpus: "${PROMETHEUS_CPU_LIMIT:-0.5}"
+          memory: "${PROMETHEUS_MEMORY_LIMIT:-512M}"
+          pids: 512
+        reservations:
+          cpus: "${PROMETHEUS_CPU_RESERVATION:-0.1}"
+          memory: "${PROMETHEUS_MEMORY_RESERVATION:-128M}"
+    stop_grace_period: 30s
     restart: unless-stopped
 
   grafana:
@@ -131,6 +161,16 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+    deploy:
+      resources:
+        limits:
+          cpus: "${GRAFANA_CPU_LIMIT:-0.5}"
+          memory: "${GRAFANA_MEMORY_LIMIT:-256M}"
+          pids: 512
+        reservations:
+          cpus: "${GRAFANA_CPU_RESERVATION:-0.1}"
+          memory: "${GRAFANA_MEMORY_RESERVATION:-64M}"
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

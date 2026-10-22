@@ -426,6 +426,12 @@ pub struct ServerConfig {
     pub tcp_idle_timeout_ms: u64,
     /// If an upstream UDP response is truncated (TC=1), retry over TCP.
     pub upstream_tcp_fallback: bool,
+    /// Require every enabled upstream to use DNS-over-TLS. This is opt-in so
+    /// existing LAN/container deployments can keep plaintext upstreams, but
+    /// once enabled validation rejects enabled UDP/TCP upstreams instead of
+    /// silently sending DNS in clear text. DoT failures never fall back to a
+    /// plaintext transport (there is no downgrade path).
+    pub require_encrypted_upstreams: bool,
     /// Grace period for draining in-flight work on shutdown.
     pub shutdown_grace_ms: u64,
     /// Bearer token required for configuration-changing API operations
@@ -457,6 +463,7 @@ impl Default for ServerConfig {
             max_queries_per_tcp_conn: 100,
             tcp_idle_timeout_ms: 10_000,
             upstream_tcp_fallback: true,
+            require_encrypted_upstreams: false,
             shutdown_grace_ms: 5_000,
             api_token: String::new(),
             tls_cert: None,
@@ -1142,6 +1149,13 @@ impl AppConfig {
             if u.id != 0 && !ids.insert(u.id) {
                 return Err(format!("duplicate upstream id {}", u.id));
             }
+            if self.server.require_encrypted_upstreams && u.enabled && u.protocol != Protocol::Tls {
+                return Err(format!(
+                    "server.require_encrypted_upstreams is enabled but upstream '{}' \
+                     uses protocol '{}' (only enabled tls upstreams are allowed)",
+                    u.name, u.protocol
+                ));
+            }
         }
         Ok(())
     }
@@ -1180,6 +1194,19 @@ impl AppConfig {
         if !self.server.upstream_tcp_fallback {
             out.push(
                 "server.upstream_tcp_fallback is off: truncated (TC=1) answers are passed through"
+                    .into(),
+            );
+        }
+        if !self.server.require_encrypted_upstreams
+            && self
+                .upstreams
+                .iter()
+                .any(|u| u.enabled && u.protocol != Protocol::Tls)
+        {
+            out.push(
+                "server.require_encrypted_upstreams is false: enabled plaintext \
+                 upstreams send DNS queries without transport encryption; set it to \
+                 true after configuring every enabled upstream as protocol = \"tls\""
                     .into(),
             );
         }
@@ -1305,7 +1332,13 @@ mod tests {
         let mut cfg = base();
         cfg.server.api_token = "test-token".into();
         cfg.validate().unwrap();
-        assert!(cfg.warnings().is_empty(), "{:?}", cfg.warnings());
+        let warnings = cfg.warnings();
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.contains("require_encrypted_upstreams")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -1344,9 +1377,12 @@ mod tests {
         cfg.query.max_attempts = 3;
         cfg.validate().unwrap();
         let warnings = cfg.warnings();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("cut short by the deadline"),
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("cut short by the deadline"))
+                .count(),
+            1,
             "{warnings:?}"
         );
     }
@@ -1361,6 +1397,44 @@ mod tests {
             warnings.iter().any(|w| w.contains("open resolver")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn encrypted_upstream_policy_rejects_plaintext_without_downgrade() {
+        let mut cfg = base();
+        cfg.server.require_encrypted_upstreams = true;
+        cfg.server.api_token = "test-token".into();
+        let err = cfg.validate().expect_err("plaintext must be rejected");
+        assert!(
+            err.contains("require_encrypted_upstreams") && err.contains("udp"),
+            "{err}"
+        );
+
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls/ca-cert.pem");
+        cfg.upstreams[0].protocol = Protocol::Tls;
+        cfg.upstreams[0].port = 853;
+        cfg.upstreams[0].tls_server_name = Some("resolver.example".into());
+        cfg.upstreams[0].tls_ca_file = Some(path);
+        cfg.validate().expect("encrypted upstream satisfies policy");
+        assert!(
+            !cfg.warnings()
+                .iter()
+                .any(|w| w.contains("require_encrypted_upstreams")),
+            "{:?}",
+            cfg.warnings()
+        );
+
+        // Disabled plaintext upstreams cannot leak traffic and are allowed;
+        // they become an error if enabled later.
+        cfg.upstreams[0].enabled = false;
+        cfg.upstreams[0].protocol = Protocol::Udp;
+        cfg.upstreams[0].tls_server_name = None;
+        cfg.upstreams[0].tls_ca_file = None;
+        cfg.validate()
+            .expect("disabled plaintext upstream is inert");
+        cfg.upstreams[0].enabled = true;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

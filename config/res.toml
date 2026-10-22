@@ -9,6 +9,7 @@ max_tcp_connections = 512
 max_queries_per_tcp_conn = 100
 tcp_idle_timeout_ms = 10000
 upstream_tcp_fallback = true
+require_encrypted_upstreams = false
 shutdown_grace_ms = 5000
 
 [auth]

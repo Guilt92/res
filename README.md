@@ -191,7 +191,13 @@ The management API can terminate TLS itself, or sit behind a reverse proxy:
 `port = 853`, and `tls_server_name = "resolver.example"`. The certificate is
 verified against that name using the bundled public WebPKI roots, or against
 `tls_ca_file` when supplied. Certificate/SNI failures are hard upstream
-failures and never fall back to plaintext. DoH (DNS-over-HTTPS) is **not**
+failures and never fall back to plaintext. Set
+`[server].require_encrypted_upstreams = true` to make transport encryption a
+startup/reload invariant: every enabled upstream must use `protocol = "tls"`,
+and validation names any enabled plaintext upstream instead of silently
+forwarding it. Health probes use the same configured transport. Disabled
+plaintext entries remain allowed because they carry no traffic, but enabling
+one fails validation. DoH (DNS-over-HTTPS) is **not**
 implemented; use DoT or a local DoH proxy if required. DNS responses retain
 upstream DNSSEC records/flags, but this gateway does **not** validate DNSSEC
 locally.

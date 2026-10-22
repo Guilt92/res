@@ -917,6 +917,18 @@ impl AppConfig {
                 self.server.api_token = v;
             }
         }
+        if let Ok(v) = std::env::var("RES_PROTECT_METRICS") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.auth.protect_metrics = true,
+                "0" | "false" | "no" | "off" => self.auth.protect_metrics = false,
+                other => tracing::warn!(
+                    event = "invalid_env_override",
+                    variable = "RES_PROTECT_METRICS",
+                    value = other,
+                    "ignoring invalid boolean"
+                ),
+            }
+        }
     }
 
     /// Startup loader with a last-known-good fallback chain:

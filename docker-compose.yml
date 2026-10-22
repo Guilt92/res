@@ -5,6 +5,7 @@
 #   RES_ADMIN_PASSWORD / RES_VIEWER_PASSWORD   dashboard users "admin"/"viewer" :8080
 #   GF_SECURITY_ADMIN_PASSWORD                 Grafana user "admin"             :3000
 #   deploy/prometheus/web.config.yml           Prometheus user "prom"           :9090
+#   RES_API_TOKEN                              gateway metrics scrape bearer    :8080/metrics
 # The gateway's Prometheus proxy authenticates with RES_PROMETHEUS_USERNAME/
 # RES_PROMETHEUS_PASSWORD, and the Grafana datasource carries the same user
 # (deploy/grafana/provisioning/datasources/prometheus.yml).
@@ -45,6 +46,10 @@ services:
       # Users: "admin" (full access) and "viewer" (read-only).
       RES_ADMIN_PASSWORD: "res-dashboard-pw"
       RES_VIEWER_PASSWORD: "res-viewer-pw"
+      # Metrics are scraped by Prometheus with this bearer token; the gateway
+      # rejects unauthenticated /metrics requests with 401.
+      RES_API_TOKEN: "res-metrics-token"
+      RES_PROTECT_METRICS: "true"
     volumes:
       # Whole directory (rw): the gateway rewrites the config atomically via
       # temp-file + fsync + rename and keeps a .backup next to it.
@@ -56,6 +61,13 @@ services:
       - "${RES_DNS_PUBLISH:-53}:53/udp"
       - "${RES_DNS_PUBLISH:-53}:53/tcp"
       - "8080:8080"
+    # The gateway never writes to its root filesystem (config is a bind mount,
+    # logs go to stdout/stderr). Keep it read-only and disallow privilege gain.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   prometheus:

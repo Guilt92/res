@@ -23,7 +23,8 @@ implemented.
   caching for NXDOMAIN/NODATA, bounded by entry count and TTL caps. RD=0
   queries bypass the cache (no cache snooping), and queries carrying any EDNS
   option (ECS, COOKIE, padding, ...) bypass the shared cache and single-flight,
-  because their upstream replies may be client-specific
+  because their upstream replies may be client-specific; upstream-added EDNS
+  options are stripped before an option-free client receives a response
 * Upstream pools with priority tiers (strict by default, optional shared
   traffic to keep lower tiers warm), weighted sharing, three selection
   strategies, active health checks with hysteresis, selectable
@@ -69,6 +70,11 @@ $ dig @127.0.0.1 -p 53 example.com
 $ open http://localhost:8080/        # log in as admin (password below)
 ```
 
+The image refuses to start without explicit credentials or a persisted
+`res.credentials` file; it never generates and prints a password to the
+logs. Compose supplies the credentials shown below, so a bare
+`docker compose up -d` still works.
+
 All credentials are plain text in `docker-compose.yml` — intentional for
 this deployment (no secrets manager), defined in exactly one place:
 
@@ -77,6 +83,7 @@ this deployment (no secrets manager), defined in exactly one place:
 | Dashboard/API | `:8080` | `admin` (full), `viewer` (read-only) | `RES_ADMIN_PASSWORD` / `RES_VIEWER_PASSWORD` (`docker-compose.yml`) |
 | Grafana | `:3000` | `admin` | `GF_SECURITY_ADMIN_PASSWORD` (`docker-compose.yml`) |
 | Prometheus | `:9090` | `prom` | `deploy/prometheus/web.config.yml` (`--web.config.file`) |
+| Gateway metrics scrape | `res:8080/metrics` | bearer | `RES_API_TOKEN` (`docker-compose.yml`, mirrored in `deploy/prometheus.yml`) |
 
 Each application enforces its own credential: the gateway rejects
 unauthenticated API requests with `401` (viewer mutations: `403`) and stores
@@ -121,6 +128,9 @@ Single TOML file `config/res.toml` — no database. Human durations (`"2s"`,
   `RES_PROMETHEUS_USERNAME` / `RES_PROMETHEUS_PASSWORD` (env-only, never in
   the TOML) are sent as HTTP basic auth on every proxy query when the
   Prometheus server requires it.
+* `RES_API_TOKEN` supplies the control-plane bearer token; `RES_PROTECT_METRICS`
+  (`true`/`false`) overrides `[auth].protect_metrics`. Compose sets both so
+  Prometheus scrapes `/metrics` with a bearer token.
 * Directories mounted into containers must be directory mounts (compose uses
   `./config:/etc/res:rw`).
 
@@ -167,9 +177,11 @@ The management API can terminate TLS itself, or sit behind a reverse proxy:
 * API concurrency is bounded (256 in-flight, 5 s wait) and sheds load with
   `503`; a reverse proxy can add its own connection limits.
 * `/metrics` is unauthenticated by default for Prometheus scrapes on the
-  internal network; set `[auth].protect_metrics = true` if it is reachable
-  more widely. When any credential is configured, scrapers must present the
-  bearer token or a session — never expose metrics publicly.
+  internal network; set `[auth].protect_metrics = true` (or
+  `RES_PROTECT_METRICS=true`) if it is reachable more widely. When any
+  credential is configured, scrapers must present the bearer token or a
+  session — never expose metrics publicly. The bundled Compose stack enables
+  this and Prometheus sends `RES_API_TOKEN`.
 
 **DNS-over-TLS upstreams:** set an upstream `protocol = "tls"`,
 `port = 853`, and `tls_server_name = "resolver.example"`. The certificate is

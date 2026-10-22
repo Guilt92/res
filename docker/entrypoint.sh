@@ -1,24 +1,21 @@
 #!/bin/sh
-# First-run credential bootstrap for the res gateway.
+# Credential bootstrap for the res gateway.
 #
-# The stack must start with a bare `docker-compose up -d` (no env file), so
-# credentials are never required at interpolation time. Precedence:
+# Credentials must be explicit, never generated and printed to logs:
 #
 #   1. RES_ADMIN_PASSWORD / RES_VIEWER_PASSWORD environment (explicit choice)
 #   2. persisted /etc/res/res.credentials (argon2 hashes; survives restarts)
-#   3. neither: generate a random one-time admin password, export it for this
-#      process only, and print it once to stderr (docker logs). The binary
-#      persists the hash; subsequent starts take path 2 and keep the password.
+#   3. neither: refuse to start (the gateway fail-closed rule is mirrored here)
 #
-# There are no hardcoded credentials in the image or repository.
+# docker-compose.yml supplies path 1, so the documented stack still starts
+# with a bare `docker compose up -d`.
 set -eu
 
 if [ -z "${RES_ADMIN_PASSWORD:-}" ] && [ -z "${RES_VIEWER_PASSWORD:-}" ] \
    && [ ! -f /etc/res/res.credentials ]; then
-    pw=$(head -c 24 /dev/urandom | base64 | tr -d '\n')
-    export RES_ADMIN_PASSWORD="$pw"
-    echo "res-entrypoint: no password configured; generated one-time admin password for user 'admin': $pw" >&2
-    echo "res-entrypoint: only its argon2 hash is persisted (/etc/res/res.credentials); set RES_ADMIN_PASSWORD to choose your own." >&2
+    echo "res-entrypoint: refusing to start without credentials." >&2
+    echo "res-entrypoint: set RES_ADMIN_PASSWORD (and optionally RES_VIEWER_PASSWORD), or mount a persisted /etc/res/res.credentials." >&2
+    exit 1
 fi
 
 # CMD carries the gateway's flags (e.g. --config ... serve): run them as

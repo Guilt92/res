@@ -27,7 +27,6 @@ RUN mkdir -p src/bin && \
     rm -rf src
 
 COPY src ./src
-COPY config ./config
 RUN touch src/main.rs src/lib.rs src/bin/*.rs && cargo build --release
 
 FROM debian:trixie-slim
@@ -53,7 +52,8 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD ["res", "--config", "/etc/res/res.toml", "probe", \
        "--server", "127.0.0.1:53", "--timeout-ms", "2000"]
 
-# Bootstrap: if no password env is set and no persisted credentials file
-# exists yet, generate a one-time admin password and print it (docker logs).
+# Fail-closed bootstrap: require explicit password env or a persisted
+# credentials file. Compose supplies the env; no password is generated or
+# written to logs.
 ENTRYPOINT ["/usr/local/bin/res-entrypoint"]
 CMD ["--config", "/etc/res/res.toml", "serve"]

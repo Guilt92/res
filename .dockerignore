@@ -4,3 +4,8 @@ target/
 README.md
 tests/
 *.md
+
+# Never ship runtime credentials/backups in the build context or image.
+config/res.credentials
+config/res.toml.backup
+bench/

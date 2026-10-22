@@ -16,11 +16,23 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::config::{backup_path, AppConfig};
 
+/// In-process serialization for the read-backup-write sequence. The control
+/// plane already serializes mutations, but the persistence helper must remain
+/// safe for direct callers and tests. Cross-process writers are not supported.
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Unique suffix for temp files (combined with the PID, so two processes
+/// sharing a directory cannot collide either).
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Persist `cfg` to `path` atomically. See module docs for the protocol.
 pub fn save_atomic(path: &Path, cfg: &AppConfig) -> Result<(), String> {
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let text = cfg.to_toml()?;
     // Round-trip check: refuse to write anything that would not load.
     AppConfig::parse(&text)?;
@@ -51,8 +63,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let file_name = path
         .file_name()
         .ok_or_else(|| format!("invalid path {}", path.display()))?;
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{seq}.tmp",
         file_name.to_string_lossy(),
         std::process::id()
     ));
@@ -209,6 +222,111 @@ mod tests {
         for p in [path.clone(), backup_path(&path)] {
             let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} must be 0600, got {mode:o}", p.display());
+        }
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+    }
+
+    fn temp_files_for(path: &Path) -> Vec<std::path::PathBuf> {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let prefix = format!(".{name}.{}.", std::process::id());
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backup_failure_leaves_primary_and_backup_untouched() {
+        let path = tmp_file("backup-fail.toml");
+        let backup = backup_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&backup);
+        save_atomic(&path, &cfg_with(53)).unwrap();
+        let primary_before = fs::read(&path).unwrap();
+
+        // Force the backup write to fail at the final rename: a directory
+        // cannot be replaced by a file. The primary must not be touched.
+        fs::create_dir(&backup).unwrap();
+        let err = save_atomic(&path, &cfg_with(54)).unwrap_err();
+        assert!(err.contains("backup"), "unexpected error: {err}");
+        assert_eq!(fs::read(&path).unwrap(), primary_before);
+        assert!(temp_files_for(&path).is_empty(), "temp file leaked");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&backup);
+    }
+
+    #[test]
+    fn rename_failure_cleans_temp_and_keeps_last_good_backup() {
+        let path = tmp_file("rename-fail.toml");
+        let backup = backup_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_dir_all(&backup);
+        // Two successful saves establish primary=54 and backup=53.
+        save_atomic(&path, &cfg_with(53)).unwrap();
+        save_atomic(&path, &cfg_with(54)).unwrap();
+        let backup_before = fs::read(&backup).unwrap();
+
+        // Replace the primary with a directory so the final atomic rename
+        // fails after the temp file has been written and fsynced.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let err = save_atomic(&path, &cfg_with(55)).unwrap_err();
+        assert!(err.contains("rename"), "unexpected error: {err}");
+        assert!(
+            path.is_dir(),
+            "failed rename must not replace the directory"
+        );
+        assert!(temp_files_for(&path).is_empty(), "temp file leaked");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            backup_before,
+            "failed primary rename must not clobber the last good backup"
+        );
+
+        let _ = fs::remove_dir(&path);
+        let _ = fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_share_temp_files_or_corrupt_the_primary() {
+        let path = tmp_file("concurrent.toml");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(backup_path(&path));
+
+        let mut handles = Vec::new();
+        for i in 0..8u16 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                save_atomic(&path, &cfg_with(5300 + i))
+            }));
+        }
+        for h in handles {
+            h.join().unwrap().expect("concurrent save failed");
+        }
+
+        let loaded = AppConfig::load(&path).expect("primary loads");
+        assert!(
+            (5300..5308).contains(&loaded.upstreams[0].port),
+            "unexpected final writer: {}",
+            loaded.upstreams[0].port
+        );
+        assert!(
+            temp_files_for(&path).is_empty(),
+            "concurrent writes leaked temp files"
+        );
+        if backup_path(&path).exists() {
+            AppConfig::load(&backup_path(&path)).expect("backup loads");
         }
 
         let _ = fs::remove_file(&path);

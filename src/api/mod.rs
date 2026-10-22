@@ -1541,7 +1541,7 @@ async fn import_config(
     })?;
 
     let (persisted, persist_error) = if req.persist {
-        persist_or_report(&st)
+        persist_or_report(&st).await
     } else {
         (false, None)
     };
@@ -1622,7 +1622,7 @@ async fn rollback_config(
 
     // Persist the restored configuration as the primary file. A failure here
     // is reported but the runtime already runs the backup content.
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
 
     st.shared.record_config_event(
         "rollback",
@@ -1960,7 +1960,7 @@ async fn apply_acl_entries(
             ApiError::BadRequest(e),
         )
     })?;
-    let (persisted, persist_error) = persist_or_report(st);
+    let (persisted, persist_error) = persist_or_report(st).await;
     let outcome = if persist_error.is_some() {
         "applied_persist_failed"
     } else {
@@ -2368,7 +2368,7 @@ async fn put_proxy(
             ApiError::BadRequest(e),
         )
     })?;
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     let outcome = if persist_error.is_some() {
         "applied_persist_failed"
     } else {
@@ -2525,7 +2525,7 @@ async fn put_cache(
             ApiError::BadRequest(e),
         )
     })?;
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     let outcome = if persist_error.is_some() {
         "applied_persist_failed"
     } else {
@@ -2638,7 +2638,7 @@ async fn put_health_config(
             ApiError::BadRequest(e),
         )
     })?;
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     let outcome = if persist_error.is_some() {
         "applied_persist_failed"
     } else {
@@ -2722,7 +2722,7 @@ async fn put_selection(
             ApiError::BadRequest(e),
         )
     })?;
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     let outcome = if persist_error.is_some() {
         "applied_persist_failed"
     } else {
@@ -3258,7 +3258,7 @@ async fn create_upstream(
         )
     })?;
 
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     st.shared.record_config_event(
         "create",
         json!({
@@ -3420,7 +3420,7 @@ async fn patch_upstream(
         )
     })?;
 
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     st.shared.record_config_event(
         "update",
         json!({
@@ -3490,7 +3490,7 @@ async fn delete_upstream(
         )
     })?;
 
-    let (persisted, persist_error) = persist_or_report(&st);
+    let (persisted, persist_error) = persist_or_report(&st).await;
     st.shared.record_config_event(
         "delete",
         json!({
@@ -3513,13 +3513,18 @@ async fn delete_upstream(
 /// reported but never rolls back the applied configuration (the data plane
 /// must keep running; `/api/diagnostics` surfaces the error). When no config
 /// path is set the gateway runs purely in memory and reports `persisted=false`.
-fn persist_or_report(st: &ApiState) -> (bool, Option<String>) {
+async fn persist_or_report(st: &ApiState) -> (bool, Option<String>) {
     if st.shared.config_path.get().is_none() {
         return (false, None);
     }
-    match st.shared.persist_config() {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
+    // save_atomic fsyncs the file and directory; never run that on a Tokio
+    // worker. The mutation lock is still held by the caller, so serializing
+    // through the blocking pool cannot reorder API mutations.
+    let shared = Arc::clone(&st.shared);
+    match tokio::task::spawn_blocking(move || shared.persist_config()).await {
+        Ok(Ok(())) => (true, None),
+        Ok(Err(e)) => (false, Some(e)),
+        Err(e) => (false, Some(format!("persist task failed: {e}"))),
     }
 }
 

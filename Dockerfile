@@ -32,18 +32,25 @@ RUN touch src/main.rs src/lib.rs src/bin/*.rs && cargo build --release
 FROM debian:trixie-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 res && \
+    useradd --uid 10001 --gid 10001 --no-create-home \
+        --home-dir /nonexistent --shell /usr/sbin/nologin res && \
+    install -d -o res -g res -m 0750 /etc/res /app
 
-COPY --from=builder /build/target/release/res /usr/local/bin/res
-COPY --from=builder /build/target/release/res-loadtest /usr/local/bin/res-loadtest
-COPY config/res.toml /etc/res/res.toml
-COPY dashboard /app/dashboard
-COPY docker/entrypoint.sh /usr/local/bin/res-entrypoint
-RUN chmod +x /usr/local/bin/res-entrypoint
+COPY --from=builder --chown=res:res /build/target/release/res /usr/local/bin/res
+COPY --from=builder --chown=res:res /build/target/release/res-loadtest /usr/local/bin/res-loadtest
+COPY --chown=res:res config/res.toml /etc/res/res.toml
+COPY --chown=res:res dashboard /app/dashboard
+COPY --chmod=0755 --chown=res:res docker/entrypoint.sh /usr/local/bin/res-entrypoint
 
 WORKDIR /app
-# Runs as root: binding :53 needs CAP_NET_BIND_SERVICE (or root), and the
-# config directory must stay writable for the atomic config writes + backup.
+# Run unprivileged. Docker's default `net.ipv4.ip_unprivileged_port_start=0`
+# lets UID 10001 bind :53; runtimes that raise it need
+# `--sysctl net.ipv4.ip_unprivileged_port_start=53`. The config directory must
+# stay writable by this UID for atomic config writes, backups and
+# res.credentials (bind mounts must be owned accordingly).
+USER 10001:10001
 EXPOSE 53/udp 53/tcp 8080/tcp
 
 # Liveness: the gateway answers a probe query (even SERVFAIL proves the data

@@ -51,6 +51,11 @@ services:
       # credentials cannot scrape metrics.
       RES_METRICS_TOKEN: "res-metrics-token"
       RES_PROTECT_METRICS: "true"
+    # The image defaults to UID/GID 10001; the host ./config bind mount is
+    # what needs to be writable (atomic config rewrite + res.credentials), so
+    # the container UID defaults to the usual host user. Override with
+    # RES_UID/RES_GID if ./config is owned by another account.
+    user: "${RES_UID:-1000}:${RES_GID:-1000}"
     volumes:
       # Whole directory (rw): the gateway rewrites the config atomically via
       # temp-file + fsync + rename and keeps a .backup next to it.
@@ -69,6 +74,13 @@ services:
       - /tmp
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Unprivileged port 53 does not need CAP_NET_BIND_SERVICE when the
+    # kernel's unprivileged-port floor is at or below 53 (Docker's default
+    # is 0; this makes it explicit and works on stricter runtimes too).
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "53"
     restart: unless-stopped
 
   prometheus:

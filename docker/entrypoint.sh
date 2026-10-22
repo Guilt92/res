@@ -11,6 +11,13 @@
 # with a bare `docker compose up -d`.
 set -eu
 
+# The image runs as UID 10001. Refuse an explicit `--user 0` override:
+# dropping privileges for the DNS data plane is the point of the image.
+if [ "$(id -u)" = "0" ]; then
+    echo "res-entrypoint: refusing to run as root; use the image's UID 10001 (or a writable bind mount owned by that UID)." >&2
+    exit 1
+fi
+
 if [ -z "${RES_ADMIN_PASSWORD:-}" ] && [ -z "${RES_VIEWER_PASSWORD:-}" ] \
    && [ ! -f /etc/res/res.credentials ]; then
     echo "res-entrypoint: refusing to start without credentials." >&2

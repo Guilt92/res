@@ -72,7 +72,12 @@ $ open http://localhost:8080/        # log in as admin (password below)
 
 The image refuses to start without explicit credentials or a persisted
 `res.credentials` file; it never generates and prints a password to the
-logs. Compose supplies the credentials shown below, so a bare
+logs. It also runs unprivileged (UID 10001) and refuses an explicit root
+override; compose maps that UID to the host owner of `./config` so the
+atomic config rewrite and `res.credentials` stay writable. Docker's
+unprivileged-port default lets UID 10001 bind `:53`; compose sets
+`net.ipv4.ip_unprivileged_port_start=53` explicitly for stricter runtimes.
+Compose supplies the credentials shown below, so a bare
 `docker compose up -d` still works.
 
 All credentials are plain text in `docker-compose.yml` — intentional for
@@ -290,6 +295,11 @@ it (hover the score).
 
 Deliberate scope decisions, so nothing here surprises an operator:
 
+* **The container is non-root by default** — the image runs as UID
+  10001/GID 10001, drops all capabilities in compose, keeps
+  `no-new-privileges`, and refuses `--user 0` via the entrypoint. The
+  `./config` bind mount (or named volume) must be writable by the
+  container UID (`RES_UID`/`RES_GID`, default 1000:1000 in compose).
 * **Compose credentials are plain text** — intentionally, per this
   deployment's requirement (no secrets manager). The gateway still stores
   only argon2 hashes at runtime; change the values by editing

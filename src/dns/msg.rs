@@ -113,7 +113,11 @@ pub fn parse_query(bytes: &[u8]) -> Result<ParsedQuery, QueryReject> {
     if bytes.len() < 12 {
         return Err(QueryReject::TooShort);
     }
-    let msg = Message::from_vec(bytes).map_err(|_| QueryReject::Malformed)?;
+    let mut decoder = BinDecoder::new(bytes);
+    let msg = Message::read(&mut decoder).map_err(|_| QueryReject::Malformed)?;
+    if !decoder.is_empty() {
+        return Err(QueryReject::Malformed);
+    }
     if msg.metadata.message_type != MessageType::Query {
         return Err(QueryReject::NotAQuery);
     }
@@ -796,6 +800,13 @@ mod tests {
             q.question().name().to_ascii().to_lowercase(),
             "example.com."
         );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_after_query() {
+        let mut bytes = sample_query();
+        bytes.push(0);
+        assert_eq!(parse_query(&bytes), Err(QueryReject::Malformed));
     }
 
     #[test]

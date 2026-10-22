@@ -617,7 +617,7 @@ pub fn align_response_to_query(resp: &mut Vec<u8>, query: &ParsedQuery, query_ra
 /// advertisement exactly. Returns `false` only when the record layout cannot
 /// be safely rewritten.
 fn align_opt(resp: &mut Vec<u8>, query: &ParsedQuery) -> bool {
-    let spans = match find_opt_spans(resp) {
+    let mut spans = match find_opt_spans(resp) {
         Some(s) => s,
         None => return false,
     };
@@ -651,6 +651,21 @@ fn align_opt(resp: &mut Vec<u8>, query: &ParsedQuery) -> bool {
                 }
             }
         }
+        // Option-free queries never opted into client-specific EDNS data.
+        // Drop any upstream options (ECS/COOKIE/...) before serving,
+        // otherwise an option-free client could receive another transaction's
+        // options from the shared cache. Re-encode
+        // because option lengths are part of the wire layout; compression
+        // offsets after OPT must not be left dangling.
+        if !query.has_edns_options {
+            if !strip_opt_options(resp) {
+                return false;
+            }
+            spans = match find_opt_spans(resp) {
+                Some(s) => s,
+                None => return false,
+            };
+        }
         // Patch payload size (class) and flags (TTL low 16: DO bit) to this
         // client's values; extended-rcode/version bytes are preserved.
         let start = spans[0].0;
@@ -678,6 +693,29 @@ fn align_opt(resp: &mut Vec<u8>, query: &ParsedQuery) -> bool {
             }
         }
         true
+    }
+}
+
+/// Remove all EDNS options from the (single) OPT record, preserving the
+/// pseudo-record itself, extended rcode/version and DNSSEC-OK flag. Returns
+/// `false` only when the message cannot be decoded/re-encoded safely.
+fn strip_opt_options(resp: &mut Vec<u8>) -> bool {
+    let Ok(mut msg) = Message::from_vec(resp) else {
+        return false;
+    };
+    let Some(edns) = msg.edns.as_mut() else {
+        return true;
+    };
+    if edns.options().as_ref().is_empty() {
+        return true;
+    }
+    edns.options_mut().as_mut().clear();
+    match msg.to_vec() {
+        Ok(bytes) => {
+            *resp = bytes;
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -1217,6 +1255,44 @@ mod tests {
             1,
             "arcount corrected"
         );
+    }
+
+    #[test]
+    fn align_strips_upstream_edns_options_for_option_free_clients() {
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+
+        // Upstream attached an ECS option even though the downstream query
+        // carried none (or the bytes were cached after such an exchange).
+        let ecs = edns_query("example.com", Some((4096, false)));
+        let q_ecs = parse_query(&ecs).unwrap();
+        let mut resp = error_response(&q_ecs, Rcode::NoError);
+        let mut msg = Message::from_vec(&resp).unwrap();
+        let mut edns = msg.edns.take().expect("response OPT");
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "198.51.100.0".parse().unwrap(),
+                24,
+                0,
+            )));
+        msg.set_edns(edns);
+        resp = msg.to_vec().unwrap();
+
+        // An option-free EDNS client must receive an OPT for its own payload
+        // size but none of the upstream's client-specific options.
+        let raw = edns_query("example.com", Some((1232, false)));
+        let q = parse_query(&raw).unwrap();
+        assert!(q.has_edns);
+        assert!(!q.has_edns_options);
+        assert!(align_response_to_query(&mut resp, &q, &raw));
+
+        let decoded = Message::from_vec(&resp).unwrap();
+        let edns = decoded.edns.expect("OPT retained");
+        assert!(
+            edns.options().as_ref().is_empty(),
+            "upstream EDNS options must not leak to option-free clients"
+        );
+        assert_eq!(edns.max_payload(), 1232);
+        assert!(!edns.flags().dnssec_ok);
     }
 
     #[test]

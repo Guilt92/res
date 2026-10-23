@@ -2121,9 +2121,8 @@ async function applyConfig(){
         return;
       } else throw e;
     }
-    msg.textContent = "applied"+(j.persisted?" + persisted":" (memory only)")+
-      (j.persist_error?" — persist error: "+j.persist_error:"");
-    msg.className = j.persist_error ? "err" : "ok";
+    msg.textContent = "applied"+(j.persisted?" + persisted":" (memory only)");
+    msg.className = "ok";
     if (j.generation != null) syncGeneration(j.generation);
     await loadConfig(); await fetchCurrent();
   } catch (e){
@@ -2175,6 +2174,8 @@ function umgHandleError(e, what){
   } else if (e.code === "conflict" && /stale configuration/.test(e.message)){
     umgMsg("Configuration changed elsewhere; reloading… ("+e.message+")", "warn");
     fetchCurrent();
+  } else if (e.code === "persist_failed"){
+    umgMsg(what+" rejected: "+e.message+" — active configuration is unchanged", "err");
   } else {
     umgMsg(what+" rejected: "+e.message, "err");
   }
@@ -2340,11 +2341,7 @@ async function umgSubmit(){
       ? await umgApi("PATCH", "/api/upstreams/"+umg.editId, body)
       : await umgApi("POST", "/api/upstreams", body);
     umgMsg(what+" of '"+name+"' applied"+(j.persisted?" + persisted":" (memory only)")+
-      (j.persist_error?" — persist error: "+j.persist_error:"")+
-      " — effective immediately (generation "+j.generation+")", j.persist_error ? "err" : "ok");
-    if (j.persist_error)
-      umgMsg(what+" of '"+name+"' applied in memory but persist failed: "+j.persist_error+
-        " — runtime and file now diverge until fixed (see timeline /logs)", "err");
+      " — effective immediately (generation "+j.generation+")", "ok");
     umgCloseForm();
     await fetchCurrent();
   } catch (e){ umgHandleError(e, what+" '"+name+"'"); }
@@ -2382,9 +2379,7 @@ async function umgRowAction(id, act){
     try {
       const j = await umgApi("PATCH", "/api/upstreams/"+id, body);
       umgMsg(u.name+(next?" enabled":" disabled")+" — effective immediately"+
-        (j.persisted?" (persisted)":" (memory only)")+
-        (j.persist_error?" — persist error: "+j.persist_error:""),
-        j.persist_error ? "err" : "ok");
+        (j.persisted?" (persisted)":" (memory only)"), "ok");
       await fetchCurrent();
     } catch (e){ umgHandleError(e, (next?"enable ":"disable ")+u.name); renderUpstreamMgr(); }
     return;
@@ -2398,9 +2393,7 @@ async function umgRowAction(id, act){
     try {
       const j = await umgApi("DELETE", path);
       umgMsg(u.name+" removed — effective immediately"+
-        (j.persisted?" (persisted)":" (memory only)")+
-        (j.persist_error?" — persist error: "+j.persist_error:""),
-        j.persist_error ? "err" : "ok");
+        (j.persisted?" (persisted)":" (memory only)"), "ok");
       await fetchCurrent();
     } catch (e){ umgHandleError(e, "remove "+u.name); renderUpstreamMgr(); }
   }
@@ -2607,9 +2600,7 @@ async function cacheSave(){
       generation: aclState.generation,
     });
     renderCache(j);
-    cacheMsg("settings applied"+(j.persisted?" + persisted":"")+
-      (j.persist_error?" — persist error: "+j.persist_error:""),
-      j.persist_error ? "err" : "ok");
+    cacheMsg("settings applied"+(j.persisted?" + persisted":""), "ok");
   } catch(e){ cacheMsg("rejected: "+e.message, "err"); }
 }
 async function cacheClear(){
@@ -2687,9 +2678,7 @@ async function proxySave(){
   try {
     const j = await umgApi("PUT", "/api/proxy", body);
     renderProxy(j);
-    proxyMsg("proxy applied"+(j.persisted?" + persisted":"")+
-      (j.persist_error?" — persist error: "+j.persist_error:""),
-      j.persist_error ? "err" : "ok");
+    proxyMsg("proxy applied"+(j.persisted?" + persisted":""), "ok");
     await fetchCurrent();
   } catch(e){ proxyMsg("rejected: "+e.message, "err"); }
 }
@@ -2799,9 +2788,7 @@ async function saveHealth(){
     const j = await umgApi("PUT", "/api/health/config", body);
     syncGeneration(j.generation);
     await loadHealthSelection();
-    hltMsg("health settings applied"+(j.persisted?" + persisted":"")+
-      (j.persist_error?" — persist error: "+j.persist_error:""),
-      j.persist_error ? "err" : "ok");
+    hltMsg("health settings applied"+(j.persisted?" + persisted":""), "ok");
   } catch(e){
     if (e.status === 409){ hltMsg("Configuration changed elsewhere; reloaded — review and re-apply. ("+e.message+")", "warn"); loadHealthSelection(); }
     else hltMsg("rejected: "+e.message, "err");
@@ -2825,9 +2812,7 @@ async function saveSelection(){
     const j = await umgApi("PUT", "/api/selection", body);
     syncGeneration(j.generation);
     await loadHealthSelection();
-    selMsg("selection policy applied"+(j.persisted?" + persisted":"")+
-      (j.persist_error?" — persist error: "+j.persist_error:""),
-      j.persist_error ? "err" : "ok");
+    selMsg("selection policy applied"+(j.persisted?" + persisted":""), "ok");
     await fetchCurrent();
   } catch(e){
     if (e.status === 409){ selMsg("Configuration changed elsewhere; reloaded — review and re-apply. ("+e.message+")", "warn"); loadHealthSelection(); }

@@ -1491,6 +1491,75 @@ async fn config_mutations_persist_atomically_with_backup() {
     fake.stop().await;
 }
 
+/// A successful disable is durable before it becomes active, and a restart
+/// loads the disabled state instead of the pre-mutation configuration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_upstream_persists_and_survives_restart() {
+    let fake = FakeUpstream::start().await;
+    let mut cfg = base_config();
+    let mut upstream = fake.config("cloudflare-1");
+    upstream.id = 1;
+    cfg.upstreams.push(upstream);
+
+    let dir = std::env::temp_dir().join(format!("res-toggle-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let path = dir.join("res.toml");
+
+    let gw = start_gateway_with_path(cfg, path.clone()).await;
+    let api = gw.api_addr().expect("api addr");
+    let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    assert_eq!(status, 200, "{body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let id = listed["upstreams"]
+        .as_array()
+        .expect("upstreams")
+        .iter()
+        .find(|u| u["name"] == "cloudflare-1")
+        .and_then(|u| u["id"].as_i64())
+        .expect("cloudflare-1 id");
+
+    let (status, body) = http(
+        "PATCH",
+        api,
+        &format!("/api/upstreams/{id}"),
+        Some(r#"{"enabled":false,"confirm":true}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let changed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(changed["persisted"], true, "{body}");
+
+    let on_disk = res::config::AppConfig::load(&path).expect("persisted config loads");
+    let persisted = on_disk
+        .upstreams
+        .iter()
+        .find(|u| u.name == "cloudflare-1")
+        .expect("cloudflare-1 in file");
+    assert!(!persisted.enabled, "disable must be durable: {on_disk:?}");
+    gw.shutdown().await;
+
+    // Restart-equivalence: a new process starts from the file and must show
+    // the upstream disabled, not the old enabled configuration.
+    let restarted_cfg = res::config::AppConfig::load(&path).expect("restart load");
+    let gw = start_gateway_with_path(restarted_cfg, path.clone()).await;
+    let api = gw.api_addr().expect("api addr");
+    let (status, body) = http("GET", api, "/api/upstreams", None).await;
+    assert_eq!(status, 200, "{body}");
+    let listed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let restarted = listed["upstreams"]
+        .as_array()
+        .expect("upstreams")
+        .iter()
+        .find(|u| u["name"] == "cloudflare-1")
+        .expect("cloudflare-1 after restart");
+    assert_eq!(restarted["enabled"], false, "{listed}");
+
+    gw.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    fake.stop().await;
+}
+
 /// Disabled upstreams keep historical health, but that state must never
 /// count as availability or hide an all-disabled outage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2667,6 +2736,10 @@ async fn persist_failure_is_reported_and_audited() {
         "{body}"
     );
 
+    let (_, before) = http("GET", api, "/api/status", None).await;
+    let before: serde_json::Value = serde_json::from_str(&before).expect("json");
+    let generation_before = before["config"]["generation"].clone();
+
     // Make the config directory read-only so the atomic write cannot create
     // its temp file.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
@@ -2678,23 +2751,31 @@ async fn persist_failure_is_reported_and_audited() {
         Some(r#"{"name":"orphan","address":"127.0.0.1","port":53}"#),
     )
     .await;
-    assert_eq!(status, 201, "{body}");
-    let created: serde_json::Value = serde_json::from_str(&body).expect("json");
-    assert_eq!(created["persisted"], false, "{body}");
-    assert!(
-        created["persist_error"].is_string(),
-        "persist_error must be reported: {body}"
+    assert_eq!(
+        status, 500,
+        "persist failure must reject the mutation: {body}"
     );
+    assert!(body.contains("persist_failed"), "{body}");
+    assert!(body.contains("not applied"), "{body}");
 
-    // The divergence is loudly audited (in-memory ring + /api/config/events).
+    // Persist-before-publish: the rejected candidate never became active and
+    // the config generation did not advance.
+    let (_, list) = http("GET", api, "/api/upstreams", None).await;
+    assert!(
+        !list.contains("orphan"),
+        "runtime changed despite failure: {list}"
+    );
+    assert!(list.contains("baseline"), "{list}");
+    let (_, after) = http("GET", api, "/api/status", None).await;
+    let after: serde_json::Value = serde_json::from_str(&after).expect("json");
+    assert_eq!(after["config"]["generation"], generation_before);
+
+    // The rejection is loudly audited (in-memory ring + /api/config/events).
     let (_, events) = http("GET", api, "/api/config/events", None).await;
-    assert!(
-        events.contains("persist_failed") || events.contains("applied_persist_failed"),
-        "{events}"
-    );
+    assert!(events.contains("persist_failed"), "{events}");
+    assert!(!events.contains("applied_persist_failed"), "{events}");
 
-    // The runtime keeps the new config (documented policy: never roll back
-    // the data plane), and the last valid file on disk is still loadable.
+    // The last valid file on disk is still loadable and unchanged.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
     let on_disk = res::config::AppConfig::load(&path).expect("file still loads");
     assert!(

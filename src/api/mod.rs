@@ -109,6 +109,8 @@ pub enum ApiError {
     /// 409: the operation is only allowed with an explicit confirmation
     /// (e.g. disabling the last enabled upstream).
     NeedsConfirm(String),
+    /// 500: the candidate could not be made durable, so it was not applied.
+    Persist(String),
     Internal(String),
 }
 
@@ -121,6 +123,7 @@ impl ApiError {
             ApiError::NotFound(_) => "not_found",
             ApiError::Conflict(_) => "conflict",
             ApiError::NeedsConfirm(_) => "confirm_required",
+            ApiError::Persist(_) => "persist_failed",
             ApiError::Internal(_) => "internal",
         }
     }
@@ -133,6 +136,7 @@ impl ApiError {
             | ApiError::NotFound(m)
             | ApiError::Conflict(m)
             | ApiError::NeedsConfirm(m)
+            | ApiError::Persist(m)
             | ApiError::Internal(m) => m,
         }
     }
@@ -146,7 +150,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) | ApiError::NeedsConfirm(_) => StatusCode::CONFLICT,
-            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Persist(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = json!({ "error": self.message(), "code": self.code() });
         (status, Json(body)).into_response()
@@ -1514,7 +1518,7 @@ async fn import_config(
 
     // Parse + validate BEFORE touching runtime state: an invalid import must
     // leave the running configuration completely unchanged.
-    let next = AppConfig::parse(&req.toml).map_err(|e| {
+    let mut next = AppConfig::parse(&req.toml).map_err(|e| {
         reject(
             &st,
             "import_rejected",
@@ -1522,6 +1526,14 @@ async fn import_config(
             ApiError::BadRequest(e),
         )
     })?;
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
+            &st,
+            "import_rejected",
+            json!({ "op": "import" }),
+            ApiError::BadRequest(e),
+        ));
+    }
 
     check_last_usable(
         &st,
@@ -1531,19 +1543,18 @@ async fn import_config(
         "(all)",
     )?;
 
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
-            &st,
-            "import_rejected",
-            json!({ "op": "import" }),
-            ApiError::BadRequest(e),
-        )
-    })?;
-
-    let (persisted, persist_error) = if req.persist {
-        persist_or_report(&st).await
+    let persisted = if req.persist {
+        commit_config(&st, next).await?
     } else {
-        (false, None)
+        st.shared.replace_config(next).map_err(|e| {
+            reject(
+                &st,
+                "import_rejected",
+                json!({ "op": "import" }),
+                ApiError::Internal(e),
+            )
+        })?;
+        false
     };
 
     st.shared.record_config_event(
@@ -1551,15 +1562,14 @@ async fn import_config(
         json!({
             "upstreams": st.shared.app.load().upstreams.len(),
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+            "outcome": "applied",
         }),
     );
 
     Ok(Json(json!({
         "status": "ok",
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "upstreams": st.shared.app.load().upstreams.len(),
         "generation": st.shared.config_generation(),
     })))
@@ -1599,8 +1609,10 @@ async fn rollback_config(
         )));
     }
 
-    // Parse + validate BEFORE touching runtime state.
-    let next = AppConfig::load(&backup).map_err(|e| {
+    // Parse + validate BEFORE touching runtime state. The restored config is
+    // persisted first, so a failed write leaves the active and on-disk
+    // configuration untouched.
+    let mut next = AppConfig::load(&backup).map_err(|e| {
         reject(
             &st,
             "rollback_rejected",
@@ -1608,21 +1620,18 @@ async fn rollback_config(
             ApiError::BadRequest(format!("backup is invalid: {e}")),
         )
     })?;
-
-    check_last_usable(&st, &next.upstreams, q.confirm, "rollback", "(backup)")?;
-
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             &st,
             "rollback_rejected",
             json!({ "op": "rollback" }),
             ApiError::BadRequest(e),
-        )
-    })?;
+        ));
+    }
 
-    // Persist the restored configuration as the primary file. A failure here
-    // is reported but the runtime already runs the backup content.
-    let (persisted, persist_error) = persist_or_report(&st).await;
+    check_last_usable(&st, &next.upstreams, q.confirm, "rollback", "(backup)")?;
+
+    let persisted = commit_config(&st, next).await?;
 
     st.shared.record_config_event(
         "rollback",
@@ -1630,8 +1639,7 @@ async fn rollback_config(
             "backup": backup.display().to_string(),
             "upstreams": st.shared.app.load().upstreams.len(),
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+            "outcome": "applied",
         }),
     );
 
@@ -1639,7 +1647,7 @@ async fn rollback_config(
         "status": "ok",
         "backup": backup.display().to_string(),
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "upstreams": st.shared.app.load().upstreams.len(),
         "generation": st.shared.config_generation(),
     })))
@@ -1952,27 +1960,21 @@ async fn apply_acl_entries(
 
     let mut next = AppConfig::clone(st.shared.app.load().as_ref());
     next.acl.set_entries(entries.clone());
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             st,
             &format!("{op}_rejected"),
             json!({ "op": op }),
             ApiError::BadRequest(e),
-        )
-    })?;
-    let (persisted, persist_error) = persist_or_report(st).await;
-    let outcome = if persist_error.is_some() {
-        "applied_persist_failed"
-    } else {
-        "applied"
-    };
+        ));
+    }
+    let persisted = commit_config(st, next).await?;
     st.shared.record_config_event(
         op,
         json!({
             "entries": entries.len(),
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": outcome,
+            "outcome": "applied",
         }),
     );
     let rt = st.shared.rt.load();
@@ -1982,7 +1984,7 @@ async fn apply_acl_entries(
         "allowed_count": rt.acl.allowed_count(),
         "denied_count": rt.acl.denied_count(),
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
@@ -2360,20 +2362,15 @@ async fn put_proxy(
     }
     let password_changed = req.clear_password || req.password.is_some();
 
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             &st,
             "proxy_update_rejected",
             json!({ "op": "proxy_update" }),
             ApiError::BadRequest(e),
-        )
-    })?;
-    let (persisted, persist_error) = persist_or_report(&st).await;
-    let outcome = if persist_error.is_some() {
-        "applied_persist_failed"
-    } else {
-        "applied"
-    };
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "proxy_update",
         json!({
@@ -2384,8 +2381,7 @@ async fn put_proxy(
             "username": req.username.as_deref(),
             "password_changed": password_changed,
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": outcome,
+            "outcome": "applied",
         }),
     );
     let app = st.shared.app.load();
@@ -2393,7 +2389,7 @@ async fn put_proxy(
     if let Value::Object(ref mut m) = v {
         m.insert("status".into(), Value::from("ok"));
         m.insert("persisted".into(), Value::from(persisted));
-        m.insert("persist_error".into(), json!(persist_error));
+        m.insert("persist_error".into(), Value::Null);
         m.insert(
             "generation".into(),
             Value::from(st.shared.config_generation()),
@@ -2517,20 +2513,15 @@ async fn put_cache(
     if let Some(negative_max_ttl_secs) = req.negative_max_ttl_secs {
         next.cache.negative_max_ttl_secs = negative_max_ttl_secs;
     }
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             &st,
             "cache_update_rejected",
             json!({ "op": "cache_update" }),
             ApiError::BadRequest(e),
-        )
-    })?;
-    let (persisted, persist_error) = persist_or_report(&st).await;
-    let outcome = if persist_error.is_some() {
-        "applied_persist_failed"
-    } else {
-        "applied"
-    };
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "cache_update",
         json!({
@@ -2541,8 +2532,7 @@ async fn put_cache(
             "max_ttl_secs": req.max_ttl_secs,
             "negative_max_ttl_secs": req.negative_max_ttl_secs,
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": outcome,
+            "outcome": "applied",
         }),
     );
     let rt = st.shared.rt.load();
@@ -2557,7 +2547,7 @@ async fn put_cache(
         "negative_max_ttl_secs": rt.cache.negative_max_ttl_secs,
         "memory_bytes": st.shared.cache.memory_bytes(),
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
@@ -2630,20 +2620,15 @@ async fn put_health_config(
     if let Some(v) = req.dwell_ms {
         next.health.dwell_ms = v;
     }
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             &st,
             "health_update_rejected",
             json!({ "op": "health_update" }),
             ApiError::BadRequest(e),
-        )
-    })?;
-    let (persisted, persist_error) = persist_or_report(&st).await;
-    let outcome = if persist_error.is_some() {
-        "applied_persist_failed"
-    } else {
-        "applied"
-    };
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "health_update",
         json!({
@@ -2652,15 +2637,14 @@ async fn put_health_config(
             "timeout_ms": req.timeout_ms,
             "probes": probes_updated,
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": outcome,
+            "outcome": "applied",
         }),
     );
     Ok(Json(json!({
         "status": "ok",
         "health": st.shared.app.load().health,
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
@@ -2714,20 +2698,15 @@ async fn put_selection(
     if let Some(v) = req.min_probe_samples {
         next.selection.min_probe_samples = v;
     }
-    st.shared.replace_config(next).map_err(|e| {
-        reject(
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
             &st,
             "selection_update_rejected",
             json!({ "op": "selection_update" }),
             ApiError::BadRequest(e),
-        )
-    })?;
-    let (persisted, persist_error) = persist_or_report(&st).await;
-    let outcome = if persist_error.is_some() {
-        "applied_persist_failed"
-    } else {
-        "applied"
-    };
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "selection_update",
         json!({
@@ -2738,8 +2717,7 @@ async fn put_selection(
             "degraded_policy": req.degraded_policy,
             "min_probe_samples": req.min_probe_samples,
             "persisted": persisted,
-            "persist_error": persist_error,
-            "outcome": outcome,
+            "outcome": "applied",
         }),
     );
     let rt = st.shared.rt.load();
@@ -2747,7 +2725,7 @@ async fn put_selection(
         "status": "ok",
         "selection": rt.selection,
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
@@ -3249,23 +3227,30 @@ async fn create_upstream(
     candidate.id = next_id;
     list.push(candidate.clone());
 
-    st.shared.apply_upstreams(list).map_err(|e| {
+    let mut next = current.with_upstreams(list).map_err(|e| {
         reject(
             &st,
             "create_rejected",
             json!({ "name": candidate.name }),
-            ApiError::Internal(e),
+            ApiError::BadRequest(e),
         )
     })?;
-
-    let (persisted, persist_error) = persist_or_report(&st).await;
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
+            &st,
+            "create_rejected",
+            json!({ "name": candidate.name }),
+            ApiError::BadRequest(e),
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "create",
         json!({
             "id": next_id,
             "name": candidate.name,
             "persisted": persisted,
-            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+            "outcome": "applied",
         }),
     );
 
@@ -3286,7 +3271,7 @@ async fn create_upstream(
         Json(json!({
             "upstream": stats,
             "persisted": persisted,
-            "persist_error": persist_error,
+            "persist_error": Value::Null,
             "generation": st.shared.config_generation(),
         })),
     ))
@@ -3411,23 +3396,30 @@ async fn patch_upstream(
         "update",
         &updated.name,
     )?;
-    st.shared.apply_upstreams(list).map_err(|e| {
+    let mut next = current.with_upstreams(list).map_err(|e| {
         reject(
             &st,
             "update_rejected",
             json!({ "id": id, "name": updated.name }),
-            ApiError::Internal(e),
+            ApiError::BadRequest(e),
         )
     })?;
-
-    let (persisted, persist_error) = persist_or_report(&st).await;
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
+            &st,
+            "update_rejected",
+            json!({ "id": id, "name": updated.name }),
+            ApiError::BadRequest(e),
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "update",
         json!({
             "id": id,
             "name": updated.name,
             "persisted": persisted,
-            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+            "outcome": "applied",
         }),
     );
 
@@ -3446,7 +3438,7 @@ async fn patch_upstream(
     Ok(Json(json!({
         "upstream": stats,
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
@@ -3471,8 +3463,9 @@ async fn delete_upstream(
 
     let list: Vec<UpstreamConfig> = current
         .upstreams
-        .into_iter()
+        .iter()
         .filter(|u| u.id != id)
+        .cloned()
         .collect();
     check_last_usable(
         &st,
@@ -3481,51 +3474,97 @@ async fn delete_upstream(
         "delete",
         &existing.name,
     )?;
-    st.shared.apply_upstreams(list).map_err(|e| {
+    let mut next = current.with_upstreams(list).map_err(|e| {
         reject(
             &st,
             "delete_rejected",
             json!({ "id": id, "name": existing.name }),
-            ApiError::Internal(e),
+            ApiError::BadRequest(e),
         )
     })?;
-
-    let (persisted, persist_error) = persist_or_report(&st).await;
+    if let Err(e) = crate::shared::Shared::validate_config(&mut next) {
+        return Err(reject(
+            &st,
+            "delete_rejected",
+            json!({ "id": id, "name": existing.name }),
+            ApiError::BadRequest(e),
+        ));
+    }
+    let persisted = commit_config(&st, next).await?;
     st.shared.record_config_event(
         "delete",
         json!({
             "id": id,
             "name": existing.name,
             "persisted": persisted,
-            "outcome": if persist_error.is_some() { "applied_persist_failed" } else { "applied" },
+            "outcome": "applied",
         }),
     );
 
     Ok(Json(json!({
         "deleted": id,
         "persisted": persisted,
-        "persist_error": persist_error,
+        "persist_error": Value::Null,
         "generation": st.shared.config_generation(),
     })))
 }
 
-/// Persist after a successful in-memory mutation. A persistence failure is
-/// reported but never rolls back the applied configuration (the data plane
-/// must keep running; `/api/diagnostics` surfaces the error). When no config
-/// path is set the gateway runs purely in memory and reports `persisted=false`.
-async fn persist_or_report(st: &ApiState) -> (bool, Option<String>) {
-    if st.shared.config_path.get().is_none() {
-        return (false, None);
-    }
+/// Publish a validated candidate only after it is durable.
+///
+/// `next` must already have passed [`Shared::validate_config`]. When a config
+/// path is set the candidate is written atomically first; a failed write
+/// returns an error and leaves the active configuration untouched. Without a
+/// config path the gateway is intentionally memory-only and `persisted=false`.
+async fn commit_config(st: &ApiState, next: AppConfig) -> Result<bool, ApiError> {
+    let Some(path) = st.shared.config_path.get().cloned() else {
+        st.shared.replace_config(next).map_err(ApiError::Internal)?;
+        return Ok(false);
+    };
+    let previous = AppConfig::clone(st.shared.app.load().as_ref());
+    let candidate = next.clone();
     // save_atomic fsyncs the file and directory; never run that on a Tokio
     // worker. The mutation lock is still held by the caller, so serializing
     // through the blocking pool cannot reorder API mutations.
     let shared = Arc::clone(&st.shared);
-    match tokio::task::spawn_blocking(move || shared.persist_config()).await {
-        Ok(Ok(())) => (true, None),
-        Ok(Err(e)) => (false, Some(e)),
-        Err(e) => (false, Some(format!("persist task failed: {e}"))),
+    let write_path = path.clone();
+    let write =
+        tokio::task::spawn_blocking(move || shared.persist_candidate(&write_path, &candidate))
+            .await;
+    match write {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(ApiError::Persist(format!(
+                "configuration was not applied: could not persist {}: {e}",
+                path.display()
+            )))
+        }
+        Err(e) => {
+            return Err(ApiError::Persist(format!(
+                "configuration was not applied: persistence task failed for {}: {e}",
+                path.display()
+            )))
+        }
     }
+
+    if let Err(e) = st.shared.replace_config(next) {
+        // Validation ran before the write, so this is an internal invariant
+        // failure. Best-effort restore the previous on-disk configuration so
+        // a restart cannot silently adopt a version the runtime rejected.
+        let shared = Arc::clone(&st.shared);
+        let restore_path = path.clone();
+        let restore =
+            tokio::task::spawn_blocking(move || shared.persist_candidate(&restore_path, &previous))
+                .await;
+        let rollback = match restore {
+            Ok(Ok(())) => "previous configuration restored".to_string(),
+            Ok(Err(e)) => format!("restoring previous configuration also failed: {e}"),
+            Err(e) => format!("restore task failed: {e}"),
+        };
+        return Err(ApiError::Internal(format!(
+            "configuration could not be activated ({e}); {rollback}"
+        )));
+    }
+    Ok(true)
 }
 
 async fn test_upstream(

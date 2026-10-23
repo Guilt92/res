@@ -7,7 +7,7 @@
 //!    `<file>.backup` (the last-known-good configuration),
 //! 3. write the new content to a temp file in the **same directory**,
 //!    `fsync` it, `rename()` it over the primary path (atomic on POSIX),
-//! 4. `fsync` the directory so the rename itself is durable.
+//! 4. `fsync` the directory (best effort) so the rename itself is durable.
 //!
 //! A reader therefore always sees either the complete previous file or the
 //! complete new file, and a crash at any point leaves a loadable
@@ -64,18 +64,32 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .ok_or_else(|| format!("invalid path {}", path.display()))?;
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // The random component prevents a stale temp file from a previous
+    // container/process (notably PID 1 after a restart) from blocking writes.
     let tmp = dir.join(format!(
-        ".{}.{}.{seq}.tmp",
+        ".{}.{}.{seq}.{:016x}.tmp",
         file_name.to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        fastrand::u64(..),
     ));
 
+    let mut created = false;
     let result = (|| -> Result<(), String> {
-        let mut f = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
         // Owner-only: `res.toml` may embed `api_token`/session secrets and
         // the credentials file holds password hashes; world-readable config
         // would leak them to any local user (umask could otherwise leave
         // the 0666-create default in place).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        created = true;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -88,13 +102,30 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
         drop(f);
         fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-        sync_dir(dir)
+        Ok(())
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        // Only remove a temp file this call actually created: a collision
+        // with another process must never delete its in-flight file.
+        if created {
+            let _ = fs::remove_file(&tmp);
+        }
+        return result;
     }
-    result
+
+    // The rename is already visible. A directory-fsync failure only affects
+    // crash durability, not the current contents, so it must not turn a
+    // successfully replaced file into a reported failure (the API would then
+    // leave memory and disk inconsistent). Record it and report success.
+    if let Err(e) = sync_dir(dir) {
+        tracing::warn!(
+            event = "config_dir_sync_failed",
+            dir = %dir.display(),
+            error = %e
+        );
+    }
+    Ok(())
 }
 
 /// Best-effort directory fsync so the rename survives a power loss.
@@ -226,6 +257,68 @@ mod tests {
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(backup_path(&path));
+    }
+
+    /// Permission denied must leave both files and the directory free of temp
+    /// artifacts. Skipped when the test process is privileged (root can write
+    /// to a 0555 directory, so the condition cannot be reproduced there).
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_leaves_primary_backup_and_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode {
+            path: std::path::PathBuf,
+            mode: u32,
+        }
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "res-persist-perm-{}-{:016x}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("res.toml");
+        save_atomic(&path, &cfg_with(53)).unwrap();
+        save_atomic(&path, &cfg_with(54)).unwrap();
+        let primary_before = fs::read(&path).unwrap();
+        let backup_before = fs::read(backup_path(&path)).unwrap();
+
+        let original = fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = RestoreMode {
+            path: dir.clone(),
+            mode: original,
+        };
+
+        // A privileged test process (root) ignores the directory mode; skip
+        // instead of asserting a condition the environment cannot create.
+        if fs::write(dir.join(".privilege-probe"), b"x").is_ok() {
+            let _ = fs::remove_file(dir.join(".privilege-probe"));
+            drop(_restore);
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let err = save_atomic(&path, &cfg_with(55)).unwrap_err();
+        assert!(
+            err.contains("Permission denied") || err.contains("permission denied"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), primary_before);
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), backup_before);
+        assert!(
+            temp_files_for(&path).is_empty(),
+            "failed permission check leaked a temp file"
+        );
+
+        drop(_restore);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn temp_files_for(path: &Path) -> Vec<std::path::PathBuf> {

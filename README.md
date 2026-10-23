@@ -59,6 +59,39 @@ The gateway container runs unprivileged. The bind-mounted `./config`
 directory must be writable by the container UID; override it with `RES_UID`
 and `RES_GID` if needed.
 
+### Configuration directory ownership
+
+Runtime updates use a temp file, fsync, and atomic rename in the config
+directory, and `res.credentials` is stored there too. The directory must
+therefore be writable by the non-root UID that runs the process. Compose
+defaults to UID/GID `1000`; align it with the host owner explicitly:
+
+```bash
+# Fresh checkout (never run the gateway as root)
+mkdir -p config
+sudo chown -R "$(id -u):$(id -g)" config
+chmod 700 config
+RES_UID="$(id -u)" RES_GID="$(id -g)" docker compose up -d --build
+```
+
+Existing deployments created before the ownership was aligned need a one-time
+migration. Changing ownership does not require root inside the container:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" config
+chmod 700 config
+RES_UID="$(id -u)" RES_GID="$(id -g)" \
+  docker compose up -d --build --force-recreate res
+```
+
+The entrypoint probes the config directory at startup and refuses to start
+with an actionable message when it is not writable; this prevents a later
+dashboard mutation from failing with `EACCES`. If persistence still fails at
+runtime, the mutation is rejected with HTTP `500` / `persist_failed`, the
+active configuration is left unchanged, and the dashboard shows the error.
+Successful writes create a mode-`0600` `res.toml.backup` of the previous
+valid configuration (when one exists) before atomically replacing `res.toml`.
+
 ### Resource limits
 
 Compose applies CPU, memory, PID and file-descriptor bounds to every service:
@@ -101,9 +134,11 @@ authentication, proxy, logging, and monitoring.
   but it is redacted from logs, API exports, diagnostics, and audit events.
 - `monitoring.client_ip_privacy` defaults to `"full"`. Use `"masked"` to hide
   host bits or `"off"` to disable per-client tracking.
-- The configuration directory must be writable for runtime updates and backup
-  recovery. The API writes atomically and keeps `res.toml.backup` as the last
-  known-good configuration.
+- The configuration directory must be writable by the runtime UID for runtime
+  updates and backup recovery. The API persists before publishing: a failed
+  write rejects the mutation and leaves the active configuration unchanged.
+  Successful writes keep `res.toml.backup` as the last known-good
+  configuration.
 
 Control-plane credentials are supplied through environment variables or a
 mode-0600 credentials file:

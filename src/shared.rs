@@ -6,7 +6,7 @@
 //! request observes a consistent old or new configuration.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -190,6 +190,18 @@ impl Shared {
     pub fn client_label(&self, ip: std::net::IpAddr) -> String {
         self.client_display(ip)
             .unwrap_or_else(|| "hidden".to_string())
+    }
+
+    /// Validate a candidate without touching the active configuration.
+    ///
+    /// This is the same validation `replace_config` performs. Mutations call
+    /// it before persisting so an invalid candidate is never written and a
+    /// persisted candidate is guaranteed to be activatable.
+    pub fn validate_config(next: &mut AppConfig) -> Result<(), String> {
+        next.normalize_upstream_ids();
+        next.validate()?;
+        RuntimeConfig::from_app(next)?;
+        Ok(())
     }
 
     /// Atomically install a new configuration (validated first).
@@ -385,7 +397,14 @@ impl Shared {
             return Ok(());
         };
         let app = self.app.load();
-        match crate::persist::save_atomic(path, &app) {
+        self.persist_candidate(path, &app)
+    }
+
+    /// Persist an explicit candidate. Used by the API before publishing it,
+    /// so a failed write leaves both the active and the on-disk configuration
+    /// unchanged. Failures are audited and surfaced through the config state.
+    pub fn persist_candidate(&self, path: &Path, cfg: &AppConfig) -> Result<(), String> {
+        match crate::persist::save_atomic(path, cfg) {
             Ok(()) => {
                 self.clear_config_error();
                 Ok(())

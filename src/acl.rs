@@ -16,6 +16,10 @@
 //!
 //! Duplicate entries and the same network appearing in both an allow and a
 //! deny entry are rejected at parse time (conflict), never silently resolved.
+//! Only *enabled* entries participate in conflict detection: a disabled entry
+//! is never evaluated, so it may overlap an enabled rule (staging) without
+//! being rejected. Client addresses are canonicalized before evaluation
+//! (IPv4-mapped IPv6 → plain IPv4), so deny always wins on every address form.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -189,11 +193,21 @@ impl AclRules {
         let entries = cfg.effective_entries();
 
         // Conflict / duplicate validation before any evaluation data is built.
+        //
+        // Only *enabled* entries participate in conflict/duplicate detection.
+        // A disabled entry is never evaluated, so overlapping it with an
+        // enabled rule (or another disabled entry) is harmless and must not
+        // be rejected — operators stage and disable rules before enabling
+        // them. Disabled entries are still syntax-checked (normalize_cidr
+        // runs above) so an invalid one is caught at parse time.
         let mut seen: HashSet<(AclAction, String)> = HashSet::new();
         let mut allow_nets: HashSet<IpNet> = HashSet::new();
         let mut deny_nets: HashSet<IpNet> = HashSet::new();
         for e in &entries {
             let net = normalize_cidr(&e.cidr)?;
+            if !e.enabled {
+                continue;
+            }
             let key = (e.action, net.to_string());
             if !seen.insert(key) {
                 return Err(format!(
@@ -238,7 +252,17 @@ impl AclRules {
         Ok(Self { allowed, denied })
     }
 
+    /// Decide allow/deny for one client address.
+    ///
+    /// The address is canonicalized first (IPv4-mapped IPv6 → plain IPv4), so
+    /// the same embedded IPv4 address is always evaluated against the IPv4
+    /// rules and can never be allowed by an IPv6 rule that happens to match
+    /// the `::ffff:a.b.c.d` form before the IPv4 deny rule is consulted.
+    /// **Deny always wins over allow**, on every address form.
     pub fn decide(&self, client: IpAddr) -> AclDecision {
+        // Canonicalize *before* any matching so the mapped form and the plain
+        // IPv4 form are literally the same address for rule evaluation.
+        let client = crate::ratelimit::canonical(client);
         if self.denied.iter().any(|n| n.contains(&client)) {
             return AclDecision::Deny;
         }
@@ -247,19 +271,6 @@ impl AclRules {
         }
         if self.allowed.iter().any(|n| n.contains(&client)) {
             return AclDecision::Allow;
-        }
-        // IPv4-mapped IPv6 (`::ffff:a.b.c.d`, common on dual-stack sockets):
-        // also match the embedded IPv4 address against the IPv4 rules, so a
-        // client reaching the listener via the mapped form is not wrongly
-        // denied (or allowed, if only v6 rules match the mapped form itself).
-        if let Some(v4) = mapped_v4(client) {
-            let v4 = IpAddr::V4(v4);
-            if self.denied.iter().any(|n| n.contains(&v4)) {
-                return AclDecision::Deny;
-            }
-            if self.allowed.iter().any(|n| n.contains(&v4)) {
-                return AclDecision::Allow;
-            }
         }
         AclDecision::Deny
     }
@@ -270,15 +281,6 @@ impl AclRules {
 
     pub fn denied_count(&self) -> usize {
         self.denied.len()
-    }
-}
-
-/// Extract the IPv4 address out of an IPv4-mapped IPv6 address
-/// (`::ffff:a.b.c.d`), if any.
-fn mapped_v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
-        IpAddr::V4(_) => None,
     }
 }
 
@@ -403,6 +405,72 @@ mod tests {
         assert!(err.contains("conflict"), "{err}");
     }
 
+    /// A *disabled* entry is never evaluated, so it may overlap an enabled
+    /// rule (or another disabled entry) without being a conflict. This lets
+    /// operators stage and disable rules before enabling them.
+    #[test]
+    fn disabled_entries_do_not_participate_in_conflict_detection() {
+        let cfg = AclConfig {
+            entries: vec![
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Allow,
+                    enabled: true,
+                },
+                AclEntry {
+                    id: String::new(),
+                    cidr: "10.0.0.0/8".into(),
+                    action: AclAction::Deny,
+                    enabled: false, // disabled: no conflict with the allow
+                },
+            ],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        let r = AclRules::parse(&cfg).expect("disabled deny may overlap enabled allow");
+        assert_eq!(r.allowed_count(), 1);
+        assert_eq!(r.decide(ip("10.1.2.3")), AclDecision::Allow);
+
+        // Two disabled entries may also overlap each other.
+        let cfg = AclConfig {
+            entries: vec![
+                AclEntry {
+                    id: String::new(),
+                    cidr: "192.0.2.0/24".into(),
+                    action: AclAction::Allow,
+                    enabled: false,
+                },
+                AclEntry {
+                    id: String::new(),
+                    cidr: "192.0.2.0/24".into(),
+                    action: AclAction::Deny,
+                    enabled: false,
+                },
+            ],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        let r = AclRules::parse(&cfg).expect("two disabled overlapping entries are not a conflict");
+        assert_eq!(r.allowed_count(), 0);
+        assert_eq!(r.denied_count(), 0);
+        // Disabled entries are still syntax-checked.
+        let cfg = AclConfig {
+            entries: vec![AclEntry {
+                id: String::new(),
+                cidr: "not-a-cidr".into(),
+                action: AclAction::Deny,
+                enabled: false,
+            }],
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        assert!(
+            AclRules::parse(&cfg).is_err(),
+            "disabled entries are still validated"
+        );
+    }
+
     #[test]
     fn disabled_entries_are_not_evaluated() {
         let cfg = AclConfig {
@@ -492,6 +560,28 @@ mod tests {
         assert_eq!(r.decide(ip("::ffff:8.8.8.8")), AclDecision::Deny);
         // Non-mapped IPv6 is unaffected.
         assert_eq!(r.decide(ip("2001:db8::1")), AclDecision::Deny);
+    }
+
+    /// Regression: an IPv6 allow rule that matches the `::ffff:a.b.c.d` form
+    /// must NOT let the embedded IPv4 address escape its IPv4 deny rule.
+    /// Deny always wins over allow, on every address form.
+    #[test]
+    fn deny_wins_over_allow_for_ipv4_mapped_clients() {
+        // `::ffff:0:0/96` (the whole IPv4-mapped range) is a common
+        // dual-stack allow; the embedded-IPv4 deny must still win.
+        let r = rules(&["::ffff:0:0/96"], &["10.0.0.0/8"]);
+        assert_eq!(r.decide(ip("::ffff:10.5.9.9")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("::ffff:10.1.2.3")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("10.5.9.9")), AclDecision::Deny);
+        // A mapped client is canonicalized to its embedded IPv4 address, so
+        // the *IPv6* allow rule no longer matches it (only IPv4 rules apply
+        // to an IPv4 client) — same outcome as the plain IPv4 spelling.
+        assert_eq!(r.decide(ip("::ffff:8.8.8.8")), AclDecision::Deny);
+        assert_eq!(r.decide(ip("8.8.8.8")), AclDecision::Deny);
+        // A genuine IPv4 allow rule admits the canonical v4 address.
+        let r = rules(&["0.0.0.0/0"], &["10.0.0.0/8"]);
+        assert_eq!(r.decide(ip("::ffff:8.8.8.8")), AclDecision::Allow);
+        assert_eq!(r.decide(ip("::ffff:10.5.9.9")), AclDecision::Deny);
     }
 
     #[test]

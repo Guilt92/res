@@ -3537,6 +3537,45 @@ async fn acl_put_rejects_duplicates_and_conflicts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acl_disabled_entries_can_overlap_enabled_rules() {
+    let mut cfg = base_config();
+    cfg.server.api_token = "sekrit".into();
+    let gw = start_gateway(cfg).await;
+    let api = gw.api_addr().expect("api addr");
+
+    // A disabled deny may overlap an enabled allow: it is never evaluated,
+    // so the pair is not a conflict and can be staged before enabling.
+    let staged = r#"{"entries":[
+        {"cidr":"10.0.0.0/8","action":"allow","enabled":true},
+        {"cidr":"10.0.0.0/8","action":"deny","enabled":false}
+    ]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(staged), Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        v["denied_count"], 0,
+        "disabled deny must not be evaluated: {body}"
+    );
+
+    // Enabling it exposes the conflict: rejected without touching the rules.
+    let enable = r#"{"entries":[
+        {"cidr":"10.0.0.0/8","action":"allow","enabled":true},
+        {"cidr":"10.0.0.0/8","action":"deny","enabled":true}
+    ]}"#;
+    let (status, body) = http_auth("PUT", api, "/api/acl", Some(enable), Some("sekrit")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("conflict"), "{body}");
+    // The previously applied (staged) list is still active.
+    let (status, body) = http_auth("GET", api, "/api/acl", None, Some("sekrit")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["entries"].as_array().expect("entries").len(), 2);
+    assert_eq!(v["denied_count"], 0, "{body}");
+
+    gw.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acl_put_legacy_lists_still_work() {
     let mut cfg = base_config();
     cfg.server.api_token = "sekrit".into();

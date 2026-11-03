@@ -73,6 +73,12 @@ impl Pipeline {
         transport: Transport,
         raw: Vec<u8>,
     ) -> Option<Vec<u8>> {
+        // Canonicalize the client address once at ingress: IPv4-mapped IPv6
+        // (`::ffff:a.b.c.d`, seen on dual-stack sockets) becomes plain IPv4 so
+        // ACL, rate limiting, RRL and traffic statistics all use the same
+        // address and the same rules — an embedded IPv4 address can never be
+        // allowed by an IPv6 rule that matches the mapped form.
+        let client = canonical_client(client);
         let started = Instant::now();
         let metrics = &self.shared.metrics;
         metrics
@@ -750,6 +756,13 @@ fn attempts_of(e: &ForwardError) -> u32 {
             *attempts
         }
     }
+}
+
+/// Fold an IPv4-mapped IPv6 peer onto plain IPv4, preserving the port. Called
+/// exactly once per request so every downstream consumer (ACL, rate limiter,
+/// RRL, traffic tables) keys on the same address.
+fn canonical_client(client: SocketAddr) -> SocketAddr {
+    SocketAddr::new(crate::ratelimit::canonical(client.ip()), client.port())
 }
 
 #[cfg(test)]

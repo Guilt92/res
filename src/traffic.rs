@@ -411,7 +411,10 @@ impl TrafficStats {
     }
 
     /// Attribute one received request to `client` (payload bytes as seen).
+    /// The address is canonicalized (IPv4-mapped IPv6 → plain IPv4) so the
+    /// per-client table keys on the same address as the ACL and rate limiter.
     pub fn record_request(&self, client: IpAddr, tcp: bool, bytes: usize) {
+        let client = crate::ratelimit::canonical(client);
         let mut t = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         t.record(client, tcp, bytes);
     }
@@ -424,7 +427,10 @@ impl TrafficStats {
     /// Record how a client request ended. Ignored when the client key was
     /// never recorded (table full/disabled) — unattributable outcomes are
     /// reported through the global metrics instead, never invented here.
+    /// The address is canonicalized to the same key as
+    /// [`TrafficStats::record_request`].
     pub fn record_outcome(&self, client: IpAddr, outcome: Outcome, latency: Option<Duration>) {
+        let client = crate::ratelimit::canonical(client);
         let mut t = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if t.cap == 0 {
             return;

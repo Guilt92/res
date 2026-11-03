@@ -204,7 +204,12 @@ fn shard_of(ip: IpAddr) -> usize {
 
 /// Fold IPv4-mapped IPv6 (`::ffff:a.b.c.d`) onto plain IPv4 so one client
 /// cannot hold two buckets under dual-stack sockets.
-fn canonical(ip: IpAddr) -> IpAddr {
+///
+/// Public so the rest of the data plane can canonicalize a client address
+/// once at ingress and then use the *same* key for ACL, rate limiting, RRL
+/// and traffic statistics — a single address must never be able to appear as
+/// two different keys (or match two different rule families).
+pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6
             .to_ipv4_mapped()

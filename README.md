@@ -30,30 +30,51 @@ validation.
 
 ## Docker quick start
 
+The stack is **secure by default**: it ships no default credentials (the
+gateway fails closed at startup without an admin password) and the management
+interfaces are bound to the host loopback. Set the required variables first:
+
 ```bash
+export RES_ADMIN_PASSWORD='a-long-random-admin-password'
+export RES_METRICS_TOKEN='a-long-random-metrics-token'
 docker compose up -d --build
-dig @127.0.0.1 example.com
+```
+
+Then query the gateway and open the dashboard:
+
+```bash
+dig @127.0.0.1 -p 153 example.com
 ```
 
 | Service | Address |
 |---|---|
-| DNS | `127.0.0.1:53` (UDP and TCP) |
-| Dashboard/API | http://localhost:8080 |
+| DNS | `127.0.0.1:153` (UDP and TCP; see `RES_DNS_PUBLISH` below) |
+| Dashboard/API | http://127.0.0.1:8080 (loopback only) |
 | Prometheus | http://localhost:9090 (loopback only) |
-| Grafana | http://localhost:3000 |
+| Grafana | http://127.0.0.1:3000 (loopback only) |
 
-The credentials in `docker-compose.yml`, `deploy/prometheus.yml`,
-`deploy/prometheus/web.config.yml`, and the Grafana provisioning file are
-**development placeholders**. Change all of them before exposing the stack.
-Prometheus passwords must be updated together with their bcrypt hash.
-
-If port 53 is already in use, publish a different host port without editing
-the Compose file:
+The gateway's DNS port is published as host port **153** by default (to avoid
+clashing with systemd-resolved or another resolver on the standard :53).
+Publish the standard port, or any other, without editing the Compose file:
 
 ```bash
-RES_DNS_PUBLISH=5353 docker compose up -d --build
-dig @127.0.0.1 -p 5353 example.com
+RES_DNS_PUBLISH=53 docker compose up -d
+dig @127.0.0.1 example.com
 ```
+
+The management dashboard/API is bound to the host **loopback** by default so
+it is never exposed to the network. Expose it explicitly (only over HTTPS or
+a trusted reverse proxy, and keep `RES_SECURE_COOKIES=true`):
+
+```bash
+RES_DASHBOARD_PUBLISH=0.0.0.0 docker compose up -d
+```
+
+The Grafana and Prometheus monitoring services use the **development
+placeholder** credentials in `docker-compose.yml`, `deploy/prometheus.yml`,
+`deploy/prometheus/web.config.yml`, and the Grafana provisioning file.
+They are loopback-only, but change them all before exposing the stack.
+Prometheus passwords must be updated together with their bcrypt hash.
 
 The gateway container runs unprivileged. The bind-mounted `./config`
 directory must be writable by the container UID; override it with `RES_UID`
@@ -145,23 +166,27 @@ mode-0600 credentials file:
 
 | Variable | Purpose |
 |---|---|
-| `RES_ADMIN_PASSWORD` | Admin login (full access) |
+| `RES_ADMIN_PASSWORD` | Admin login (full access; required to start, no default) |
 | `RES_VIEWER_PASSWORD` | Optional read-only viewer login |
 | `RES_API_TOKEN` | Optional API bearer token |
 | `RES_METRICS_TOKEN` | Dedicated metrics-only bearer token |
 | `RES_PROTECT_METRICS` | Require the metrics token for `/metrics` |
+| `RES_SECURE_COOKIES` | Mark session/CSRF cookies `Secure` (set `true` when serving over HTTPS) |
 | `RES_PROMETHEUS_URL` | Prometheus URL used by the dashboard |
 | `RES_PROMETHEUS_USERNAME` / `RES_PROMETHEUS_PASSWORD` | Prometheus basic auth |
 
 Startup fails closed when no admin password, API token, or persisted
 credentials are available. Passwords are stored as argon2id hashes in
-`config/res.credentials` (mode `0600`, ignored by Git).
+`config/res.credentials` (mode `0600`, ignored by Git). The management API
+binds the loopback by default; expose it only over HTTPS (which also forces
+`Secure` cookies) or a trusted reverse proxy.
 
 ## Local build
 
 The default configuration binds port 53, so running it directly requires root
 or `CAP_NET_BIND_SERVICE`. For development, change the listener addresses in
-`config/res.toml`.
+`config/res.toml`. The management API binds the loopback by default; bind it
+to a network address only when serving over HTTPS or a trusted reverse proxy.
 
 ```bash
 cargo build --release
@@ -222,8 +247,10 @@ integration, or scrape the rules from your central monitoring system.
   unrestricted DNS gateway.
 - Application rate limits bound in-process work but do not stop volumetric
   DDoS traffic; add network-level protection where needed.
-- Change all example credentials and use HTTPS or a trusted reverse proxy for
-  the management interface before exposing it.
+- The management API/dashboard binds the host loopback by default and ships
+  no default credentials. Expose it only over HTTPS (which marks cookies
+  `Secure`) or a trusted reverse proxy, and change every monitoring
+  placeholder credential first.
 - Keep the configuration directory private; it may contain an API token or a
   proxy password.
 

@@ -1,6 +1,12 @@
 [server]
 udp_addr = "0.0.0.0:53"
 tcp_addr = "0.0.0.0:53"
+# Management API/dashboard address. The Docker stack publishes this on the
+# host LOOPBACK only (see docker-compose.yml); the container must bind
+# 0.0.0.0 for the published port to reach it, and the host-side publish is
+# what controls exposure. For bare-metal use, prefer 127.0.0.1:8080 and only
+# bind a non-loopback address when serving over HTTPS (server.tls_cert/key)
+# or a trusted reverse proxy.
 api_addr = "0.0.0.0:8080"
 dashboard_dir = "dashboard"
 max_udp_packet_size = 4096

@@ -1,26 +1,27 @@
 # res full stack: gateway + Prometheus + Grafana. No database.
 #
-# The credential values below are DEVELOPMENT PLACEHOLDERS, not repository
-# secrets. Change every password/token (and the matching hashes/values in the
-# deploy/ files) before exposing this stack to a network. For production, use
-# a Compose override or a secrets manager instead of editing tracked values:
-#   RES_ADMIN_PASSWORD / RES_VIEWER_PASSWORD   dashboard users "admin"/"viewer" :8080
-#   GF_SECURITY_ADMIN_PASSWORD                 Grafana user "admin"             :3000
-#   deploy/prometheus/web.config.yml           Prometheus user "prom"           :9090
-#   RES_METRICS_TOKEN                          metrics-only scrape bearer      :8080/metrics
-# The gateway's Prometheus proxy authenticates with RES_PROMETHEUS_USERNAME/
-# RES_PROMETHEUS_PASSWORD, and the Grafana datasource carries the same user
-# (deploy/grafana/provisioning/datasources/prometheus.yml).
+# Secure by default: NO default credentials are shipped and the management
+# interface is bound to the host loopback. The gateway fails closed at startup
+# without an explicit admin password. Before the first `docker compose up`,
+# set the required variables in your environment (or a `.env` file):
+#   RES_ADMIN_PASSWORD                 dashboard/API admin login
+#   RES_METRICS_TOKEN                  metrics-only scrape bearer (must match
+#                                      deploy/prometheus.yml `credentials`)
+# The Prometheus/Grafana monitoring services are development placeholders:
+# their credentials (deploy/prometheus/web.config.yml bcrypt hash,
+# deploy/prometheus.yml, the Grafana datasource and GF_SECURITY_ADMIN_PASSWORD)
+# are loopback-only but MUST be changed before any exposure.
 #
-# Start:   docker compose up -d --build
-# DNS:     dig @127.0.0.1 example.com          (host port 53 -> container 53)
-#          If something on the host already owns :53 (systemd-resolved,
-#          another resolver), override the publish port without editing
-#          this file:  RES_DNS_PUBLISH=5353 docker compose up -d
-#          then:        dig @127.0.0.1 -p 5353 example.com
-# API:     http://localhost:8080/  (dashboard; admin / RES_ADMIN_PASSWORD)
-# Metrics: http://localhost:9090/  (Prometheus; prompt for prom / web.config.yml)
-# Charts:  http://localhost:3000/  (Grafana; admin / GF_SECURITY_ADMIN_PASSWORD)
+# Start:   export RES_ADMIN_PASSWORD=... RES_METRICS_TOKEN=... && docker compose up -d --build
+# DNS:     dig @127.0.0.1 -p 153 example.com          (host port 153 -> container 53)
+#          If you want the standard :53, override the publish port without
+#          editing this file:  RES_DNS_PUBLISH=53 docker compose up -d
+#          then:                dig @127.0.0.1 example.com
+# API:     http://127.0.0.1:8080/  (dashboard, loopback only; admin / RES_ADMIN_PASSWORD)
+#          Expose beyond loopback with RES_DASHBOARD_PUBLISH=0.0.0.0 only over
+#          HTTPS or a trusted reverse proxy (and keep RES_SECURE_COOKIES=true).
+# Metrics: http://localhost:9090/  (Prometheus; loopback; prompt for web.config.yml)
+# Charts:  http://127.0.0.1:3000/  (Grafana; loopback; admin / GF_SECURITY_ADMIN_PASSWORD)
 
 services:
   res:
@@ -41,19 +42,25 @@ services:
       RES_PROMETHEUS_URL: http://prometheus:9090
       # Prometheus enforces HTTP basic auth (deploy/prometheus/web.config.yml);
       # the gateway proxy authenticates its queries with these credentials.
+      # The value MUST match deploy/prometheus.yml, the bcrypt hash in
+      # deploy/prometheus/web.config.yml and the Grafana datasource.
       RES_PROMETHEUS_USERNAME: "prom"
       RES_PROMETHEUS_PASSWORD: "change-me-prometheus-password"
-      # Development placeholders: change them before deployment. They are
-      # hashed with argon2 at startup and never written to the TOML config;
-      # only argon2 hashes land in config/res.credentials, mode 0600.
-      # Users: "admin" (full access) and "viewer" (read-only).
-      RES_ADMIN_PASSWORD: "change-me-admin-password"
-      RES_VIEWER_PASSWORD: "change-me-viewer-password"
+      # No default credentials: the gateway refuses to start unless an admin
+      # password is supplied (or a res.credentials file is mounted). Set these
+      # in your environment / .env; hashes land in config/res.credentials.
+      RES_ADMIN_PASSWORD: "${RES_ADMIN_PASSWORD:?set RES_ADMIN_PASSWORD (dashboard admin login) in your environment or .env}"
+      RES_VIEWER_PASSWORD: "${RES_VIEWER_PASSWORD:-}"
       # Metrics are scraped by Prometheus with this dedicated, metrics-only
-      # bearer token. It cannot read or change the API, and the admin/API
-      # credentials cannot scrape metrics.
-      RES_METRICS_TOKEN: "change-me-metrics-token"
+      # bearer token. It cannot read or change the API. Must match the
+      # `credentials` value in deploy/prometheus.yml. With RES_PROTECT_METRICS
+      # on, /metrics rejects every request (fail closed) until it is set.
+      RES_METRICS_TOKEN: "${RES_METRICS_TOKEN:?set RES_METRICS_TOKEN (metrics scrape token) in your environment or .env}"
       RES_PROTECT_METRICS: "true"
+      # Mark session/CSRF cookies Secure. The management interface is served
+      # on the host loopback (a potentially-trustworthy origin), so login over
+      # http://127.0.0.1:8080 keeps working with Secure cookies.
+      RES_SECURE_COOKIES: "true"
     # The image defaults to UID/GID 10001; the host ./config bind mount is
     # what needs to be writable (atomic config rewrite + res.credentials), so
     # the container UID defaults to the usual host user. Override with
@@ -66,10 +73,14 @@ services:
       - ./dashboard:/app/dashboard:ro
     ports:
       # Host publish port is overridable (e.g. systemd-resolved owns :53):
-      #   RES_DNS_PUBLISH=5353 docker compose up -d
+      #   RES_DNS_PUBLISH=53 docker compose up -d
       - "${RES_DNS_PUBLISH:-153}:53/udp"
       - "${RES_DNS_PUBLISH:-153}:53/tcp"
-      - "8080:8080"
+      # Management interface: bound to the host LOOPBACK by default so the
+      # dashboard/API is never exposed to the network without an explicit
+      # choice. Expose it only over HTTPS or a trusted reverse proxy:
+      #   RES_DASHBOARD_PUBLISH=0.0.0.0 docker compose up -d
+      - "127.0.0.1:${RES_DASHBOARD_PUBLISH:-8080}:8080"
     # The gateway never writes to its root filesystem (config is a bind mount,
     # logs go to stdout/stderr). Keep it read-only and disallow privilege gain.
     read_only: true
@@ -158,7 +169,8 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      # Loopback-only by default: Grafana is a management interface too.
+      - "127.0.0.1:${RES_GRAFANA_PUBLISH:-3000}:3000"
     depends_on:
       - prometheus
     deploy:

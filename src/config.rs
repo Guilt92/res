@@ -589,7 +589,12 @@ impl Default for ServerConfig {
         Self {
             udp_addr: "0.0.0.0:53".parse().expect("default udp addr"),
             tcp_addr: "0.0.0.0:53".parse().expect("default tcp addr"),
-            api_addr: "0.0.0.0:8080".parse().expect("default api addr"),
+            // The management API/dashboard binds loopback by default. The DNS
+            // listeners must be reachable from the network, but the control
+            // plane must not be exposed unless the operator explicitly binds
+            // it to a non-loopback address (and secures it with TLS +
+            // secure_cookies or a trusted reverse proxy).
+            api_addr: "127.0.0.1:8080".parse().expect("default api addr"),
             dashboard_dir: Some(PathBuf::from("dashboard")),
             max_udp_packet_size: 4096,
             max_inflight_udp: 4096,
@@ -1089,6 +1094,18 @@ impl AppConfig {
                 ),
             }
         }
+        if let Ok(v) = std::env::var("RES_SECURE_COOKIES") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => self.auth.secure_cookies = true,
+                "0" | "false" | "no" | "off" => self.auth.secure_cookies = false,
+                other => tracing::warn!(
+                    event = "invalid_env_override",
+                    variable = "RES_SECURE_COOKIES",
+                    value = other,
+                    "ignoring invalid boolean"
+                ),
+            }
+        }
     }
 
     /// Startup loader with a last-known-good fallback chain:
@@ -1527,6 +1544,40 @@ mod tests {
                 .all(|w| w.contains("require_encrypted_upstreams")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn management_api_defaults_to_loopback() {
+        // Secure default: the control plane is not exposed on all interfaces
+        // unless the operator explicitly binds it elsewhere.
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.server.api_addr.ip().is_loopback(),
+            "api_addr must default to loopback, got {}",
+            cfg.server.api_addr
+        );
+        // The DNS listeners stay reachable from the network.
+        assert!(!cfg.server.udp_addr.ip().is_loopback());
+        assert!(!cfg.server.tcp_addr.ip().is_loopback());
+    }
+
+    #[test]
+    fn secure_cookies_env_override() {
+        let mut cfg = AppConfig::default();
+        assert!(!cfg.auth.secure_cookies);
+        std::env::set_var("RES_SECURE_COOKIES", "true");
+        cfg.apply_env_overrides();
+        assert!(
+            cfg.auth.secure_cookies,
+            "RES_SECURE_COOKIES=true must enable Secure cookies"
+        );
+        std::env::set_var("RES_SECURE_COOKIES", "0");
+        cfg.apply_env_overrides();
+        assert!(
+            !cfg.auth.secure_cookies,
+            "RES_SECURE_COOKIES=0 must disable Secure cookies"
+        );
+        std::env::remove_var("RES_SECURE_COOKIES");
     }
 
     #[test]

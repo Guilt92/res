@@ -4512,3 +4512,75 @@ async fn api_responses_carry_security_headers() {
 
     gw.shutdown().await;
 }
+
+/// Documentation/implementation consistency (regression): the Docker quick
+/// start must match docker-compose.yml, and the compose must ship no working
+/// default credentials and bind the management interface to the host loopback.
+#[test]
+fn docker_compose_matches_readme_and_has_no_default_credentials() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let compose = std::fs::read_to_string(root.join("docker-compose.yml"))
+        .expect("docker-compose.yml must exist");
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("README.md must exist");
+
+    // No working default credentials for the gateway control plane.
+    for placeholder in [
+        "change-me-admin-password",
+        "change-me-viewer-password",
+        "change-me-metrics-token",
+    ] {
+        assert!(
+            !compose.contains(placeholder),
+            "compose must not ship a working default credential {placeholder}"
+        );
+        assert!(
+            !readme.contains(placeholder),
+            "README must not document a working default credential {placeholder}"
+        );
+    }
+    // The gateway fails closed: credentials are required, not defaulted.
+    assert!(
+        compose.contains("RES_ADMIN_PASSWORD:?set RES_ADMIN_PASSWORD"),
+        "compose must require the admin password"
+    );
+    assert!(
+        compose.contains("RES_METRICS_TOKEN:?set RES_METRICS_TOKEN"),
+        "compose must require the metrics token"
+    );
+
+    // The management interface is loopback-bound on the host.
+    assert!(
+        compose.contains("127.0.0.1:${RES_DASHBOARD_PUBLISH:-8080}:8080"),
+        "dashboard publish must default to loopback"
+    );
+    assert!(
+        compose.contains("127.0.0.1:${RES_GRAFANA_PUBLISH:-3000}:3000"),
+        "grafana publish must default to loopback"
+    );
+    assert!(
+        compose.contains("RES_SECURE_COOKIES: \"true\""),
+        "cookies Secure"
+    );
+
+    // The README quick start reflects the compose defaults.
+    assert!(
+        readme.contains("127.0.0.1:153"),
+        "README must document the default published DNS port 153"
+    );
+    assert!(
+        readme.contains("RES_DNS_PUBLISH=53"),
+        "README must document the DNS publish override"
+    );
+    assert!(
+        readme.contains("RES_DASHBOARD_PUBLISH"),
+        "README must document the dashboard publish override"
+    );
+    assert!(
+        readme.contains("RES_SECURE_COOKIES"),
+        "README must document RES_SECURE_COOKIES"
+    );
+    assert!(
+        readme.contains("no default credentials"),
+        "README must state the no-default-credentials posture"
+    );
+}

@@ -465,7 +465,20 @@ async fn acl_refuses_disallowed_client() {
     let gw = start_gateway(cfg).await;
     let addr = gw.udp_addr().expect("udp addr");
 
-    let resp = udp_query(addr, "denied.test").await.expect("REFUSED reply");
+    // UDP: a denied client receives NO reply. Answering REFUSED over UDP to a
+    // spoofed source would make the gateway a reflection amplifier, so the
+    // denied datagram is dropped silently (the anti-amplification posture,
+    // matching rate limiting).
+    let resp = udp_query_timeout(addr, "denied.test", Duration::from_millis(500)).await;
+    assert!(resp.is_none(), "denied UDP client must get no reply");
+    assert_eq!(fake.hits(), 0, "denied queries must never be forwarded");
+
+    // TCP: the connected transport is not a reflection vector, so the client
+    // is told explicitly with REFUSED.
+    let tcp = gw.tcp_addr().expect("tcp addr");
+    let resp = tcp_query(tcp, "denied.test")
+        .await
+        .expect("REFUSED over TCP");
     assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
     assert!(resp.answers.is_empty());
     assert_eq!(fake.hits(), 0, "denied queries must never be forwarded");
@@ -1824,10 +1837,12 @@ async fn system_events_capture_acl_and_rate_limit_activity() {
     cfg.ratelimit.per_ip_qps = 1.0;
     let gw = start_gateway(cfg).await;
     let api = gw.api_addr().expect("api addr");
-    let udp = gw.udp_addr().expect("udp addr");
+    let _udp = gw.udp_addr().expect("udp addr");
 
-    // ACL denial (REFUSED response) must land in the system event ring.
-    let resp = udp_query(udp, "acl.test").await.expect("response");
+    // ACL denial over TCP (REFUSED response; UDP denied clients are dropped
+    // silently as an anti-reflection measure) must land in the system ring.
+    let tcp = gw.tcp_addr().expect("tcp addr");
+    let resp = tcp_query(tcp, "acl.test").await.expect("response");
     assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
 
     // With the ACL denying everything the rate limiter never sees a query,

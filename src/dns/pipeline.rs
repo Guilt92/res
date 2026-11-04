@@ -85,11 +85,10 @@ impl Pipeline {
             .queries_total
             .with_label_values(&[transport.as_str()])
             .inc();
-        // Traffic introspection: every received request is attributed to its
-        // client (masked on output unless the operator opted out of privacy).
-        self.shared
-            .traffic
-            .record_request(client.ip(), transport == Transport::Tcp, raw.len());
+        // Traffic introspection happens *after* admission (ACL) inside
+        // precheck, so ACL-denied or spoofed traffic is counted separately and
+        // never distorts the bounded per-client table or the domain/query-type
+        // statistics for legitimate clients.
 
         let prepared = match self.precheck(client, transport, &raw, started) {
             Precheck::Reply(resp) => return Some(resp),
@@ -546,20 +545,13 @@ impl Pipeline {
             }
         };
 
-        // ---- Question-type + domain accounting (before any rejection so
-        // traffic reflects what clients actually asked for) ----
-        let cache_key = msg::question_key(
-            parsed.question(),
-            parsed.checking_disabled,
-            parsed.recursion_desired,
-        );
-        metrics
-            .query_type_total
-            .with_label_values(&[msg::qtype_label(parsed.qtype())])
-            .inc();
-        shared.traffic.record_domain(&cache_key.name);
-
-        // ---- ACL (before any forwarding work) ----
+        // ---- ACL (before any forwarding work, and before any per-client or
+        // per-domain accounting) ----
+        // Denied traffic is counted separately (`res_acl_denied_total` and a
+        // coalesced system event) but is *not* recorded into the bounded
+        // per-client table or the domain/query-type statistics: an attacker
+        // spraying spoofed sources or random names must not be able to crowd
+        // out legitimate clients or pollute analytics.
         if rt.acl.decide(client.ip()) == AclDecision::Deny {
             metrics.acl_denied_total.inc();
             shared.note_system_event(
@@ -576,13 +568,36 @@ impl Pipeline {
             );
             let elapsed = started.elapsed();
             metrics.query_duration.observe(elapsed.as_secs_f64());
-            shared.traffic.record_outcome(
-                client.ip(),
-                crate::traffic::Outcome::AclDenied,
-                Some(elapsed),
-            );
-            return Precheck::Reply(msg::error_response(&parsed, Rcode::Refused));
+            // Over UDP a REFUSED reply is a reflection vector to spoofed
+            // sources, so denied UDP clients get no reply at all (the same
+            // posture as rate limiting). On the connected TCP path a REFUSED
+            // answer is safe and tells the client the query was denied.
+            if transport == Transport::Tcp {
+                metrics
+                    .client_rcode_total
+                    .with_label_values(&["REFUSED"])
+                    .inc();
+                return Precheck::Reply(msg::error_response(&parsed, Rcode::Refused));
+            }
+            return Precheck::Drop;
         }
+
+        // ---- Admission accounting ----
+        // Only traffic admitted past the ACL is attributed to its client and
+        // question, so the introspection tables reflect real clients.
+        shared
+            .traffic
+            .record_request(client.ip(), transport == Transport::Tcp, raw.len());
+        let cache_key = msg::question_key(
+            parsed.question(),
+            parsed.checking_disabled,
+            parsed.recursion_desired,
+        );
+        metrics
+            .query_type_total
+            .with_label_values(&[msg::qtype_label(parsed.qtype())])
+            .inc();
+        shared.traffic.record_domain(&cache_key.name);
 
         // ---- Rate limiting ----
         if !shared.ratelimit.check(client.ip(), &rt.ratelimit) {
@@ -816,7 +831,15 @@ mod tests {
         let p = pipeline_with(app);
         let raw = query_bytes("example.com", "A");
 
+        // UDP: silent drop (anti-reflection)
         let out = p.precheck(client(), Transport::Udp, &raw, Instant::now());
+        assert!(
+            matches!(out, Precheck::Drop),
+            "UDP ACL deny must be silent drop"
+        );
+
+        // TCP: explicit REFUSED (connected transport is not a reflection vector)
+        let out = p.precheck(client(), Transport::Tcp, &raw, Instant::now());
         match out {
             Precheck::Reply(bytes) => {
                 let view = msg::parse_response(&bytes).expect("parse REFUSED");
@@ -824,7 +847,8 @@ mod tests {
             }
             _ => panic!("expected REFUSED reply"),
         }
-        assert_eq!(p.shared.metrics.acl_denied_total.get(), 1);
+
+        assert_eq!(p.shared.metrics.acl_denied_total.get(), 2);
     }
 
     #[test]

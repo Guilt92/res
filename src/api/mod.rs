@@ -958,39 +958,50 @@ async fn rotate_password(
     let cfg_path = st.shared.config_path.get().cloned();
     let new_password = req.new_password.clone();
     let account_for_task = account.clone();
-    let rotated = tokio::task::spawn_blocking(move || {
-        let changed = match account_for_task.as_str() {
-            "admin" => auth.rotate_admin_password(&new_password),
-            "viewer" => auth.rotate_viewer_password(&new_password),
-            other => {
+    let rotated = tokio::task::spawn_blocking(move || match account_for_task.as_str() {
+        "admin" => {
+            let path = match cfg_path {
+                Some(p) => p,
+                None => {
+                    return (
+                        Err("no config path known; cannot persist admin credential".into()),
+                        false,
+                        Some("no config path known; cannot persist".into()),
+                    );
+                }
+            };
+            match auth.set_admin_password(&path, &new_password) {
+                Ok(()) => (Ok(()), true, None),
+                Err(e) => (Err(e.clone()), false, Some(e)),
+            }
+        }
+        "viewer" => {
+            if !auth.rotate_viewer_password(&new_password) {
                 return (
-                    Err(format!("unknown account '{other}' (expected admin|viewer)")),
+                    Err(format!(
+                        "no '{account_for_task}' credential is configured to rotate"
+                    )),
                     false,
                     None,
-                )
+                );
             }
-        };
-        if !changed {
-            return (
-                Err(format!(
-                    "no '{account_for_task}' credential is configured to rotate"
-                )),
-                false,
-                None,
-            );
+            match cfg_path {
+                Some(path) => match auth.persist_credentials(&path) {
+                    Ok(()) => (Ok(()), true, None),
+                    Err(e) => (Ok(()), false, Some(e)),
+                },
+                None => (
+                    Ok(()),
+                    false,
+                    Some("no config path known; hash is in-memory only".into()),
+                ),
+            }
         }
-        // Persist when a config path is known; report failure honestly.
-        match cfg_path {
-            Some(path) => match auth.persist_credentials(&path) {
-                Ok(()) => (Ok(()), true, None),
-                Err(e) => (Ok(()), false, Some(e)),
-            },
-            None => (
-                Ok(()),
-                false,
-                Some("no config path known; hash is in-memory only".into()),
-            ),
-        }
+        other => (
+            Err(format!("unknown account '{other}' (expected admin|viewer)")),
+            false,
+            None,
+        ),
     })
     .await;
     let (outcome, persisted, persist_error) = match rotated {

@@ -3319,7 +3319,11 @@ async fn auth_viewer_cannot_mutate_configuration() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_rotate_password_invalidates_old_and_works_with_new() {
     let cfg = base_config();
-    let gw = start_gateway_with_passwords(cfg, "old-pw", None).await;
+    let temp = std::env::temp_dir().join(format!("res_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let cfg_path = temp.join("res.toml");
+    std::fs::write(&cfg_path, "").unwrap();
+    let gw = start_gateway_with_passwords_and_path(cfg, "old-pw", None, cfg_path).await;
     let api = gw.api_addr().expect("api addr");
 
     // Login with old password works.
@@ -3423,7 +3427,11 @@ async fn auth_secure_cookies_flag_set_when_configured() {
 async fn auth_rotate_password_rejects_short_password() {
     let mut cfg = base_config();
     cfg.server.api_token = "rotation-token".into();
-    let gw = start_gateway_with_passwords(cfg, "admin-pw", None).await;
+    let temp = std::env::temp_dir().join(format!("res_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let cfg_path = temp.join("res.toml");
+    std::fs::write(&cfg_path, "").unwrap();
+    let gw = start_gateway_with_passwords_and_path(cfg, "admin-pw", None, cfg_path).await;
     let api = gw.api_addr().expect("api addr");
 
     let (status, body) = http_auth(

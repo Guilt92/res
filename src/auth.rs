@@ -536,6 +536,37 @@ impl AuthState {
         self.save_credentials_file(config_path)
     }
 
+    /// Set the admin password, persisting the new credential to disk BEFORE
+    /// updating in-memory state. If the disk write fails, in-memory state is
+    /// unchanged and all sessions remain valid (a restart will reload the old
+    /// credential from disk). This is the correct rotation order; the plain
+    /// `rotate_admin_password` applies in-memory first and is only safe when
+    /// persistence is guaranteed (e.g. in tests).
+    pub fn set_admin_password(&self, config_path: &Path, new_password: &str) -> Result<(), String> {
+        let hash = hash_password(new_password);
+        let mut creds = self.credentials.lock().unwrap_or_else(|e| e.into_inner());
+        let username = {
+            let admin = creds
+                .admin
+                .as_mut()
+                .ok_or("no admin password configured to rotate")?;
+            admin.username.clone()
+        };
+        let doc = CredentialsFile {
+            version: 1,
+            admin: Credential {
+                username,
+                hash: hash.clone(),
+            },
+            viewer: creds.viewer.clone(),
+        };
+        let path = Self::credentials_path(config_path);
+        let json = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
+        write_private(&path, &json)?;
+        creds.admin.as_mut().unwrap().hash = hash;
+        Ok(())
+    }
+
     fn record_failure(&self, key: &str) {
         let now = Instant::now();
         let mut lockouts = self.lockouts.lock().unwrap_or_else(|e| e.into_inner());
@@ -860,6 +891,42 @@ mod tests {
         // New password works.
         let (_, s) = auth.login("admin", "new-secret").unwrap();
         assert_eq!(s.role, Role::Admin);
+    }
+
+    #[test]
+    fn set_admin_password_persist_first_preserves_on_failure() {
+        let auth = AuthState::from_passwords(cfg(), Some("old".into()), None);
+        assert!(auth.login("admin", "old").is_ok());
+        let result = auth.set_admin_password(Path::new("/proc/1/root/etc/res"), "new");
+        assert!(result.is_err(), "writing to /proc/1/root/ should fail");
+        assert!(auth.login("admin", "old").is_ok());
+        assert!(matches!(
+            auth.login("admin", "new"),
+            Err(LoginError::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn set_admin_password_persist_first_succeeds() {
+        use std::env::temp_dir;
+        let auth = AuthState::from_passwords(cfg(), Some("old".into()), None);
+        assert!(auth.login("admin", "old").is_ok());
+        let dir = temp_dir().join(format!("res_auth_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("res.toml");
+        let _ = std::fs::write(&cfg_path, "[auth]\nusername = \"admin\"\n");
+        let result = auth.set_admin_password(&cfg_path, "new-secret");
+        assert!(
+            result.is_ok(),
+            "set_admin_password should succeed: {:?}",
+            result
+        );
+        assert!(matches!(
+            auth.login("admin", "old"),
+            Err(LoginError::InvalidCredentials)
+        ));
+        assert!(auth.login("admin", "new-secret").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

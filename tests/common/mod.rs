@@ -579,6 +579,23 @@ pub async fn start_gateway_with_path(cfg: AppConfig, path: std::path::PathBuf) -
         .expect("gateway should start")
 }
 
+/// Start a gateway with password auth AND a config path for persistence.
+pub async fn start_gateway_with_passwords_and_path(
+    cfg: AppConfig,
+    admin_password: &str,
+    viewer_password: Option<&str>,
+    path: std::path::PathBuf,
+) -> Gateway {
+    let auth = std::sync::Arc::new(res::auth::AuthState::from_passwords(
+        cfg.auth.clone(),
+        Some(admin_password.to_string()),
+        viewer_password.map(str::to_string),
+    ));
+    res::runtime::start_with_auth(cfg, Some(path), auth)
+        .await
+        .expect("gateway should start")
+}
+
 /// Send one A query over UDP and wait for a response (None on timeout/error).
 pub async fn udp_query(server: SocketAddr, name: &str) -> Option<Message> {
     udp_query_timeout(server, name, Duration::from_secs(3)).await

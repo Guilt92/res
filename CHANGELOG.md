@@ -61,3 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the credentials file before it is published in memory, so a failed disk
   write leaves the old password active instead of diverging between memory and
   disk across a restart.
+
+### Performance
+
+- **DNS-over-TLS connection reuse.** Direct DoT upstreams now keep a bounded
+  idle pool of established TLS sessions (2 per upstream identity, 32 total,
+  30 s idle / 5 min age) keyed by target, SNI and CA bundle, and share rustls
+  session resumption through the cached client config. Sequential queries no
+  longer pay a full TCP+TLS handshake each time. Certificate validation is
+  unchanged; proxied DoT is not pooled. Startup warns (`dot_short_timeout`)
+  when a DoT upstream's timeout budget is under 1 s, since the first exchange
+  still includes the handshake.

@@ -483,9 +483,9 @@ impl Forwarder {
         let start = Instant::now();
 
         let result = timeout(budget, async {
-            let (stream, proxy_latency, proxy_protocol) =
+            let (mut stream, proxy_latency, proxy_protocol) =
                 self.connect_stream(target, budget).await?;
-            let mut ok = self.exchange_framed(query, raw, stream).await?;
+            let mut ok = self.exchange_framed(query, raw, &mut stream).await?;
             ok.proxied = proxy_latency.is_some();
             ok.proxy_connect_latency = proxy_latency;
             ok.proxy_protocol = proxy_protocol;
@@ -499,6 +499,13 @@ impl Forwarder {
     /// DNS-over-TLS (RFC 7858): TCP framing inside a certificate-validated TLS
     /// session. There is no plaintext retry or downgrade: a handshake or
     /// identity failure is a hard upstream failure.
+    ///
+    /// Direct (non-proxied) connections are reused: a successful exchange
+    /// returns the TLS session to a small bounded idle pool keyed by the
+    /// upstream target, SNI and CA bundle. Reuse amortizes the TCP+TLS
+    /// handshake, and because rustls's in-memory session store lives on the
+    /// cached `ClientConfig`, reconnecting peers resume sessions too.
+    /// Certificate validation is unchanged.
     async fn exchange_tls(
         &self,
         up: &UpstreamConfig,
@@ -509,7 +516,7 @@ impl Forwarder {
         if raw.len() > MAX_TCP_MESSAGE {
             return Err(ExchangeError::Invalid("query too large for TLS".into()));
         }
-        let server_name = up
+        let server_name_str = up
             .tls_server_name
             .as_deref()
             .map(str::trim)
@@ -520,20 +527,47 @@ impl Forwarder {
                     up.name
                 ))
             })?;
-        let server_name = ServerName::try_from(server_name.to_string())
+        let server_name = ServerName::try_from(server_name_str.to_string())
             .map_err(|e| ExchangeError::Invalid(format!("invalid tls_server_name: {e}")))?;
         let config = tls_client_config(up.tls_ca_file.as_deref())?;
         let target = SocketAddr::new(up.address, up.port);
         let start = Instant::now();
+        let key = DotKey {
+            target,
+            server_name: server_name_str.to_string(),
+            ca_file: up.tls_ca_file.clone(),
+        };
 
         let result = timeout(budget, async {
+            // Prefer an idle pooled session. A stale connection (peer closed
+            // it while idle) fails its first write/read; that case falls
+            // through to one fresh connection below. A protocol-level
+            // mismatch is returned as-is: retrying cannot help and the
+            // connection must not be reused.
+            if self.proxy.is_none() {
+                if let Some(mut pooled) = dot_pool().take(&key) {
+                    match self.exchange_framed(query, raw, &mut pooled.stream).await {
+                        Ok(ok) => {
+                            dot_pool().put(key.clone(), pooled.stream, pooled.established);
+                            return Ok(ok);
+                        }
+                        Err(e @ ExchangeError::Invalid(_)) => return Err(e),
+                        Err(_) => {}
+                    }
+                }
+            }
+
             let (stream, proxy_latency, proxy_protocol) =
                 self.connect_stream(target, budget).await?;
-            let mut stream = TlsConnector::from(config)
+            let mut tls = TlsConnector::from(config)
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| ExchangeError::Network(format!("tls handshake: {e}")))?;
-            let mut ok = self.exchange_framed(query, raw, &mut stream).await?;
+            let established = Instant::now();
+            let mut ok = self.exchange_framed(query, raw, &mut tls).await?;
+            if self.proxy.is_none() {
+                dot_pool().put(key, tls, established);
+            }
             ok.proxied = proxy_latency.is_some();
             ok.proxy_connect_latency = proxy_latency;
             ok.proxy_protocol = proxy_protocol;
@@ -546,11 +580,14 @@ impl Forwarder {
 
     /// Write one length-prefixed DNS query and read one correlated response.
     /// Latency is filled in by the caller around the complete exchange.
+    ///
+    /// The stream is borrowed so a caller that owns a pooled connection can
+    /// return it to the pool when the exchange completes cleanly.
     async fn exchange_framed<S>(
         &self,
         query: &ParsedQuery,
         raw: &[u8],
-        mut stream: S,
+        stream: &mut S,
     ) -> Result<ExchangeOk, ExchangeError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -596,6 +633,96 @@ impl Forwarder {
             proxy_protocol: None,
         })
     }
+}
+
+/// Idle TLS session reusable for another query to the same upstream.
+struct PooledTls {
+    stream: tokio_rustls::client::TlsStream<TcpStream>,
+    /// When the TLS handshake completed (bounds total connection age).
+    established: Instant,
+    /// When the exchange that returned it to the pool finished.
+    idle_since: Instant,
+}
+
+/// Identity of a reusable DoT connection: target plus the certificate
+/// identity used for validation. Two upstreams with different SNI or CA
+/// bundles never share a session.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DotKey {
+    target: SocketAddr,
+    server_name: String,
+    ca_file: Option<PathBuf>,
+}
+
+/// Bounded idle-session cache for DNS-over-TLS.
+///
+/// Bounds keep an untrusted upstream set from growing memory without limit:
+/// at most [`DOT_MAX_IDLE_PER_KEY`] idle sessions per upstream identity and
+/// [`DOT_MAX_TOTAL_IDLE`] process-wide; sessions older than
+/// [`DOT_IDLE_TIMEOUT`] (or [`DOT_MAX_CONN_AGE`] overall) are discarded.
+/// The mutex is held only for the map operation, never across an await.
+struct DotPool {
+    idle: Mutex<HashMap<DotKey, Vec<PooledTls>>>,
+}
+
+const DOT_MAX_IDLE_PER_KEY: usize = 2;
+const DOT_MAX_TOTAL_IDLE: usize = 32;
+const DOT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DOT_MAX_CONN_AGE: Duration = Duration::from_secs(300);
+
+impl DotPool {
+    fn new() -> Self {
+        Self {
+            idle: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take the most recently used live session for `key`, discarding any
+    /// that expired while idle.
+    fn take(&self, key: &DotKey) -> Option<PooledTls> {
+        let mut map = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let list = map.get_mut(key)?;
+        while let Some(pooled) = list.pop() {
+            if pooled.idle_since.elapsed() <= DOT_IDLE_TIMEOUT
+                && pooled.established.elapsed() <= DOT_MAX_CONN_AGE
+            {
+                return Some(pooled);
+            }
+        }
+        map.remove(key);
+        None
+    }
+
+    /// Return a session to the pool if both bounds allow it.
+    fn put(
+        &self,
+        key: DotKey,
+        stream: tokio_rustls::client::TlsStream<TcpStream>,
+        established: Instant,
+    ) {
+        if established.elapsed() > DOT_MAX_CONN_AGE {
+            return;
+        }
+        let mut map = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let total: usize = map.values().map(Vec::len).sum();
+        if total >= DOT_MAX_TOTAL_IDLE {
+            return;
+        }
+        let list = map.entry(key).or_default();
+        if list.len() >= DOT_MAX_IDLE_PER_KEY {
+            return;
+        }
+        list.push(PooledTls {
+            stream,
+            established,
+            idle_since: Instant::now(),
+        });
+    }
+}
+
+fn dot_pool() -> &'static DotPool {
+    static POOL: OnceLock<DotPool> = OnceLock::new();
+    POOL.get_or_init(DotPool::new)
 }
 
 /// Normalize the timeout result and stamp the measured latency on success.

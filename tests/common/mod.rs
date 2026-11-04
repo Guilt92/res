@@ -314,6 +314,7 @@ pub const TLS_CA_PATH: &str = concat!(
 pub struct FakeTlsUpstream {
     pub addr: SocketAddr,
     pub hits: Arc<AtomicU64>,
+    pub connections: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -336,9 +337,11 @@ impl FakeTlsUpstream {
         .expect("test TLS identity");
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let hits = Arc::new(AtomicU64::new(0));
+        let connections = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
         {
             let hits = Arc::clone(&hits);
+            let connections = Arc::clone(&connections);
             tasks.push(tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -346,39 +349,51 @@ impl FakeTlsUpstream {
                     };
                     let acceptor = acceptor.clone();
                     let hits = Arc::clone(&hits);
+                    connections.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
                         let Ok(mut stream) = acceptor.accept(stream).await else {
                             return;
                         };
-                        let mut len_buf = [0u8; 2];
-                        if stream.read_exact(&mut len_buf).await.is_err() {
-                            return;
+                        // Serve frames until the peer closes the session so
+                        // connection reuse is observable (one connection,
+                        // many queries).
+                        loop {
+                            let mut len_buf = [0u8; 2];
+                            if stream.read_exact(&mut len_buf).await.is_err() {
+                                return;
+                            }
+                            let len = usize::from(u16::from_be_bytes(len_buf));
+                            let mut body = vec![0u8; len];
+                            if stream.read_exact(&mut body).await.is_err() {
+                                return;
+                            }
+                            let Ok(query) = Message::from_vec(&body) else {
+                                return;
+                            };
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            if silent {
+                                std::future::pending::<()>().await;
+                            }
+                            let Some(resp) = build_response(&query, false, ANSWER, false, false)
+                            else {
+                                return;
+                            };
+                            let mut frame = Vec::with_capacity(2 + resp.len());
+                            frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+                            frame.extend_from_slice(&resp);
+                            let _ = stream.write_all(&frame).await;
+                            let _ = stream.flush().await;
                         }
-                        let len = usize::from(u16::from_be_bytes(len_buf));
-                        let mut body = vec![0u8; len];
-                        if stream.read_exact(&mut body).await.is_err() {
-                            return;
-                        }
-                        let Ok(query) = Message::from_vec(&body) else {
-                            return;
-                        };
-                        hits.fetch_add(1, Ordering::SeqCst);
-                        if silent {
-                            std::future::pending::<()>().await;
-                        }
-                        let Some(resp) = build_response(&query, false, ANSWER, false, false) else {
-                            return;
-                        };
-                        let mut frame = Vec::with_capacity(2 + resp.len());
-                        frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
-                        frame.extend_from_slice(&resp);
-                        let _ = stream.write_all(&frame).await;
-                        let _ = stream.flush().await;
                     });
                 }
             }));
         }
-        Self { addr, hits, tasks }
+        Self {
+            addr,
+            hits,
+            connections,
+            tasks,
+        }
     }
 
     pub fn config(&self, name: &str, server_name: &str) -> UpstreamConfig {
@@ -400,6 +415,11 @@ impl FakeTlsUpstream {
 
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Number of TCP connections accepted (TLS handshakes attempted).
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::SeqCst)
     }
 
     pub async fn stop(self) {

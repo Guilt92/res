@@ -136,6 +136,36 @@ async fn dot_forwarding_uses_validated_tls() {
     fake.stop().await;
 }
 
+/// Sequential queries to the same DoT upstream must reuse the established
+/// TLS session instead of paying a full TCP+TLS handshake per query. The
+/// fake upstream keeps the connection open and counts accepted connections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_reuses_upstream_connection_across_queries() {
+    let fake = FakeTlsUpstream::start().await;
+    let mut cfg = base_config();
+    cfg.query.max_attempts = 1;
+    cfg.query.upstream_timeout_ms = 2000;
+    cfg.query.timeout_ms = 5000;
+    cfg.upstreams.push(fake.config("dot-reuse", "localhost"));
+    let gw = start_gateway(cfg).await;
+    let addr = gw.udp_addr().expect("udp addr");
+
+    for name in ["reuse-one.test", "reuse-two.test", "reuse-three.test"] {
+        let resp = udp_query(addr, name).await.expect("response");
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError, "{name}");
+    }
+
+    assert_eq!(fake.hits(), 3, "every query must reach the upstream");
+    assert_eq!(
+        fake.connections(),
+        1,
+        "sequential queries must reuse one TLS connection, not handshake per query"
+    );
+
+    gw.shutdown().await;
+    fake.stop().await;
+}
+
 /// A certificate/SNI mismatch is a hard failure: no plaintext retry and no
 /// silent downgrade to the same address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

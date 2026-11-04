@@ -161,6 +161,31 @@ pub async fn start_with_auth(
 
     let pipeline = Pipeline::new(Arc::clone(&shared));
 
+    // A DoT handshake shares the upstream query budget. The 500 ms default
+    // is often too small for a TCP connect plus TLS handshake to a
+    // high-latency resolver, so warn rather than let it fail mysteriously at
+    // runtime (reuse keeps the steady-state cost low, but the first exchange
+    // and any reconnect still pay the handshake).
+    {
+        let app = shared.app.load();
+        for up in &app.upstreams {
+            if up.protocol != crate::config::Protocol::Tls || !up.enabled {
+                continue;
+            }
+            let budget = up.timeout(app.query.upstream_timeout_ms);
+            if budget < Duration::from_millis(1_000) {
+                tracing::warn!(
+                    event = "dot_short_timeout",
+                    upstream = %up.name,
+                    timeout_ms = budget.as_millis() as u64,
+                    note = "DoT upstream timeout is below 1s; a TCP+TLS handshake \
+                            can consume the whole budget on high-latency links. \
+                            Raise timeout_ms for this upstream."
+                );
+            }
+        }
+    }
+
     // Bind listeners before spawning anything so startup failures are clean.
     let udp_addr = shared.rt.load().udp_addr;
     let udp_sock = UdpSocket::bind(udp_addr)

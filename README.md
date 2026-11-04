@@ -150,7 +150,16 @@ authentication, proxy, logging, and monitoring.
 - The ACL is allow-list based. Add every client network explicitly; an empty
   allow list cannot serve DNS clients.
 - DNS-over-TLS upstreams use `protocol = "tls"`, normally on port `853`, and
-  require `tls_server_name`.
+  require `tls_server_name`. Successful direct (non-proxied) exchanges return
+  the TLS session to a small bounded idle pool (up to 2 per upstream, 32
+  process-wide, 30 s idle / 5 min total age), and rustls session resumption is
+  shared through the cached client config, so sequential queries do not pay a
+  TCP+TLS handshake each time. Proxied DoT is not pooled.
+- A DoT exchange must complete within the per-upstream timeout, which defaults
+  to 500 ms (`query.upstream_timeout_ms` or `timeout_ms` per upstream). The
+  first exchange and any reconnect include a TCP connect plus TLS handshake;
+  on high-latency links raise `timeout_ms` for that upstream (startup logs a
+  `dot_short_timeout` warning when a DoT upstream's budget is under 1 s).
 - Set `require_encrypted_upstreams = true` to reject enabled plaintext
   upstreams.
 - `[proxy]` routes upstream exchanges through SOCKS5 or HTTP CONNECT. SOCKS5

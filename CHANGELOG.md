@@ -45,3 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session/CSRF cookies (mirrors `RES_PROTECT_METRICS`). The Docker stack
   enables it.
 
+### Added
+
+- **Multiple config backup generations.** Successful persistence writes now
+  keep up to three generations of the last known-good configuration
+  (`res.toml.backup`, `res.toml.backup.2`, `res.toml.backup.3`) instead of a
+  single `.backup` file. `restore_backup` promotes a generation only after it
+  parses as a complete configuration. Stale temp files left by a crashed
+  writer are removed on the next save, and persistence failures are logged as
+  structured `config_persist_failed` events.
+
+### Fixed
+
+- **Admin password rotation is persist-first.** The new password is written to
+  the credentials file before it is published in memory, so a failed disk
+  write leaves the old password active instead of diverging between memory and
+  disk across a restart.

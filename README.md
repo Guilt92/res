@@ -110,8 +110,14 @@ with an actionable message when it is not writable; this prevents a later
 dashboard mutation from failing with `EACCES`. If persistence still fails at
 runtime, the mutation is rejected with HTTP `500` / `persist_failed`, the
 active configuration is left unchanged, and the dashboard shows the error.
-Successful writes create a mode-`0600` `res.toml.backup` of the previous
-valid configuration (when one exists) before atomically replacing `res.toml`.
+Successful writes keep up to three generations of the previous valid
+configuration, mode-`0600`: `res.toml.backup` (newest), `res.toml.backup.2`
+and `res.toml.backup.3`. Restoring an older generation is validated: the file
+must parse as a complete configuration before it replaces `res.toml` (use
+`res`'s persisted backups through the config import API, which validates the
+same way, or copy the backup over `res.toml` and let startup validation
+decide). Temp files abandoned by a crashed writer are removed automatically
+on the next save.
 
 ### Resource limits
 
@@ -158,8 +164,8 @@ authentication, proxy, logging, and monitoring.
 - The configuration directory must be writable by the runtime UID for runtime
   updates and backup recovery. The API persists before publishing: a failed
   write rejects the mutation and leaves the active configuration unchanged.
-  Successful writes keep `res.toml.backup` as the last known-good
-  configuration.
+  Successful writes keep up to three backup generations of the last
+  known-good configuration (`res.toml.backup`, `.backup.2`, `.backup.3`).
 
 Control-plane credentials are supplied through environment variables or a
 mode-0600 credentials file:

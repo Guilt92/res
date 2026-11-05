@@ -3,10 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" id="theme-color" content="#0b1119">
 <title>res · Observability</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6feb'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='sans-serif' font-size='12' font-weight='700' fill='white'%3Eres%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/app.css">
 <script src="/boot.js"></script>
+<link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <a class="skip-link" href="#content">Skip to content</a>
@@ -51,6 +52,11 @@
       <button id="login-retry" class="login-retry" type="button" hidden>Retry connection</button>
     </form>
     <div class="login-foot">
+      <button type="button" class="login-theme" data-theme-cycle
+              aria-label="Change color theme">
+        <span class="theme-dot" aria-hidden="true"></span>
+        Theme: <span class="login-theme-label">Auto</span>
+      </button>
       <span>Protected by a server-side session; the cookie is HttpOnly and SameSite=Strict.</span>
       <span class="mono">res v<span id="login-version">0.1.0</span></span>
     </div>
@@ -76,8 +82,44 @@
       <span id="updated" class="updated">connecting…</span>
     </div>
     <div class="user-area">
+      <div class="theme-switch">
+        <button id="theme-toggle" class="btn btn-ghost btn-sm theme-btn" type="button"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu"
+                title="Color theme: system, light or dark">
+          <span class="theme-ico" aria-hidden="true">
+            <svg class="ico ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+              <circle cx="12" cy="12" r="4"></circle>
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+            </svg>
+            <svg class="ico ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+            </svg>
+            <svg class="ico ico-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+              <circle cx="12" cy="12" r="9"></circle>
+              <path d="M12 3v18"></path>
+              <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"></path>
+            </svg>
+          </span>
+          <span class="theme-label">Auto</span>
+        </button>
+        <div id="theme-menu" class="theme-menu" role="menu" aria-label="Color theme" hidden>
+          <button type="button" role="menuitemradio" data-theme-choice="system" aria-checked="true">
+            <span>System</span><span class="theme-hint">follows your OS</span>
+          </button>
+          <button type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false">
+            <span>Light</span><span class="theme-hint">always light</span>
+          </button>
+          <button type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false">
+            <span>Dark</span><span class="theme-hint">always dark</span>
+          </button>
+        </div>
+      </div>
       <span class="chip auth-chip" id="auth-chip" title="Session status">…</span>
-      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button" hidden>Sign out</button>
+      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button"
+              title="Sign out" aria-label="Sign out" hidden>Sign out</button>
     </div>
   </div>
   <div class="hbar hbar-secondary">

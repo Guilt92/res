@@ -141,6 +141,16 @@ The memory alert thresholds in `deploy/alerts.yml` (warning at 384 MiB,
 critical at 460 MiB) assume the default 512 MiB `res` limit. If you raise or
 lower `RES_MEMORY_LIMIT`, adjust those rules to match.
 
+## Dashboard
+
+The web dashboard is served at the loopback address above. It follows the
+operating system's light/dark preference on first load; use the theme control
+in the header (or on the sign-in dialog) to pin **Auto**, **Light**, or
+**Dark**. The choice is stored per browser in `localStorage` and never sent to
+the gateway. The layout is usable from 320 px upward: the sidebar becomes an
+off-canvas drawer on narrow screens, and wide tables scroll inside their own
+panels.
+
 ## Configuration
 
 The main configuration file is `config/res.toml`. It defines listeners,

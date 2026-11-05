@@ -3,8 +3,140 @@
  * State
  * ====================================================================== */
 const RANGES = ["5m","15m","1h","6h","24h","7d"];
-const PALETTE = ["#4cc2ff","#7ee787","#ffa657","#ff7b72","#d2a8ff","#79c0ff","#e3b341","#f778ba","#56d364","#a5d6ff"];
+const THEME_KEY = "res-theme-pref";
+const THEME_CHOICES = ["system","light","dark"];
+/* Theme-aware chart palette, resolved from CSS custom properties so both
+   themes keep readable contrast without shipping two copies of the JS. */
+let PALETTE = [];
 const $ = id => document.getElementById(id);
+
+/* =========================================================================
+ * Theme controller (system preference + explicit override, no flash)
+ * ====================================================================== */
+function themePref(){
+  try {
+    const v = localStorage.getItem(THEME_KEY);
+    return THEME_CHOICES.includes(v) ? v : "system";
+  } catch(_) { return "system"; }
+}
+function systemPrefersDark(){
+  try {
+    return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  } catch(_) { return true; }
+}
+function cssVar(name, fallback){
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  } catch(_) { return fallback; }
+}
+function refreshPalette(){
+  const next = [];
+  for (let i = 1; i <= 10; i++) next.push(cssVar("--chart-" + i, "#4cc2ff"));
+  PALETTE = next;
+  const names = Object.keys(state.upColors);
+  if (names.length){
+    const remapped = {};
+    names.forEach((n, i) => { remapped[n] = PALETTE[i % PALETTE.length]; });
+    state.upColors = remapped;
+  }
+}
+function metaColor(key){
+  const meta = META[key];
+  return meta && meta[2] ? cssVar(meta[2], "#8b949e") : "#8b949e";
+}
+function renderThemeSensitive(){
+  if (!state.status || !state.stats) return;
+  renderKpis(); renderTraffic(); renderStatsBlocks();
+  renderClientTable(); renderUpState(); renderFailovers();
+  renderUpstreams(); renderEvents(); renderUpstreamMgr();
+  hydrateStyles(document);
+}
+function applyTheme(pref, persist){
+  if (!THEME_CHOICES.includes(pref)) pref = "system";
+  const root = document.documentElement;
+  const theme = pref === "system" ? (systemPrefersDark() ? "dark" : "light") : pref;
+  root.setAttribute("data-theme-pref", pref);
+  root.setAttribute("data-theme", theme);
+  if (persist){
+    try {
+      if (pref === "system") localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, pref);
+    } catch(_) {}
+  }
+  const label = pref === "system" ? "Auto" : pref === "light" ? "Light" : "Dark";
+  for (const el of document.querySelectorAll(".theme-label,.login-theme-label")){
+    el.textContent = label;
+  }
+  const btn = $("theme-toggle");
+  if (btn){
+    btn.dataset.mode = pref;
+    btn.setAttribute("aria-label", "Color theme: " + label);
+  }
+  for (const item of document.querySelectorAll("[data-theme-choice]")){
+    item.setAttribute("aria-checked",
+      String(item.getAttribute("data-theme-choice") === pref));
+  }
+  const meta = $("theme-color");
+  if (meta) meta.setAttribute("content", theme === "dark" ? "#0b1119" : "#eef2f8");
+  refreshPalette();
+  renderThemeSensitive();
+  if (state.hist) requestAnimationFrame(() => drawAllCharts());
+}
+function initTheme(){
+  applyTheme(themePref(), false);
+  const btn = $("theme-toggle"), menu = $("theme-menu");
+  if (btn && menu){
+    const closeMenu = focusBtn => {
+      menu.hidden = true;
+      btn.setAttribute("aria-expanded", "false");
+      if (focusBtn) btn.focus();
+    };
+    btn.addEventListener("click", e => {
+      e.stopPropagation();
+      const open = menu.hidden;
+      menu.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+      if (open){
+        const current = menu.querySelector('[aria-checked="true"]') || menu.querySelector("button");
+        if (current) requestAnimationFrame(() => current.focus());
+      }
+    });
+    menu.addEventListener("click", e => {
+      const choice = e.target.closest("[data-theme-choice]");
+      if (!choice) return;
+      applyTheme(choice.getAttribute("data-theme-choice"), true);
+      closeMenu(true);
+    });
+    menu.addEventListener("keydown", e => {
+      if (e.key === "Escape"){ e.preventDefault(); closeMenu(true); return; }
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      e.preventDefault();
+      const items = [...menu.querySelectorAll("button")];
+      const at = items.indexOf(document.activeElement);
+      const next = e.key === "ArrowDown"
+        ? (at + 1) % items.length
+        : (at - 1 + items.length) % items.length;
+      items[next].focus();
+    });
+    document.addEventListener("click", e => {
+      if (!menu.hidden && !e.target.closest(".theme-switch")) closeMenu(false);
+    });
+  }
+  for (const cycle of document.querySelectorAll("[data-theme-cycle]")){
+    cycle.addEventListener("click", () => {
+      const order = ["system", "light", "dark"];
+      const next = order[(order.indexOf(themePref()) + 1) % order.length];
+      applyTheme(next, true);
+    });
+  }
+  if (window.matchMedia){
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = () => { if (themePref() === "system") applyTheme("system", false); };
+    if (mq.addEventListener) mq.addEventListener("change", onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
+}
 
 const state = {
   range: "5m",
@@ -69,6 +201,29 @@ const NAV_GROUP_OF = {
   "health-checks-selection": "Protection",
   "incident-timeline": "Incidents",
   "configuration": "System",
+};
+/* Compact, dependency-free line icons for the section menu. Static markup
+   only (CSP-safe), coloured through currentColor. */
+const NAV_ICONS = {
+  "dns-service": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+  "service-statistics": '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+  "top-clients": '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  "traffic": '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+  "assessment": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+  "process-capacity": '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/>',
+  "dns-service-history": '<polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>',
+  "upstream-history": '<line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
+  "process-history": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+  "current-upstream-state": '<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/>',
+  "failover-monitoring": '<polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>',
+  "upstreams": '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  "upstream-dns-management": '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  "client-acl": '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  "cache": '<polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/>',
+  "upstream-proxy": '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>',
+  "health-checks-selection": '<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>',
+  "incident-timeline": '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  "configuration": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>',
 };
 
 function sectionTitle(h2){
@@ -187,13 +342,18 @@ function buildNav(){
     a.className = "nav-link";
     a.href = "#" + sec.id;
     a.dataset.section = sec.id;
-    const idx = document.createElement("span");
-    idx.className = "nav-idx";
-    idx.textContent = String(++n).padStart(2, "0");
+    const ico = document.createElement("span");
+    ico.className = "nav-ico";
+    ico.setAttribute("aria-hidden", "true");
+    ico.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ' +
+      'focusable="false">' + (NAV_ICONS[sec.id] || NAV_ICONS["dns-service"]) + '</svg>';
     const text = document.createElement("span");
+    text.className = "nav-text";
     text.textContent = label;
-    a.appendChild(idx); a.appendChild(text);
+    a.appendChild(ico); a.appendChild(text);
     wrap.appendChild(a);
+    n++;
   }
 }
 function navSections(){
@@ -344,39 +504,39 @@ function setBanner(id, on){
 
 /* Series metadata: label, unit, color for every canonical series key. */
 const META = {
-  qps:            ["Query rate","qps","#4cc2ff"],
-  queries:        ["Requests","","#4cc2ff"],
-  packets_in:     ["Packets in","","#79c0ff"],
-  packets_out:    ["Packets out","","#ffa657"],
-  avg_req_bytes:  ["Avg request","B","#4cc2ff"],
-  avg_resp_bytes: ["Avg response","B","#7ee787"],
-  success_pct:    ["Success","%","#7ee787"],
-  error_pct:      ["Errors","%","#ff7b72"],
-  servfail_pct:   ["SERVFAIL","%","#ffa657"],
-  nxdomain_pct:   ["NXDOMAIN","%","#d2a8ff"],
-  refused_pct:    ["REFUSED","%","#ff7b72"],
-  deadline_pct:   ["Deadline","%","#d2a8ff"],
-  timeout_pct:    ["Upstream timeout","%","#ff7b72"],
-  failover_per_min:["Failovers","/min","#e3b341"],
-  rate_limited_per_min:["Rate limited","/min","#d2a8ff"],
-  acl_denied_per_min:["ACL denied","/min","#79c0ff"],
-  overload_per_min:["Overload","/min","#f85149"],
-  malformed_per_min:["Malformed","/min","#8b949e"],
-  cache_hit_pct:  ["Hit ratio","%","#7ee787"],
-  p50_ms:         ["P50","ms","#7ee787"],
-  p95_ms:         ["P95","ms","#ffa657"],
-  p99_ms:         ["P99","ms","#ff7b72"],
-  inflight:       ["UDP in-flight","","#4cc2ff"],
-  tcp_open:       ["TCP conns","","#79c0ff"],
-  rss_mb:         ["RSS","MB","#d2a8ff"],
-  cpu_pct:        ["CPU","%","#ffa657"],
-  fds:            ["FDs","","#e3b341"],
-  healthy:        ["Healthy","","#7ee787"],
-  degraded:       ["Degraded","","#e3b341"],
-  recovering:     ["Recovering","","#388bfd"],
-  down:           ["Unhealthy","","#ff7b72"],
-  cache_entries:  ["Entries","","#7ee787"],
-  tcp_conn_per_min:["TCP accepts","/min","#79c0ff"],
+  qps:            ["Query rate","qps","--chart-1"],
+  queries:        ["Requests","","--chart-1"],
+  packets_in:     ["Packets in","","--chart-2"],
+  packets_out:    ["Packets out","","--chart-3"],
+  avg_req_bytes:  ["Avg request","B","--chart-1"],
+  avg_resp_bytes: ["Avg response","B","--chart-5"],
+  success_pct:    ["Success","%","--chart-5"],
+  error_pct:      ["Errors","%","--chart-4"],
+  servfail_pct:   ["SERVFAIL","%","--chart-3"],
+  nxdomain_pct:   ["NXDOMAIN","%","--chart-7"],
+  refused_pct:    ["REFUSED","%","--chart-4"],
+  deadline_pct:   ["Deadline","%","--chart-7"],
+  timeout_pct:    ["Upstream timeout","%","--chart-4"],
+  failover_per_min:["Failovers","/min","--chart-6"],
+  rate_limited_per_min:["Rate limited","/min","--chart-7"],
+  acl_denied_per_min:["ACL denied","/min","--chart-2"],
+  overload_per_min:["Overload","/min","--chart-4"],
+  malformed_per_min:["Malformed","/min","--chart-10"],
+  cache_hit_pct:  ["Hit ratio","%","--chart-5"],
+  p50_ms:         ["P50","ms","--chart-5"],
+  p95_ms:         ["P95","ms","--chart-3"],
+  p99_ms:         ["P99","ms","--chart-4"],
+  inflight:       ["UDP in-flight","","--chart-1"],
+  tcp_open:       ["TCP conns","","--chart-2"],
+  rss_mb:         ["RSS","MB","--chart-7"],
+  cpu_pct:        ["CPU","%","--chart-3"],
+  fds:            ["FDs","","--chart-6"],
+  healthy:        ["Healthy","","--chart-5"],
+  degraded:       ["Degraded","","--chart-6"],
+  recovering:     ["Recovering","","--chart-2"],
+  down:           ["Unhealthy","","--chart-4"],
+  cache_entries:  ["Entries","","--chart-5"],
+  tcp_conn_per_min:["TCP accepts","/min","--chart-2"],
 };
 
 /* Chart definitions: canvas id -> series keys (global) or per-upstream key. */
@@ -686,22 +846,20 @@ function applyRoleGating(){
 function renderAuthChip(){
   const el = $("auth-chip");
   if (!el) return;
+  el.classList.remove("auth-open", "auth-active", "auth-anon");
   if (AUTH.open){
     el.textContent = "no auth";
     el.title = "Authentication is disabled on this gateway";
-    el.style.color = "var(--faint)";
-    el.style.cursor = "";
+    el.classList.add("auth-open");
   } else if (AUTH.role){
     el.textContent = AUTH.user && AUTH.user !== AUTH.role
       ? AUTH.user + " · " + AUTH.role : AUTH.role;
     el.title = "Signed in";
-    el.style.color = "#7ee787";
-    el.style.cursor = "";
+    el.classList.add("auth-active");
   } else {
     el.textContent = "signed out";
     el.title = "Sign in to the control plane";
-    el.style.color = "#e3b341";
-    el.style.cursor = "pointer";
+    el.classList.add("auth-anon");
   }
   $("logout-btn").hidden = !AUTH.role || AUTH.open;
   $("nav-mode").textContent = AUTH.open ? "open mode" : (AUTH.role || "locked");
@@ -880,8 +1038,8 @@ function drawChart(def){
     });
   } else {
     for (const key of def.keys){
-      const meta = META[key] || [key,"","#8b949e"];
-      series.push({name:meta[0], color:meta[2], points:seriesFrom(state.hist, key), step:!!def.step});
+      const meta = META[key] || [key,"",""];
+      series.push({name:meta[0], color:metaColor(key), points:seriesFrom(state.hist, key), step:!!def.step});
     }
   }
   if (state.focus){
@@ -929,8 +1087,9 @@ function drawChart(def){
   const X = t => L + (t-t0)/(t1-t0)*pw;
   const Y = v => T + ph - (v-v0)/(v1-v0)*ph;
 
-  // Grid + Y labels.
-  ctx.strokeStyle = "#1c2634"; ctx.fillStyle = "#7f90a6";
+  // Grid + Y labels (theme-aware tokens).
+  ctx.strokeStyle = cssVar("--chart-grid", "#1c2634");
+  ctx.fillStyle = cssVar("--chart-axis", "#7f90a6");
   ctx.font = '10px "Shabnam", sans-serif'; ctx.textAlign = "right";
   const unit = META[(def.keys&&def.keys[0]) || ""] ? META[def.keys[0]][1] : "";
   for (let i=0;i<=4;i++){
@@ -1199,7 +1358,7 @@ function drawKpiSparks(){
     const pad = 3;
     const X = i => i/(pts.length-1)*W;
     const Y = v => pad + (1-(v-min)/(max-min))*(H-pad*2);
-    const color = (META[key] && META[key][2]) || "#5cc8ff";
+    const color = metaColor(key);
     ctx.beginPath();
     pts.forEach((p,i) => { if (i) ctx.lineTo(X(i),Y(p[1])); else ctx.moveTo(X(i),Y(p[1])); });
     ctx.lineTo(X(pts.length-1),H); ctx.lineTo(X(0),H); ctx.closePath();
@@ -2824,6 +2983,7 @@ async function saveSelection(){
  * Wiring
  * ====================================================================== */
 function wire(){
+  initTheme();
   $("range-sel").addEventListener("change", e => {
     state.range = e.target.value;
     if (!RANGES.includes(state.range)) state.range = "5m";

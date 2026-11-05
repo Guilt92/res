@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Responsive dashboard with light/dark themes.** The control plane follows
+  the operating system color scheme by default and can be pinned to Auto,
+  Light, or Dark from the header (or the sign-in dialog). The preference is
+  stored per browser in `localStorage` (`res-theme-pref`) and applied before
+  first paint, so reloads do not flash the wrong theme. Charts, KPI cards,
+  tables, forms and the sign-in dialog are fully themed with no new runtime
+  dependencies. The layout is usable from 320 px upward: the sidebar becomes
+  an off-canvas drawer on narrow screens and wide tables scroll inside their
+  own panels instead of overflowing the page.
 - **Multiple config backup generations.** Successful persistence writes now
   keep up to three generations of the last known-good configuration
   (`res.toml.backup`, `res.toml.backup.2`, `res.toml.backup.3`) instead of a

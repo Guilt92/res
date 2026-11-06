@@ -1,0 +1,17 @@
+{
+  "name": "res-dashboard-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Browser smoke tests and JS checks for the res dashboard (dev tooling only; the dashboard itself has no build step or runtime dependencies).",
+  "scripts": {
+    "lint": "cd ../.. && tests/e2e/node_modules/.bin/eslint -c tests/e2e/eslint.config.js dashboard",
+    "check": "node --check ../../dashboard/boot.js && node --check ../../dashboard/app.js && node --check ../../dashboard/js/format.js",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "@playwright/test": "1.56.1",
+    "eslint": "9.39.1",
+    "globals": "16.5.0"
+  }
+}

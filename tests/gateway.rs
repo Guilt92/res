@@ -2754,8 +2754,6 @@ async fn rejected_upstream_update_leaves_active_config_intact() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persist_failure_is_reported_and_audited() {
-    use std::os::unix::fs::PermissionsExt;
-
     let fake = FakeUpstream::start().await;
     let mut cfg = base_config();
     cfg.upstreams.push(fake.config("seed"));
@@ -2785,9 +2783,15 @@ async fn persist_failure_is_reported_and_audited() {
     let before: serde_json::Value = serde_json::from_str(&before).expect("json");
     let generation_before = before["config"]["generation"].clone();
 
-    // Make the config directory read-only so the atomic write cannot create
-    // its temp file.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    // Make the atomic write fail deterministically for *every* user (root
+    // ignores directory permissions, so chmod is not a reliable fault): move
+    // the config directory away so the temp file cannot be created (ENOENT).
+    let moved = dir.with_extension("moved");
+    let _ = std::fs::remove_dir_all(&moved);
+    std::fs::rename(&dir, &moved).expect("move config dir away");
+    // A regular file in its place: neither the directory nor a temp file can
+    // be created (ENOTDIR), whatever the uid.
+    std::fs::write(&dir, b"not a directory").expect("blocker file");
 
     let (status, body) = http(
         "POST",
@@ -2821,7 +2825,8 @@ async fn persist_failure_is_reported_and_audited() {
     assert!(!events.contains("applied_persist_failed"), "{events}");
 
     // The last valid file on disk is still loadable and unchanged.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    std::fs::remove_file(&dir).expect("remove blocker");
+    std::fs::rename(&moved, &dir).expect("restore config dir");
     let on_disk = res::config::AppConfig::load(&path).expect("file still loads");
     assert!(
         on_disk.upstreams.iter().any(|u| u.name == "baseline"),
@@ -3252,10 +3257,14 @@ async fn auth_config_export_redacts_token_for_viewers() {
     );
     assert!(!body.contains("api_token"), "token field must be stripped");
 
-    // Admin (via bearer token) sees the full export.
+    // Not even the admin export contains secrets any more; importing the
+    // export back keeps the live token (see the import round-trip tests).
     let (status, body) = http_auth("GET", api, "/api/config", None, Some("sekrit-token")).await;
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains("sekrit-token"), "admin keeps full export");
+    assert!(
+        !body.contains("sekrit-token"),
+        "admin export must be redacted too: {body}"
+    );
 
     gw.shutdown().await;
 }

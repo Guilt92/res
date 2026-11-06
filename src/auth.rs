@@ -28,9 +28,12 @@ use crate::config::AuthConfig;
 
 /// Minimum accepted password length for environment/file provisioning.
 pub const MIN_PASSWORD_LEN: usize = 8;
-/// Hard cap on concurrent sessions (oldest-expiring session is evicted).
+/// Hard cap on concurrent sessions (the oldest session is evicted).
 const MAX_SESSIONS: usize = 1024;
-/// Hard cap on tracked failed-login accounts (oldest window is evicted).
+/// Cap on concurrent sessions per account (that account's oldest is evicted),
+/// so one account cannot push every other user's session out of the table.
+const MAX_SESSIONS_PER_USER: usize = 16;
+/// Hard cap on tracked failed-login (username, IP) pairs.
 const MAX_LOCKOUTS: usize = 4096;
 /// Hard cap on tracked per-IP login rate-limit entries (oldest window evicted).
 const MAX_LOGIN_IPS: usize = 8192;
@@ -78,6 +81,8 @@ pub struct Session {
     /// every cookie-authenticated mutation).
     pub csrf: String,
     pub created: Instant,
+    /// Last time the session was presented (drives the idle timeout).
+    pub last_seen: Instant,
     pub expires: Instant,
 }
 
@@ -97,7 +102,10 @@ struct CredentialsFile {
     viewer: Option<Credential>,
 }
 
-/// Failed-login tracking for one username (case-insensitive key).
+/// Lockout key: (lower-cased username, canonical client IP).
+type LockKey = (String, IpAddr);
+
+/// Failed-login tracking for one (username, client IP) pair.
 #[derive(Debug, Default)]
 struct Lockout {
     failures: u32,
@@ -140,7 +148,7 @@ pub struct AuthState {
     cfg: AuthConfig,
     credentials: Mutex<Credentials>,
     sessions: Mutex<SessionTable>,
-    lockouts: Mutex<HashMap<String, Lockout>>,
+    lockouts: Mutex<HashMap<LockKey, Lockout>>,
     login_ips: Mutex<HashMap<IpAddr, LoginIp>>,
 }
 
@@ -327,26 +335,38 @@ impl AuthState {
         self.cfg.secure_cookies = true;
     }
 
-    /// Per-IP login rate limit. Returns `Ok(())` when the attempt may
-    /// proceed, or `Err(retry_after_secs)` when the client has exceeded
-    /// `login_rate_limit_per_minute` within the current one-minute window.
-    /// Call once per attempt before verifying credentials.
-    pub fn check_login_rate(&self, ip: IpAddr) -> Result<(), u64> {
+    /// Atomically check **and** count one login attempt from `ip` against the
+    /// per-IP limit (`login_rate_limit_per_minute` per fixed one-minute
+    /// window). Returns `Ok(())` when the attempt may proceed, or
+    /// `Err(retry_after_secs)` when the client is over the limit. Check and
+    /// increment happen under one lock, so concurrent requests cannot all
+    /// slip under the limit.
+    pub fn begin_login_attempt(&self, ip: IpAddr) -> Result<(), u64> {
         let max = self.cfg.login_rate_limit_per_minute;
+        // With rate limiting disabled the table serves no purpose; tracking
+        // every source address would be an unbounded unauthenticated memory
+        // sink, so skip it entirely.
         if max == 0 {
             return Ok(());
         }
         let ip = canonical_ip(ip);
         let now = Instant::now();
         let mut map = self.login_ips.lock().unwrap_or_else(|e| e.into_inner());
-        // Bound the table: evict the entry with the oldest window.
         if map.len() >= MAX_LOGIN_IPS && !map.contains_key(&ip) {
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, v)| v.window_start.unwrap_or(now))
-                .map(|(k, _)| *k)
-            {
-                map.remove(&oldest);
+            // Expired windows carry no information: drop them first, and
+            // only then evict the entry with the oldest window.
+            map.retain(|_, v| {
+                v.window_start
+                    .is_some_and(|s| now.saturating_duration_since(s).as_secs() < 60)
+            });
+            if map.len() >= MAX_LOGIN_IPS {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.window_start.unwrap_or(now))
+                    .map(|(k, _)| *k)
+                {
+                    map.remove(&oldest);
+                }
             }
         }
         let e = map.entry(ip).or_default();
@@ -363,75 +383,51 @@ impl AuthState {
                 .unwrap_or(0);
             return Err((60u64.saturating_sub(elapsed)).max(1));
         }
-        Ok(())
-    }
-
-    /// Count one login attempt from `ip` (call after [`Self::check_login_rate`]).
-    pub fn record_login_attempt(&self, ip: IpAddr) {
-        // With rate limiting disabled the table serves no purpose; tracking
-        // every source address would be an unbounded unauthenticated memory
-        // sink, so skip it entirely.
-        if self.cfg.login_rate_limit_per_minute == 0 {
-            return;
-        }
-        let ip = canonical_ip(ip);
-        let now = Instant::now();
-        let mut map = self.login_ips.lock().unwrap_or_else(|e| e.into_inner());
-        // Bound the table here too: this path runs even when the check
-        // above was skipped for any reason.
-        if map.len() >= MAX_LOGIN_IPS && !map.contains_key(&ip) {
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, v)| v.window_start.unwrap_or(now))
-                .map(|(k, _)| *k)
-            {
-                map.remove(&oldest);
-            }
-        }
-        let e = map.entry(ip).or_default();
         if e.window_start.is_none() {
             e.window_start = Some(now);
         }
         e.attempts = e.attempts.saturating_add(1);
+        Ok(())
     }
 
     /// Drop the per-IP rate-limit counter for a client (called after a
     /// successful login so a legitimate user who mistyped once starts clean).
+    /// The address is canonicalised exactly like [`Self::begin_login_attempt`].
     pub fn clear_login_rate(&self, ip: IpAddr) {
         self.login_ips
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&ip);
+            .remove(&canonical_ip(ip));
     }
 
-    /// Verify credentials and create a session on success. Locks the account
-    /// for `lockout_duration` after `max_failed_attempts` failures inside
-    /// `lockout_window`. The same error is returned for unknown users and
-    /// wrong passwords.
-    pub fn login(&self, username: &str, password: &str) -> Result<(String, Session), LoginError> {
-        let key = username.to_lowercase();
-        {
-            let lockouts = self.lockouts.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(l) = lockouts.get(&key) {
-                if let Some(until) = l.locked_until {
-                    if until > Instant::now() {
-                        return Err(LoginError::Locked {
-                            retry_after_secs: until
-                                .saturating_duration_since(Instant::now())
-                                .as_secs()
-                                .max(1),
-                        });
-                    }
-                }
-            }
-        }
+    /// Verify credentials and create a session on success.
+    ///
+    /// Lockout is keyed by *(canonical username, canonical client IP)*: after
+    /// `max_failed_attempts` failures inside `lockout_window` that pair is
+    /// rejected for `lockout_duration`. A different source address is never
+    /// affected, so an anonymous attacker cannot lock the administrator out
+    /// of their own account; brute force from one address is bounded by the
+    /// pair lockout plus the per-IP rate limit.
+    ///
+    /// The lockout check and the failure *reservation* happen in one critical
+    /// section before the (slow) password verification, so N concurrent
+    /// requests cannot all be evaluated against a stale counter: at most
+    /// `max_failed_attempts` guesses per window ever reach argon2. A
+    /// successful login removes the reservation.
+    ///
+    /// The same error is returned for unknown users and wrong passwords.
+    pub fn login(
+        &self,
+        username: &str,
+        password: &str,
+        ip: IpAddr,
+    ) -> Result<(String, Session), LoginError> {
+        let key: LockKey = (username.to_lowercase(), canonical_ip(ip));
+        self.reserve_attempt(&key)?;
 
         let role = self.verify(username, password);
         match role {
-            None => {
-                self.record_failure(&key);
-                Err(LoginError::InvalidCredentials)
-            }
+            None => Err(LoginError::InvalidCredentials),
             Some(role) => {
                 self.clear_failures(&key);
                 let token = random_token();
@@ -460,11 +456,11 @@ impl AuthState {
                     role,
                     csrf,
                     created: now,
+                    last_seen: now,
                     expires: now + self.session_ttl(),
                 };
                 let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                sessions.prune_expired();
-                sessions.insert(token.clone(), session.clone());
+                sessions.insert(token.clone(), session.clone(), self.idle_timeout());
                 Ok((token, session))
             }
         }
@@ -567,23 +563,65 @@ impl AuthState {
         Ok(())
     }
 
-    fn record_failure(&self, key: &str) {
+    /// Check the lockout for `key` and, if it is not locked, atomically count
+    /// this attempt as a failure (a successful login removes it again via
+    /// [`Self::clear_failures`]).
+    fn reserve_attempt(&self, key: &LockKey) -> Result<(), LoginError> {
         let now = Instant::now();
         let mut lockouts = self.lockouts.lock().unwrap_or_else(|e| e.into_inner());
-        // Bound the table: evict the entry whose window started earliest.
-        if lockouts.len() >= MAX_LOCKOUTS && !lockouts.contains_key(key) {
-            if let Some(oldest) = lockouts
-                .iter()
-                .min_by_key(|(_, v)| v.window_start.unwrap_or(now))
-                .map(|(k, _)| k.clone())
-            {
-                lockouts.remove(&oldest);
+        if let Some(l) = lockouts.get(key) {
+            if let Some(until) = l.locked_until {
+                if until > now {
+                    return Err(LoginError::Locked {
+                        retry_after_secs: until.saturating_duration_since(now).as_secs().max(1),
+                    });
+                }
             }
         }
-        let l = lockouts.entry(key.to_string()).or_default();
+        Self::count_failure(&mut lockouts, key, &self.cfg, now);
+        Ok(())
+    }
+
+    /// Count one failure for `key` in `lockouts`, keeping the table bounded.
+    ///
+    /// Eviction order when full: expired entries first, then unlocked entries
+    /// (oldest window), and only as a last resort the lock that expires
+    /// soonest. An attacker flooding fresh keys therefore cannot push a
+    /// currently-locked key out of the table while cheaper victims exist.
+    fn count_failure(
+        lockouts: &mut HashMap<LockKey, Lockout>,
+        key: &LockKey,
+        cfg: &AuthConfig,
+        now: Instant,
+    ) {
+        if lockouts.len() >= MAX_LOCKOUTS && !lockouts.contains_key(key) {
+            let window = cfg.lockout_window_ms_duration();
+            lockouts.retain(|_, v| {
+                v.locked_until.is_some_and(|u| u > now)
+                    || v.window_start
+                        .is_some_and(|s| now.saturating_duration_since(s) <= window)
+            });
+            if lockouts.len() >= MAX_LOCKOUTS {
+                let victim = lockouts
+                    .iter()
+                    .filter(|(_, v)| v.locked_until.is_none_or(|u| u <= now))
+                    .min_by_key(|(_, v)| v.window_start.unwrap_or(now))
+                    .map(|(k, _)| k.clone())
+                    .or_else(|| {
+                        lockouts
+                            .iter()
+                            .min_by_key(|(_, v)| v.locked_until.unwrap_or(now))
+                            .map(|(k, _)| k.clone())
+                    });
+                if let Some(victim) = victim {
+                    lockouts.remove(&victim);
+                }
+            }
+        }
+        let l = lockouts.entry(key.clone()).or_default();
         // Start a fresh window when the previous one has expired.
         if let Some(start) = l.window_start {
-            if now.saturating_duration_since(start) > self.cfg.lockout_window_ms_duration()
+            if now.saturating_duration_since(start) > cfg.lockout_window_ms_duration()
                 && l.locked_until.is_none_or(|u| u <= now)
             {
                 l.failures = 0;
@@ -594,33 +632,45 @@ impl AuthState {
         if l.window_start.is_none() {
             l.window_start = Some(now);
         }
-        l.failures += 1;
-        if l.failures >= self.cfg.max_failed_attempts {
-            l.locked_until = Some(now + self.cfg.lockout_duration_ms_duration());
-            tracing::warn!(event = "auth_locked", user = %key);
+        l.failures = l.failures.saturating_add(1);
+        if l.failures >= cfg.max_failed_attempts {
+            l.locked_until = Some(now + cfg.lockout_duration_ms_duration());
+            tracing::warn!(event = "auth_locked", user = %key.0, client = %key.1);
         }
     }
 
-    fn clear_failures(&self, key: &str) {
+    fn clear_failures(&self, key: &LockKey) {
         self.lockouts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
     }
 
-    /// Look up a live session by token; expired tokens are dropped.
+    fn idle_timeout(&self) -> Option<Duration> {
+        (self.cfg.session_idle_timeout_ms > 0)
+            .then(|| Duration::from_millis(self.cfg.session_idle_timeout_ms))
+    }
+
+    /// Look up a live session by token. A session is rejected (and dropped)
+    /// once its absolute lifetime has elapsed or, when an idle timeout is
+    /// configured, once it has gone unused for that long. A successful lookup
+    /// counts as activity and refreshes the idle clock.
     pub fn session(&self, token: &str) -> Option<Session> {
+        let now = Instant::now();
+        let idle = self.idle_timeout();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let expired = sessions
+        let dead = sessions
             .map
             .get(token)
-            .map(|s| s.expires <= Instant::now())
+            .map(|s| s.is_dead(now, idle))
             .unwrap_or(false);
-        if expired {
+        if dead {
             sessions.map.remove(token);
             return None;
         }
-        sessions.map.get(token).cloned()
+        let s = sessions.map.get_mut(token)?;
+        s.last_seen = now;
+        Some(s.clone())
     }
 
     /// Invalidate a session (logout). Idempotent.
@@ -632,7 +682,7 @@ impl AuthState {
             .remove(token);
     }
 
-    /// Drop every session (not used in normal operation; test helper).
+    /// Drop every session (password rotation, administrative revocation).
     pub fn logout_all(&self) {
         self.sessions
             .lock()
@@ -641,34 +691,119 @@ impl AuthState {
             .clear();
     }
 
+    /// Revoke every session except `keep` (the caller's own). Returns the
+    /// number of sessions revoked.
+    pub fn revoke_all_except(&self, keep: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let before = sessions.map.len();
+        sessions.map.retain(|t, _| t == keep);
+        before - sessions.map.len()
+    }
+
+    /// Revoke every session belonging to `username` (case-insensitive).
+    /// Returns the number of sessions revoked.
+    pub fn revoke_user(&self, username: &str) -> usize {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let before = sessions.map.len();
+        sessions
+            .map
+            .retain(|_, s| !s.username.eq_ignore_ascii_case(username));
+        before - sessions.map.len()
+    }
+
+    /// Number of live (not expired, not idle) sessions.
     pub fn session_count(&self) -> usize {
+        let now = Instant::now();
+        let idle = self.idle_timeout();
         self.sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .map
-            .len()
+            .values()
+            .filter(|s| !s.is_dead(now, idle))
+            .count()
     }
 
     pub fn config(&self) -> &AuthConfig {
         &self.cfg
     }
 
-    /// Test-only: record a failed login without running argon2 (keeps the
-    /// lockout-table bound test fast).
+    /// Test-only: pretend `age` has elapsed for every lockout entry.
     #[cfg(test)]
-    pub(crate) fn record_failure_for_test(&self, key: &str) {
-        self.record_failure(key);
+    pub(crate) fn age_lockouts_for_test(&self, age: Duration) {
+        let back = |t: Instant| t.checked_sub(age).unwrap_or(t);
+        for l in self
+            .lockouts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            l.window_start = l.window_start.map(back);
+            l.locked_until = l.locked_until.map(back);
+        }
+    }
+
+    /// Test-only: pretend `token`'s session was last used `age` ago.
+    #[cfg(test)]
+    pub(crate) fn age_session_for_test(&self, token: &str, age: Duration) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .get_mut(token)
+        {
+            s.last_seen = s.last_seen.checked_sub(age).unwrap_or(s.last_seen);
+        }
+    }
+
+    /// Test-only: count a failed login for (`user`, `ip`) without running
+    /// argon2 (keeps the lockout-table bound tests fast).
+    #[cfg(test)]
+    pub(crate) fn record_failure_for_test(&self, user: &str, ip: IpAddr) {
+        let key: LockKey = (user.to_lowercase(), canonical_ip(ip));
+        let mut l = self.lockouts.lock().unwrap_or_else(|e| e.into_inner());
+        Self::count_failure(&mut l, &key, &self.cfg, Instant::now());
+    }
+}
+
+impl Session {
+    fn is_dead(&self, now: Instant, idle: Option<Duration>) -> bool {
+        self.expires <= now
+            || idle.is_some_and(|i| now.saturating_duration_since(self.last_seen) >= i)
     }
 }
 
 impl SessionTable {
-    fn insert(&mut self, token: String, session: Session) {
+    /// Insert a session, keeping the table bounded without letting one
+    /// account crowd out the others:
+    ///
+    /// 1. dead (expired/idle) sessions are pruned;
+    /// 2. an account at `MAX_SESSIONS_PER_USER` loses its own oldest session;
+    /// 3. at the global `MAX_SESSIONS` cap the oldest session overall goes.
+    fn insert(&mut self, token: String, session: Session, idle: Option<Duration>) {
+        let now = Instant::now();
+        self.map.retain(|_, s| !s.is_dead(now, idle));
+        let same_user: Vec<(&String, Instant)> = self
+            .map
+            .iter()
+            .filter(|(_, s)| s.username.eq_ignore_ascii_case(&session.username))
+            .map(|(t, s)| (t, s.created))
+            .collect();
+        if same_user.len() >= MAX_SESSIONS_PER_USER {
+            if let Some(victim) = same_user
+                .iter()
+                .min_by_key(|(_, c)| *c)
+                .map(|(t, _)| (*t).clone())
+            {
+                self.map.remove(&victim);
+            }
+        }
         if self.map.len() >= MAX_SESSIONS {
-            // Evict the session that expires soonest (≈ oldest).
             if let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, s)| s.expires)
+                .min_by_key(|(_, s)| s.created)
                 .map(|(t, _)| t.clone())
             {
                 self.map.remove(&oldest);
@@ -676,14 +811,8 @@ impl SessionTable {
         }
         self.map.insert(token, session);
     }
-
-    fn prune_expired(&mut self) {
-        let now = Instant::now();
-        self.map.retain(|_, s| s.expires > now);
-    }
 }
 
-/// Argon2id hash with an auto-generated random salt (PHC string output).
 fn hash_password(password: &str) -> String {
     Argon2::default()
         .hash_password(password.as_bytes())
@@ -742,6 +871,23 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Temp directory removed on drop (also on panic).
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("res-{tag}-{}", random_token()));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+
     fn cfg() -> AuthConfig {
         AuthConfig::default()
     }
@@ -750,7 +896,7 @@ mod tests {
     fn disabled_without_passwords() {
         let auth = AuthState::from_passwords(cfg(), None, None);
         assert!(!auth.enabled());
-        assert!(auth.login("admin", "x").is_err());
+        assert!(auth.login("admin", "x", IP).is_err());
     }
 
     #[test]
@@ -761,7 +907,7 @@ mod tests {
             Some("battery staple".into()),
         );
         assert!(auth.enabled());
-        let (token, session) = auth.login("admin", "correct horse").expect("login");
+        let (token, session) = auth.login("admin", "correct horse", IP).expect("login");
         assert_eq!(session.role, Role::Admin);
         assert_eq!(session.username, "admin");
         assert!(!session.csrf.is_empty());
@@ -769,15 +915,15 @@ mod tests {
         assert_eq!(got.role, Role::Admin);
 
         let (_, viewer) = auth
-            .login("viewer", "battery staple")
+            .login("viewer", "battery staple", IP)
             .expect("viewer login");
         assert_eq!(viewer.role, Role::Viewer);
 
-        assert!(auth.login("admin", "wrong").is_err());
-        assert!(auth.login("nobody", "correct horse").is_err());
+        assert!(auth.login("admin", "wrong", IP).is_err());
+        assert!(auth.login("nobody", "correct horse", IP).is_err());
         // Unknown user and wrong password share the error variant.
         assert!(matches!(
-            auth.login("nobody", "x"),
+            auth.login("nobody", "x", IP),
             Err(LoginError::InvalidCredentials)
         ));
     }
@@ -785,7 +931,7 @@ mod tests {
     #[test]
     fn logout_invalidates_session() {
         let auth = AuthState::from_passwords(cfg(), Some("pw".into()), None);
-        let (token, _) = auth.login("admin", "pw").unwrap();
+        let (token, _) = auth.login("admin", "pw", IP).unwrap();
         assert!(auth.session(&token).is_some());
         auth.logout(&token);
         assert!(auth.session(&token).is_none());
@@ -800,13 +946,13 @@ mod tests {
         let auth = AuthState::from_passwords(c, Some("pw".into()), None);
         for _ in 0..3 {
             assert!(matches!(
-                auth.login("admin", "bad"),
+                auth.login("admin", "bad", IP),
                 Err(LoginError::InvalidCredentials)
             ));
         }
         // Locked even with the correct password.
         assert!(matches!(
-            auth.login("admin", "pw"),
+            auth.login("admin", "pw", IP),
             Err(LoginError::Locked { .. })
         ));
     }
@@ -814,7 +960,7 @@ mod tests {
     #[test]
     fn case_insensitive_usernames() {
         let auth = AuthState::from_passwords(cfg(), Some("pw".into()), None);
-        let (_, s) = auth.login("ADMIN", "pw").unwrap();
+        let (_, s) = auth.login("ADMIN", "pw", IP).unwrap();
         assert_eq!(s.role, Role::Admin);
     }
 
@@ -828,7 +974,7 @@ mod tests {
         let loaded = AuthState::load_credentials_file(cfg(), &cfg_path).unwrap();
         assert!(loaded.enabled());
         assert!(loaded.viewer_enabled());
-        let (_, s) = loaded.login("admin", "s3cret").unwrap();
+        let (_, s) = loaded.login("admin", "s3cret", IP).unwrap();
         assert_eq!(s.role, Role::Admin);
         // Path is res.credentials next to res.toml.
         assert!(AuthState::credentials_path(&cfg_path)
@@ -853,17 +999,16 @@ mod tests {
         let auth = AuthState::from_passwords(c, Some("pw".into()), None);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..3 {
-            auth.check_login_rate(ip).expect("within limit");
-            auth.record_login_attempt(ip);
+            auth.begin_login_attempt(ip).expect("within limit");
         }
         // 4th attempt is rate-limited.
-        assert!(auth.check_login_rate(ip).is_err());
+        assert!(auth.begin_login_attempt(ip).is_err());
         // A different IP is unaffected.
         let other: IpAddr = "10.0.0.2".parse().unwrap();
-        assert!(auth.check_login_rate(other).is_ok());
+        assert!(auth.begin_login_attempt(other).is_ok());
         // Successful login clears the counter for that IP.
         auth.clear_login_rate(ip);
-        assert!(auth.check_login_rate(ip).is_ok());
+        assert!(auth.begin_login_attempt(ip).is_ok());
     }
 
     #[test]
@@ -873,35 +1018,46 @@ mod tests {
         let auth = AuthState::from_passwords(c, Some("pw".into()), None);
         let ip: IpAddr = "10.0.0.9".parse().unwrap();
         for _ in 0..100 {
-            auth.check_login_rate(ip).expect("disabled");
-            auth.record_login_attempt(ip);
+            auth.begin_login_attempt(ip).expect("disabled");
         }
     }
 
     #[test]
     fn rotate_admin_password_invalidates_old() {
         let auth = AuthState::from_passwords(cfg(), Some("old".into()), None);
-        assert!(auth.login("admin", "old").is_ok());
+        assert!(auth.login("admin", "old", IP).is_ok());
         assert!(auth.rotate_admin_password("new-secret"));
         // Old password no longer works.
         assert!(matches!(
-            auth.login("admin", "old"),
+            auth.login("admin", "old", IP),
             Err(LoginError::InvalidCredentials)
         ));
         // New password works.
-        let (_, s) = auth.login("admin", "new-secret").unwrap();
+        let (_, s) = auth.login("admin", "new-secret", IP).unwrap();
         assert_eq!(s.role, Role::Admin);
     }
 
     #[test]
     fn set_admin_password_persist_first_preserves_on_failure() {
         let auth = AuthState::from_passwords(cfg(), Some("old".into()), None);
-        assert!(auth.login("admin", "old").is_ok());
-        let result = auth.set_admin_password(Path::new("/proc/1/root/etc/res"), "new");
-        assert!(result.is_err(), "writing to /proc/1/root/ should fail");
-        assert!(auth.login("admin", "old").is_ok());
+        assert!(auth.login("admin", "old", IP).is_ok());
+        // Deterministic for every user (including root): the parent directory
+        // of the config path does not exist, so the credential file cannot be
+        // created. Nothing is ever written outside the temp directory.
+        let dir = TempDir::new("auth-persist-fail");
+        let missing = dir.0.join("no-such-subdir").join("res.toml");
+        let result = auth.set_admin_password(&missing, "new");
+        assert!(
+            result.is_err(),
+            "persisting into a missing directory must fail"
+        );
+        assert!(
+            !missing.parent().unwrap().exists(),
+            "failed write must not create directories"
+        );
+        assert!(auth.login("admin", "old", IP).is_ok());
         assert!(matches!(
-            auth.login("admin", "new"),
+            auth.login("admin", "new", IP),
             Err(LoginError::InvalidCredentials)
         ));
     }
@@ -910,7 +1066,7 @@ mod tests {
     fn set_admin_password_persist_first_succeeds() {
         use std::env::temp_dir;
         let auth = AuthState::from_passwords(cfg(), Some("old".into()), None);
-        assert!(auth.login("admin", "old").is_ok());
+        assert!(auth.login("admin", "old", IP).is_ok());
         let dir = temp_dir().join(format!("res_auth_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = dir.join("res.toml");
@@ -922,10 +1078,10 @@ mod tests {
             result
         );
         assert!(matches!(
-            auth.login("admin", "old"),
+            auth.login("admin", "old", IP),
             Err(LoginError::InvalidCredentials)
         ));
-        assert!(auth.login("admin", "new-secret").is_ok());
+        assert!(auth.login("admin", "new-secret", IP).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -933,13 +1089,13 @@ mod tests {
     fn rotate_viewer_password_invalidates_old() {
         let auth =
             AuthState::from_passwords(cfg(), Some("admin-pw".into()), Some("view-old".into()));
-        assert!(auth.login("viewer", "view-old").is_ok());
+        assert!(auth.login("viewer", "view-old", IP).is_ok());
         assert!(auth.rotate_viewer_password("view-new"));
         assert!(matches!(
-            auth.login("viewer", "view-old"),
+            auth.login("viewer", "view-old", IP),
             Err(LoginError::InvalidCredentials)
         ));
-        let (_, s) = auth.login("viewer", "view-new").unwrap();
+        let (_, s) = auth.login("viewer", "view-new", IP).unwrap();
         assert_eq!(s.role, Role::Viewer);
     }
 
@@ -959,7 +1115,7 @@ mod tests {
         // Insert more than MAX_LOCKOUTS distinct usernames via failed logins
         // (test helper skips argon2 so this stays fast).
         for i in 0..(MAX_LOCKOUTS + 50) {
-            auth.record_failure_for_test(&format!("user{i}"));
+            auth.record_failure_for_test(&format!("user{i}"), IP);
         }
         let n = auth
             .lockouts
@@ -979,5 +1135,311 @@ mod tests {
         c.secure_cookies = true;
         let auth = AuthState::from_passwords(c, Some("pw".into()), None);
         assert!(auth.secure_cookies());
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn lock_cfg(max: u32) -> AuthConfig {
+        let mut c = cfg();
+        c.max_failed_attempts = max;
+        c
+    }
+
+    fn fail(auth: &AuthState, user: &str, from: IpAddr, n: u32) {
+        for _ in 0..n {
+            assert!(matches!(
+                auth.login(user, "wrong", from),
+                Err(LoginError::InvalidCredentials)
+            ));
+        }
+    }
+
+    #[test]
+    fn lockout_is_per_ip_not_global() {
+        let auth = AuthState::from_passwords(lock_cfg(3), Some("pw".into()), None);
+        let attacker = ip("203.0.113.66");
+        let admin = ip("198.51.100.10");
+        fail(&auth, "admin", attacker, 3);
+        // The attacker's address is locked out, even with the right password.
+        assert!(matches!(
+            auth.login("admin", "pw", attacker),
+            Err(LoginError::Locked { .. })
+        ));
+        // The administrator on another address is unaffected.
+        assert!(auth.login("admin", "pw", admin).is_ok());
+    }
+
+    #[test]
+    fn same_ip_repeated_failures_lock_that_pair() {
+        let auth =
+            AuthState::from_passwords(lock_cfg(2), Some("pw".into()), Some("vw-pass".into()));
+        let a = ip("192.0.2.1");
+        fail(&auth, "admin", a, 2);
+        assert!(matches!(
+            auth.login("admin", "pw", a),
+            Err(LoginError::Locked { .. })
+        ));
+        // Lockout is per account too: the viewer from the same address is a
+        // different key and still gets its own attempts.
+        assert!(auth.login("viewer", "vw-pass", a).is_ok());
+    }
+
+    #[test]
+    fn correct_login_after_failures_from_another_ip() {
+        let auth = AuthState::from_passwords(lock_cfg(3), Some("pw".into()), None);
+        fail(&auth, "admin", ip("203.0.113.1"), 2);
+        fail(&auth, "admin", ip("203.0.113.2"), 2);
+        assert!(auth.login("admin", "pw", ip("198.51.100.5")).is_ok());
+    }
+
+    #[test]
+    fn success_clears_the_pair_counter() {
+        let auth = AuthState::from_passwords(lock_cfg(3), Some("pw".into()), None);
+        let a = ip("192.0.2.7");
+        fail(&auth, "admin", a, 2);
+        assert!(auth.login("admin", "pw", a).is_ok());
+        // Counter was reset: two more failures do not lock.
+        fail(&auth, "admin", a, 2);
+        assert!(auth.login("admin", "pw", a).is_ok());
+    }
+
+    #[test]
+    fn lockout_expires_and_recovers() {
+        let auth = AuthState::from_passwords(lock_cfg(2), Some("pw".into()), None);
+        let a = ip("192.0.2.9");
+        fail(&auth, "admin", a, 2);
+        assert!(matches!(
+            auth.login("admin", "pw", a),
+            Err(LoginError::Locked { .. })
+        ));
+        // Default lockout is 15 minutes: still locked after 14, free after 16.
+        auth.age_lockouts_for_test(Duration::from_secs(14 * 60));
+        assert!(matches!(
+            auth.login("admin", "pw", a),
+            Err(LoginError::Locked { .. })
+        ));
+        auth.age_lockouts_for_test(Duration::from_secs(2 * 60));
+        assert!(auth.login("admin", "pw", a).is_ok());
+    }
+
+    #[test]
+    fn failure_window_expiry_resets_the_counter() {
+        let auth = AuthState::from_passwords(lock_cfg(3), Some("pw".into()), None);
+        let a = ip("192.0.2.11");
+        fail(&auth, "admin", a, 2);
+        auth.age_lockouts_for_test(Duration::from_secs(16 * 60)); // window is 15 min
+        fail(&auth, "admin", a, 2); // would be the 4th failure without the reset
+        assert!(auth.login("admin", "pw", a).is_ok());
+    }
+
+    #[test]
+    fn mapped_ipv6_shares_the_ipv4_lock() {
+        let auth = AuthState::from_passwords(lock_cfg(2), Some("pw".into()), None);
+        fail(&auth, "admin", ip("192.0.2.33"), 2);
+        assert!(matches!(
+            auth.login("admin", "pw", ip("::ffff:192.0.2.33")),
+            Err(LoginError::Locked { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_guesses_cannot_exceed_the_failure_budget() {
+        // 16 parallel wrong guesses against a budget of 3: the reservation is
+        // taken before argon2 runs, so at most 3 may ever be evaluated.
+        let auth = std::sync::Arc::new(AuthState::from_passwords(
+            lock_cfg(3),
+            Some("pw".into()),
+            None,
+        ));
+        let a = ip("192.0.2.50");
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let auth = auth.clone();
+                std::thread::spawn(move || auth.login("admin", "wrong", a))
+            })
+            .collect();
+        let (mut invalid, mut locked) = (0, 0);
+        for h in handles {
+            match h.join().unwrap() {
+                Err(LoginError::InvalidCredentials) => invalid += 1,
+                Err(LoginError::Locked { .. }) => locked += 1,
+                Ok(_) => panic!("wrong password must never succeed"),
+            }
+        }
+        assert_eq!(
+            invalid, 3,
+            "only the budgeted guesses may reach verification"
+        );
+        assert_eq!(locked, 13);
+        assert!(matches!(
+            auth.login("admin", "pw", a),
+            Err(LoginError::Locked { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_rate_limit_is_exact() {
+        let mut c = cfg();
+        c.login_rate_limit_per_minute = 5;
+        let auth = std::sync::Arc::new(AuthState::from_passwords(c, Some("pw".into()), None));
+        let a = ip("192.0.2.60");
+        let handles: Vec<_> = (0..40)
+            .map(|_| {
+                let auth = auth.clone();
+                std::thread::spawn(move || auth.begin_login_attempt(a).is_ok())
+            })
+            .collect();
+        let allowed = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(allowed, 5);
+    }
+
+    #[test]
+    fn eviction_never_drops_active_locks_while_cheaper_victims_exist() {
+        let auth = AuthState::from_passwords(lock_cfg(1), Some("pw".into()), None);
+        let victim = ip("192.0.2.100");
+        // A real lock for the administrator's own pair.
+        auth.record_failure_for_test("admin", victim);
+        assert!(matches!(
+            auth.login("admin", "pw", victim),
+            Err(LoginError::Locked { .. })
+        ));
+        // Flood with distinct keys: with max=1 each of these is also "locked",
+        // so relax: use a config where flood entries are merely counted.
+        let mut c = cfg();
+        c.max_failed_attempts = 2;
+        let auth2 = AuthState::from_passwords(c, Some("pw".into()), None);
+        auth2.record_failure_for_test("admin", victim);
+        auth2.record_failure_for_test("admin", victim); // locked
+        for i in 0..(MAX_LOCKOUTS + 200) {
+            let a = IpAddr::V4(std::net::Ipv4Addr::from(0xC000_0000u32 + i as u32));
+            auth2.record_failure_for_test("flood", a);
+        }
+        let n = auth2.lockouts.lock().unwrap().len();
+        assert!(n <= MAX_LOCKOUTS, "table bounded, got {n}");
+        assert!(
+            matches!(
+                auth2.login("admin", "pw", victim),
+                Err(LoginError::Locked { .. })
+            ),
+            "the active lock must survive a flood of unlocked entries"
+        );
+    }
+
+    #[test]
+    fn lockout_table_capacity_with_all_locked_entries_stays_bounded() {
+        let auth = AuthState::from_passwords(lock_cfg(1), Some("pw".into()), None);
+        for i in 0..(MAX_LOCKOUTS + 100) {
+            let a = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000u32 + i as u32));
+            auth.record_failure_for_test("x", a);
+        }
+        assert!(auth.lockouts.lock().unwrap().len() <= MAX_LOCKOUTS);
+    }
+
+    #[test]
+    fn clear_login_rate_canonicalizes_addresses() {
+        let mut c = cfg();
+        c.login_rate_limit_per_minute = 1;
+        let auth = AuthState::from_passwords(c, Some("pw".into()), None);
+        for (spent, clear) in [
+            ("192.0.2.1", "192.0.2.1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("192.0.2.2", "::ffff:192.0.2.2"),
+            ("::ffff:192.0.2.3", "192.0.2.3"),
+        ] {
+            let (spent, clear) = (ip(spent), ip(clear));
+            auth.begin_login_attempt(spent).expect("first attempt");
+            assert!(
+                auth.begin_login_attempt(spent).is_err(),
+                "limit reached for {spent}"
+            );
+            auth.clear_login_rate(clear);
+            assert!(
+                auth.begin_login_attempt(spent).is_ok(),
+                "clearing {clear} must reset the counter of {spent}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_sessions_expire_and_activity_refreshes() {
+        let auth = AuthState::from_passwords(cfg(), Some("pw".into()), None); // idle = 30 min
+        let (active, _) = auth.login("admin", "pw", IP).unwrap();
+        let (idle, _) = auth.login("admin", "pw", IP).unwrap();
+        auth.age_session_for_test(&active, Duration::from_secs(20 * 60));
+        auth.age_session_for_test(&idle, Duration::from_secs(31 * 60));
+        assert!(
+            auth.session(&active).is_some(),
+            "20 min idle is within the timeout"
+        );
+        // The lookup above counted as activity: it survives another 20 min.
+        auth.age_session_for_test(&active, Duration::from_secs(20 * 60));
+        assert!(
+            auth.session(&active).is_some(),
+            "activity refreshes the idle clock"
+        );
+        assert!(
+            auth.session(&idle).is_none(),
+            "unused session must be idle-expired"
+        );
+        assert_eq!(auth.session_count(), 1);
+    }
+
+    #[test]
+    fn idle_timeout_zero_disables() {
+        let mut c = cfg();
+        c.session_idle_timeout_ms = 0;
+        let auth = AuthState::from_passwords(c, Some("pw".into()), None);
+        let (t, _) = auth.login("admin", "pw", IP).unwrap();
+        auth.age_session_for_test(&t, Duration::from_secs(10 * 60 * 60));
+        assert!(auth.session(&t).is_some());
+    }
+
+    #[test]
+    fn revoke_all_except_keeps_only_the_callers_session() {
+        let auth = AuthState::from_passwords(cfg(), Some("pw".into()), Some("vw-pass".into()));
+        let (keep, _) = auth.login("admin", "pw", IP).unwrap();
+        let (other, _) = auth.login("admin", "pw", IP).unwrap();
+        let (viewer, _) = auth.login("viewer", "vw-pass", IP).unwrap();
+        assert_eq!(auth.revoke_all_except(&keep), 2);
+        assert!(auth.session(&keep).is_some());
+        assert!(auth.session(&other).is_none());
+        assert!(auth.session(&viewer).is_none());
+    }
+
+    #[test]
+    fn revoke_user_only_touches_that_account() {
+        let auth = AuthState::from_passwords(cfg(), Some("pw".into()), Some("vw-pass".into()));
+        let (admin, _) = auth.login("admin", "pw", IP).unwrap();
+        let (viewer, _) = auth.login("viewer", "vw-pass", IP).unwrap();
+        assert_eq!(auth.revoke_user("VIEWER"), 1);
+        assert!(auth.session(&viewer).is_none());
+        assert!(auth.session(&admin).is_some());
+    }
+
+    #[test]
+    fn per_user_session_cap_evicts_own_oldest_only() {
+        let auth = AuthState::from_passwords(cfg(), Some("pw".into()), Some("vw-pass".into()));
+        let (viewer, _) = auth.login("viewer", "vw-pass", IP).unwrap();
+        let mut admin_tokens = Vec::new();
+        for _ in 0..(MAX_SESSIONS_PER_USER + 3) {
+            let (t, _) = auth.login("admin", "pw", IP).unwrap();
+            admin_tokens.push(t);
+        }
+        assert!(
+            auth.session(&viewer).is_some(),
+            "other accounts keep their session"
+        );
+        assert!(
+            auth.session(&admin_tokens[0]).is_none(),
+            "oldest admin session evicted"
+        );
+        assert!(auth.session(admin_tokens.last().unwrap()).is_some());
+        assert_eq!(auth.session_count(), MAX_SESSIONS_PER_USER + 1);
     }
 }

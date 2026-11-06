@@ -182,6 +182,45 @@ impl Default for UpstreamConfig {
     }
 }
 
+/// Characters allowed in an upstream name besides letters and digits.
+const UPSTREAM_NAME_PUNCT: &str = " _-.:@+/()[]#,=~";
+
+/// Server-side upstream-name policy.
+///
+/// Names are shown in the dashboard, used as Prometheus label values, in
+/// audit events and in URLs, so they must be plain text: Unicode letters and
+/// digits plus a conservative punctuation set (`space _ - . : @ + / ( ) [ ] # , = ~`),
+/// no leading/trailing whitespace and no consecutive spaces. Control
+/// characters and markup/escaping characters (`< > & " ' \` backtick, `\`,
+/// `%`, `;`, `{ }`, `$`, `|`) are rejected. The dashboard still HTML-escapes
+/// every name (defence in depth).
+pub fn validate_upstream_name(name: &str) -> Result<(), String> {
+    if name.trim() != name {
+        return Err(format!(
+            "upstream name '{}' must not start or end with whitespace",
+            name.escape_debug()
+        ));
+    }
+    if name.contains("  ") {
+        return Err(format!(
+            "upstream name '{}' must not contain consecutive spaces",
+            name.escape_debug()
+        ));
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || UPSTREAM_NAME_PUNCT.contains(*c)))
+    {
+        return Err(format!(
+            "upstream name '{}' contains the unsupported character '{}'; allowed: letters, digits and {:?}",
+            name.escape_debug(),
+            c.escape_debug(),
+            UPSTREAM_NAME_PUNCT
+        ));
+    }
+    Ok(())
+}
+
 impl UpstreamConfig {
     pub fn timeout(&self, fallback_ms: u64) -> Duration {
         Duration::from_millis(self.timeout_ms.unwrap_or(fallback_ms))
@@ -198,6 +237,7 @@ impl UpstreamConfig {
                 self.name
             ));
         }
+        validate_upstream_name(&self.name)?;
         if self.port == 0 {
             return Err(format!("upstream '{}' has port 0", self.name));
         }
@@ -467,7 +507,12 @@ pub struct AuthConfig {
     /// Session lifetime; expired sessions are rejected and dropped.
     #[serde(rename = "session_ttl", with = "duration_ms")]
     pub session_ttl_ms: u64,
-    /// Failed logins per account within `lockout_window` before lockout.
+    /// Sessions unused for this long are rejected and dropped (0 disables the
+    /// idle timeout). Dashboard polling counts as activity, so an open
+    /// dashboard tab keeps its session alive until `session_ttl`.
+    #[serde(rename = "session_idle_timeout", with = "duration_ms")]
+    pub session_idle_timeout_ms: u64,
+    /// Failed logins per (account, client IP) pair within `lockout_window` before lockout.
     pub max_failed_attempts: u32,
     /// Sliding window over which failures are counted.
     #[serde(rename = "lockout_window", with = "duration_ms")]
@@ -508,6 +553,7 @@ impl Default for AuthConfig {
             username: "admin".into(),
             viewer_username: "viewer".into(),
             session_ttl_ms: 12 * 60 * 60 * 1000,
+            session_idle_timeout_ms: 30 * 60 * 1000,
             max_failed_attempts: 5,
             lockout_window_ms: 15 * 60 * 1000,
             lockout_duration_ms: 15 * 60 * 1000,
@@ -582,6 +628,16 @@ pub struct ServerConfig {
     /// PEM private key matching `tls_cert`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<PathBuf>,
+    /// Reverse proxies (CIDRs) whose `X-Forwarded-For` header the control
+    /// plane may trust. Empty (default) means forwarded headers are never
+    /// consulted and the socket peer is always the client. When the direct
+    /// peer is inside one of these networks, the client address is the
+    /// right-most `X-Forwarded-For` entry that is *not* itself a trusted
+    /// proxy; entries to its left are attacker-controlled and ignored. Only
+    /// affects the HTTP control plane (login rate limit/lockout, audit
+    /// labels), never DNS ACLs or DNS rate limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Default for ServerConfig {
@@ -607,6 +663,7 @@ impl Default for ServerConfig {
             api_token: String::new(),
             tls_cert: None,
             tls_key: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -1344,6 +1401,18 @@ impl AppConfig {
                 self.query.max_attempts, self.query.upstream_timeout_ms, self.query.timeout_ms
             ));
         }
+        if self
+            .server
+            .trusted_proxies
+            .iter()
+            .any(|n| n.prefix_len() == 0)
+        {
+            out.push(
+                "server.trusted_proxies contains a /0 network: every client may spoof its \
+                 address through X-Forwarded-For"
+                    .into(),
+            );
+        }
         let open = self.acl.effective_entries().iter().any(|e| {
             e.action == crate::acl::AclAction::Allow
                 && crate::acl::normalize_cidr(&e.cidr)
@@ -1434,18 +1503,57 @@ impl AppConfig {
 
     /// Serialize back to the TOML file format (used for persistence and
     /// export). Contains every functional secret, including the proxy
-    /// password; API exports must use [`AppConfig::to_toml_redacted`].
+    /// password and API token; API exports must use [`AppConfig::to_toml_redacted`].
     pub fn to_toml(&self) -> Result<String, String> {
         toml::to_string_pretty(self).map_err(|e| format!("serialize error: {e}"))
     }
 
-    /// Serialize for human-facing export with credentials removed. Proxy
-    /// authentication is not usable after re-import until the password is
-    /// supplied again; the dashboard reports `password_set` separately.
+    /// Serialize for human-facing export with every secret removed (the proxy
+    /// password and the control-plane bearer token). Importing such an export
+    /// does not lose them: see [`AppConfig::merge_import_secrets`].
     pub fn to_toml_redacted(&self) -> Result<String, String> {
         let mut redacted = self.clone();
         redacted.proxy.password.clear();
+        redacted.server.api_token.clear();
         redacted.to_toml()
+    }
+
+    /// Carry secrets over from the running configuration into an imported one.
+    ///
+    /// Exports never contain secrets, so an import that omits one (empty
+    /// value) must not silently erase the live value:
+    ///
+    /// * `proxy.password` is kept when the imported `proxy.username` is
+    ///   unchanged. If the username changed the old password belongs to a
+    ///   different account and is dropped rather than sent to it.
+    /// * `server.api_token` is kept when the import carries none.
+    ///
+    /// A non-empty value in the import is an explicit replacement and always
+    /// wins. `clear` lists secrets the operator explicitly wants removed; those
+    /// are never carried over. Returns the names of the secrets that were
+    /// preserved (for the audit record and API response).
+    pub fn merge_import_secrets(
+        &mut self,
+        current: &AppConfig,
+        clear: &[SecretField],
+    ) -> Vec<&'static str> {
+        let mut kept = Vec::new();
+        if self.proxy.password.is_empty()
+            && !clear.contains(&SecretField::ProxyPassword)
+            && !current.proxy.password.is_empty()
+            && self.proxy.username == current.proxy.username
+        {
+            self.proxy.password = current.proxy.password.clone();
+            kept.push("proxy.password");
+        }
+        if self.server.api_token.is_empty()
+            && !clear.contains(&SecretField::ApiToken)
+            && !current.server.api_token.is_empty()
+        {
+            self.server.api_token = current.server.api_token.clone();
+            kept.push("server.api_token");
+        }
+        kept
     }
 
     /// Returns a copy with the given upstream list, validated.
@@ -1455,6 +1563,16 @@ impl AppConfig {
         next.validate()?;
         Ok(next)
     }
+}
+
+/// Secret-bearing configuration fields that an import may explicitly clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretField {
+    /// `proxy.password`
+    ProxyPassword,
+    /// `server.api_token`
+    ApiToken,
 }
 
 /// `<file>.backup` next to the primary configuration file.
@@ -1693,6 +1811,152 @@ mod tests {
         assert!(cfg.validate().unwrap_err().contains("rrl.max_tracked_keys"));
         cfg.rrl.max_tracked_keys = 65_536;
         cfg.validate().expect("valid RRL configuration");
+    }
+
+    #[test]
+    fn upstream_name_policy() {
+        for ok in [
+            "cloudflare-1",
+            "Google DNS (primary)",
+            "quad9_2.example.com",
+            "dot@10.0.0.1:853",
+            "résolveur-1",
+            "上游-1",
+            "a/b+c=d,e#f~g[1]",
+        ] {
+            assert!(validate_upstream_name(ok).is_ok(), "{ok} should be allowed");
+        }
+        for bad in [
+            "<b id=x>",
+            "a&b",
+            "say \"hi\"",
+            "it's",
+            "back`tick",
+            "back\\slash",
+            "per%cent",
+            "semi;colon",
+            "{brace}",
+            "dollar$",
+            "pipe|",
+            "tab\tname",
+            "new\nline",
+            "nul\0",
+            " leading",
+            "trailing ",
+            "two  spaces",
+            "emoji😀",
+        ] {
+            assert!(
+                validate_upstream_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_validate_applies_name_policy() {
+        let mut cfg = base();
+        cfg.upstreams[0].name = "<img src=x onerror=alert(1)>".into();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("unsupported character"));
+        cfg.upstreams[0].name = "ok-name".into();
+        cfg.validate().expect("valid name");
+    }
+
+    #[test]
+    fn shipped_config_names_remain_valid() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config/res.toml"))
+            .expect("shipped config");
+        let cfg = AppConfig::parse(&text).expect("shipped config still validates");
+        assert!(!cfg.upstreams.is_empty());
+    }
+
+    #[test]
+    fn merge_import_secrets_rules() {
+        let mut current = base();
+        current.proxy.username = "u".into();
+        current.proxy.password = "pw".into();
+        current.server.api_token = "tok".into();
+
+        // Omitted secrets are preserved.
+        let mut next = base();
+        next.proxy.username = "u".into();
+        let kept = next.merge_import_secrets(&current, &[]);
+        assert_eq!(next.proxy.password, "pw");
+        assert_eq!(next.server.api_token, "tok");
+        assert_eq!(kept, vec!["proxy.password", "server.api_token"]);
+
+        // Explicit replacements win.
+        let mut next = base();
+        next.proxy.username = "u".into();
+        next.proxy.password = "new".into();
+        next.server.api_token = "newtok".into();
+        assert!(next.merge_import_secrets(&current, &[]).is_empty());
+        assert_eq!(
+            (next.proxy.password.as_str(), next.server.api_token.as_str()),
+            ("new", "newtok")
+        );
+
+        // A different proxy username never inherits the old password.
+        let mut next = base();
+        next.proxy.username = "someone-else".into();
+        next.merge_import_secrets(&current, &[]);
+        assert_eq!(next.proxy.password, "");
+
+        // Explicit clear wins over preservation.
+        let mut next = base();
+        next.proxy.username = "u".into();
+        next.merge_import_secrets(
+            &current,
+            &[SecretField::ProxyPassword, SecretField::ApiToken],
+        );
+        assert_eq!(
+            (next.proxy.password.as_str(), next.server.api_token.as_str()),
+            ("", "")
+        );
+    }
+
+    #[test]
+    fn redacted_export_omits_all_secrets() {
+        let mut cfg = base();
+        cfg.proxy.username = "u".into();
+        cfg.proxy.password = "pw-secret".into();
+        cfg.server.api_token = "tok-secret".into();
+        let out = cfg.to_toml_redacted().unwrap();
+        assert!(
+            !out.contains("pw-secret") && !out.contains("tok-secret"),
+            "{out}"
+        );
+        let persisted = cfg.to_toml().unwrap();
+        assert!(persisted.contains("pw-secret") && persisted.contains("tok-secret"));
+    }
+
+    #[test]
+    fn trusted_proxies_roundtrip_and_warn_on_zero_prefix() {
+        let mut cfg = base();
+        cfg.server.trusted_proxies =
+            vec!["10.0.0.0/8".parse().unwrap(), "fd00::/8".parse().unwrap()];
+        let text = cfg.to_toml().unwrap();
+        let back = AppConfig::parse(&text).unwrap();
+        assert_eq!(back.server.trusted_proxies, cfg.server.trusted_proxies);
+        assert!(!back
+            .warnings()
+            .iter()
+            .any(|w| w.contains("trusted_proxies")));
+        cfg.server
+            .trusted_proxies
+            .push("0.0.0.0/0".parse().unwrap());
+        assert!(cfg.warnings().iter().any(|w| w.contains("trusted_proxies")));
+    }
+
+    #[test]
+    fn session_idle_timeout_defaults_and_parses() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.auth.session_idle_timeout_ms, 30 * 60 * 1000);
+        let parsed = AppConfig::parse("[auth]\nsession_idle_timeout = \"0\"\n[[upstreams]]\nname = \"x\"\naddress = \"1.1.1.1\"\n");
+        assert_eq!(parsed.unwrap().auth.session_idle_timeout_ms, 0);
     }
 
     #[test]

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Login lockout is per (account, client IP).** An anonymous attacker can no
+  longer lock the administrator out by failing five logins. The failure budget
+  is reserved atomically before password verification (concurrent guesses
+  cannot exceed it), the per-IP rate limit checks and counts atomically,
+  `clear_login_rate` canonicalizes IPv4-mapped IPv6, and table eviction drops
+  expired and unlocked entries before any active lock.
+- **Config export never contains secrets; import preserves them.** Both the
+  proxy password and `server.api_token` are omitted from exports for every role
+  (previously admins received the token). Importing an export no longer erases
+  the proxy password or token; use `clear_secrets` to remove one explicitly. A
+  changed proxy username never inherits the old password.
+- **`server.trusted_proxies`** (default empty): `X-Forwarded-For` is honoured
+  only from listed proxies and only for hops they appended; audit events record
+  the real socket peer as `peer`.
+- **Sessions:** idle timeout (`auth.session_idle_timeout`, default 30m),
+  per-account session cap, `DELETE /api/auth/sessions` revocation.
+- **Upstream names** are validated server-side (letters, digits and
+  ``space _ - . : @ + / ( ) [ ] # , = ~``; no markup or control characters).
+  Existing configs using other characters will be rejected at load.
+- **Dependencies:** `ctutils` 0.4.8 (RUSTSEC-2026-0385), `tokio` 1.53.3
+  (RUSTSEC-2026-0386), `yoke-derive` 0.8.4; unmaintained `rustls-pemfile`
+  removed in favour of `rustls::pki_types` PEM parsing.
+
 - **ACL deny always wins on every address form.** Client addresses are now
   canonicalized once at ingress (IPv4-mapped IPv6 `::ffff:a.b.c.d` → plain
   IPv4) and that same address is used for ACL evaluation, rate limiting, RRL
@@ -46,6 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enables it.
 
 ### Added
+
+- **Dashboard static assets** are served from memory with strong ETags
+  (`304`), gzip/Brotli, `no-cache` revalidation for HTML/CSS/JS and a one-day
+  max-age for fonts; changed files are picked up within a second. API and
+  metrics responses remain `no-store`.
+- **CI** (fmt, clippy, build, tests, MSRV 1.88, cargo audit, JS lint,
+  Playwright) and `tests/e2e/` browser smoke tests.
+- Dashboard: 44 px touch targets on narrow/touch devices; formatting helpers
+  moved to an ES module (`dashboard/js/format.js`).
+- `src/api` split into modules (auth, ACL, cache, config, policy, proxy,
+  upstreams, assets, client_ip).
 
 - **Responsive dashboard with light/dark themes.** The control plane follows
   the operating system color scheme by default and can be pinned to Auto,

@@ -206,6 +206,40 @@ credentials are available. Passwords are stored as argon2id hashes in
 binds the loopback by default; expose it only over HTTPS (which also forces
 `Secure` cookies) or a trusted reverse proxy.
 
+### Sessions, lockout and reverse proxies
+
+- **Session lifecycle.** Sessions are in-memory only and are **lost when the
+  process restarts** (operators sign in again; no database or session file is
+  written). A session ends at `auth.session_ttl` (default 12h) or after
+  `auth.session_idle_timeout` (default 30m, `0` disables) without any request;
+  an open dashboard polls the API, so it keeps its own session alive. Limits:
+  16 sessions per account (that account's oldest is replaced) and 1024 overall.
+  Rotating a password revokes every session; an admin can cut off all *other*
+  sessions with `DELETE /api/auth/sessions` (cookie requests need
+  `X-CSRF-Token`; bearer-token callers revoke all).
+- **Cookies/CSRF.** `res_session` is `HttpOnly; SameSite=Strict` (plus
+  `Secure` over HTTPS or with `secure_cookies`); mutations require the
+  double-submit `X-CSRF-Token`.
+- **Login lockout** is keyed by *(account, client IP)*: failed logins from one
+  address never lock the administrator out from another. The per-IP rate
+  limit (`login_rate_limit_per_minute`) still applies and the check-and-count
+  is atomic, so concurrent requests cannot exceed either budget.
+- **Reverse proxies.** By default the TCP peer is the client and
+  `X-Forwarded-For` is ignored. List your proxies in
+  `server.trusted_proxies = ["10.0.0.0/8", "fd00::/8"]` to trust the header
+  *only* from them; the right-most address that is not itself a trusted proxy
+  is used for login limits and audit labels (the socket peer is always
+  recorded too as `peer`). This never affects DNS ACLs or DNS rate limits.
+
+### Configuration export/import and secrets
+
+`GET /api/config` never contains secrets (the proxy password and
+`server.api_token` are omitted for every role). `PUT /api/config` keeps the
+running value of an omitted secret, replaces it when the imported TOML
+contains a new one, and drops the proxy password when `proxy.username`
+changes. Remove a secret explicitly with
+`{"toml": "...", "clear_secrets": ["proxy_password", "api_token"]}`.
+
 ## Local build
 
 The default configuration binds port 53, so running it directly requires root
@@ -228,10 +262,29 @@ Additional binaries:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo build --release
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo build --release --locked
+cargo audit            # needs cargo-audit
 ```
+
+The minimum supported Rust version is **1.88** (verified with
+`cargo +1.88.0 build --locked --all-targets`); the Docker build uses a newer
+toolchain. CI (`.github/workflows/ci.yml`) runs formatting, clippy, release
+build, unit and integration tests, an MSRV build, `cargo audit`, dashboard
+JavaScript checks and Playwright browser smoke tests.
+
+Dashboard checks (Node 22; dev tooling only, the dashboard has no build step):
+
+```bash
+cd tests/e2e && npm ci && npm run check && npm run lint
+# Browser smoke tests against an isolated gateway on unprivileged test ports:
+tests/e2e/start-gateway.sh target/release/res /tmp/res-e2e 15353 8099
+npx playwright install chromium && npx playwright test
+```
+
+Tests and helper scripts never bind DNS port 53: integration tests use
+ephemeral loopback ports and `start-gateway.sh` refuses port 53.
 
 Integration tests start in-process loopback upstreams and do not require
 external DNS access. The TLS fixtures under `tests/fixtures/tls/` are

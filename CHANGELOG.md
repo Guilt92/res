@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Dashboard redesign (compact enterprise layout, light and dark).** Full-height
+  205px sidebar (icon rail when collapsed, drawer below 981px, expandable
+  groups), 58px header with greeting/date, section search, a notification
+  popover fed by the live assessment, theme switch and account menu; four KPI
+  cards; a 65/35 analytics row (latency / query-rate lines with a range
+  selector, response-code donut); and a three-column widget row (pie with a
+  selectable breakdown, grouped bars, upstream list). Every chart and number
+  is drawn from the existing `/api/*` payloads; the remaining sections keep
+  their content and collapse behaviour and adopt the same card style.
+  Cache-hit and error-rate moved into the "Detailed metrics" disclosure.
+
 ### Security
 
 - **Login lockout is per (account, client IP).** An anonymous attacker can no

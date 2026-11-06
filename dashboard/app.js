@@ -66,6 +66,7 @@ function renderThemeSensitive(){
   renderKpis(); renderTraffic(); renderStatsBlocks();
   renderClientTable(); renderUpState(); renderFailovers();
   renderUpstreams(); renderEvents(); renderUpstreamMgr();
+  renderOverview();
   hydrateStyles(document);
 }
 function applyTheme(pref, persist){
@@ -335,52 +336,88 @@ function buildSections(){
     applySectionCollapsed(sec, collapsed.has(sec.id));
   }
 }
+const GROUP_ICON = {
+  "Traffic": "traffic", "Resolver": "upstreams", "Protection": "client-acl",
+};
+function navIconSvg(id){
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ' +
+    'focusable="false">' + (NAV_ICONS[id] || NAV_ICONS["dns-service"]) + '</svg>';
+}
+function navLink(sec, label, child){
+  const a = document.createElement("a");
+  a.className = "nav-link" + (child ? " nav-child" : "");
+  a.href = "#" + sec.id;
+  a.dataset.section = sec.id;
+  a.title = label;
+  const ico = document.createElement("span");
+  ico.className = "nav-ico";
+  ico.setAttribute("aria-hidden", "true");
+  ico.innerHTML = navIconSvg(sec.id);
+  const text = document.createElement("span");
+  text.className = "nav-text";
+  text.textContent = label;
+  a.appendChild(ico); a.appendChild(text);
+  return a;
+}
 function buildNav(){
   const links = $("sidenav-links");
-  let n = 0;
-  let group = null;
-  let wrap = null;
+  const groups = [];
   for (const sec of navSections()){
     const labelEl = sec.querySelector(".sec-title");
     const label = labelEl ? labelEl.textContent.trim() : sec.id;
-    const nextGroup = NAV_GROUP_OF[sec.id] || "Other";
-    if (nextGroup !== group){
-      group = nextGroup;
-      wrap = document.createElement("div");
-      wrap.className = "nav-group";
-      const title = document.createElement("div");
-      title.className = "nav-group-title";
-      title.textContent = group;
-      wrap.appendChild(title);
-      links.appendChild(wrap);
-    }
-    const a = document.createElement("a");
-    a.className = "nav-link";
-    a.href = "#" + sec.id;
-    a.dataset.section = sec.id;
-    const ico = document.createElement("span");
-    ico.className = "nav-ico";
-    ico.setAttribute("aria-hidden", "true");
-    ico.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-      'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ' +
-      'focusable="false">' + (NAV_ICONS[sec.id] || NAV_ICONS["dns-service"]) + '</svg>';
-    const text = document.createElement("span");
-    text.className = "nav-text";
-    text.textContent = label;
-    a.appendChild(ico); a.appendChild(text);
-    wrap.appendChild(a);
-    n++;
+    const name = NAV_GROUP_OF[sec.id] || "Other";
+    let g = groups[groups.length - 1];
+    if (!g || g.name !== name){ g = {name, items: []}; groups.push(g); }
+    g.items.push({sec, label});
   }
+  groups.forEach((g, gi) => {
+    if (g.items.length === 1){
+      // A group with one section is a plain link: no empty expander.
+      links.appendChild(navLink(g.items[0].sec, g.items[0].label, false));
+      return;
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "nav-group";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "nav-link nav-parent";
+    head.setAttribute("aria-expanded", "false");
+    head.setAttribute("aria-controls", "nav-grp-" + gi);
+    head.title = g.name;
+    head.innerHTML = '<span class="nav-ico" aria-hidden="true">' +
+      navIconSvg(GROUP_ICON[g.name] || g.items[0].sec.id) + '</span>' +
+      '<span class="nav-text"></span><span class="nav-chev" aria-hidden="true"></span>';
+    head.querySelector(".nav-text").textContent = g.name;
+    const kids = document.createElement("div");
+    kids.className = "nav-children";
+    kids.id = "nav-grp-" + gi;
+    for (const it of g.items) kids.appendChild(navLink(it.sec, it.label, true));
+    head.addEventListener("click", () => toggleNavGroup(wrap));
+    wrap.appendChild(head); wrap.appendChild(kids);
+    links.appendChild(wrap);
+  });
+}
+function toggleNavGroup(wrap, open){
+  const on = open == null ? !wrap.classList.contains("open") : open;
+  wrap.classList.toggle("open", on);
+  wrap.querySelector(".nav-parent").setAttribute("aria-expanded", String(on));
 }
 function navSections(){
   return Array.from(document.querySelectorAll("#content .panel-section"));
 }
 function setActiveSection(id){
-  for (const a of document.querySelectorAll("#sidenav-links .nav-link")){
+  for (const a of document.querySelectorAll("#sidenav-links a.nav-link")){
     const on = a.dataset.section === id;
     a.classList.toggle("active", on);
-    if (on) a.setAttribute("aria-current", "location");
-    else a.removeAttribute("aria-current");
+    if (on){
+      a.setAttribute("aria-current", "location");
+      const grp = a.closest(".nav-group");
+      if (grp){ toggleNavGroup(grp, true); }
+    } else a.removeAttribute("aria-current");
+  }
+  for (const g of document.querySelectorAll("#sidenav-links .nav-group")){
+    g.classList.toggle("has-active", !!g.querySelector("a.active"));
   }
 }
 let navFrame = null;
@@ -410,25 +447,27 @@ function syncHeaderHeight(){
 const NAV_COLLAPSE_KEY = "res-nav-collapsed";
 function applyNavCollapsed(collapsed, persist){
   document.body.classList.toggle("nav-collapsed", collapsed);
-  const closeBtn = $("side-collapse"), openBtn = $("side-reopen");
-  if (closeBtn) closeBtn.setAttribute("aria-expanded", String(!collapsed));
-  if (openBtn) openBtn.hidden = !collapsed;
+  const btn = $("side-collapse");
+  if (btn){
+    btn.setAttribute("aria-expanded", String(!collapsed));
+    const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+  }
   if (persist){
     try { localStorage.setItem(NAV_COLLAPSE_KEY, collapsed ? "1" : "0"); } catch(_) {}
   }
   requestAnimationFrame(() => drawAllCharts());
+  setTimeout(drawAllCharts, 220);
 }
 function initNavCollapsed(){
   let collapsed = false;
   try { collapsed = localStorage.getItem(NAV_COLLAPSE_KEY) === "1"; } catch(_) {}
   applyNavCollapsed(collapsed, false);
   $("side-collapse").addEventListener("click", () => {
-    applyNavCollapsed(true, true);
-    requestAnimationFrame(() => $("side-reopen").focus());
-  });
-  $("side-reopen").addEventListener("click", () => {
-    applyNavCollapsed(false, true);
-    requestAnimationFrame(() => $("side-collapse").focus());
+    // Inside the mobile drawer the same button simply closes it.
+    if (window.innerWidth <= 980){ closeSidebar(); return; }
+    applyNavCollapsed(!document.body.classList.contains("nav-collapsed"), true);
   });
 }
 function wireNavigation(){
@@ -446,7 +485,7 @@ function wireNavigation(){
       setActiveSection(id);
     }
   });
-  for (const a of document.querySelectorAll("#sidenav-links .nav-link")){
+  for (const a of document.querySelectorAll("#sidenav-links a.nav-link")){
     a.addEventListener("click", () => {
       expandSection(a.dataset.section);
       setActiveSection(a.dataset.section);
@@ -469,7 +508,8 @@ function wireNavigation(){
       return;
     }
     if (e.key !== "Tab" || !$("sidenav").classList.contains("open")) return;
-    const links = [...document.querySelectorAll("#sidenav-links a[href], #sidenav button:not([disabled])")];
+    const links = [...document.querySelectorAll("#sidenav-links a[href], #sidenav-links button, #sidenav .side-collapse")]
+      .filter(el => el.getClientRects().length);
     if (!links.length) return;
     const first = links[0], last = links[links.length - 1];
     const active = document.activeElement;
@@ -539,9 +579,9 @@ const META = {
   overload_per_min:["Overload","/min","--chart-4"],
   malformed_per_min:["Malformed","/min","--chart-10"],
   cache_hit_pct:  ["Hit ratio","%","--chart-5"],
-  p50_ms:         ["P50","ms","--chart-5"],
+  p50_ms:         ["P50","ms","--chart-1"],
   p95_ms:         ["P95","ms","--chart-3"],
-  p99_ms:         ["P99","ms","--chart-4"],
+  p99_ms:         ["P99","ms","--chart-8"],
   inflight:       ["UDP in-flight","","--chart-1"],
   tcp_open:       ["TCP conns","","--chart-2"],
   rss_mb:         ["RSS","MB","--chart-7"],
@@ -888,6 +928,7 @@ function renderAuthChip(){
       ? "<b>Viewer session.</b> Monitoring and diagnostics are available; configuration, cache, ACL and upstream mutations are disabled here and independently rejected by the API."
       : "";
   }
+  renderHeaderIdentity();
   applyRoleGating();
 }
 
@@ -946,6 +987,8 @@ function fmtClockShort(ms){
   const d=new Date(ms);
   if (state.range==="24h"||state.range==="7d")
     return pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
+  if (state.range==="5m"||state.range==="15m")
+    return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds());
   return pad(d.getHours())+":"+pad(d.getMinutes());
 }
 /* `null`/undefined means "not measured yet" — never render it as a number.
@@ -1051,14 +1094,16 @@ function drawChart(def){
   ctx.fillStyle = cssVar("--chart-axis", "#7f90a6");
   ctx.font = '10px "Shabnam", sans-serif'; ctx.textAlign = "right";
   const unit = META[(def.keys&&def.keys[0]) || ""] ? META[def.keys[0]][1] : "";
+  ctx.setLineDash([3,4]);
   for (let i=0;i<=4;i++){
     const v = v0 + (v1-v0)*i/4, y = Y(v);
     ctx.beginPath(); ctx.moveTo(L,y); ctx.lineTo(W-R,y); ctx.stroke();
     ctx.fillText(fmtAxis(v, def), L-5, y+3);
   }
+  ctx.setLineDash([]);
   // X labels.
   ctx.textAlign = "center";
-  const ticks = 5;
+  const ticks = W < 420 ? 3 : 5;
   for (let i=0;i<=ticks;i++){
     const t = t0 + (t1-t0)*i/ticks, x = X(t);
     ctx.fillText(fmtClockShort(t), Math.min(Math.max(x, L+24), W-R-24), H-6);
@@ -1067,7 +1112,8 @@ function drawChart(def){
   // Series lines.
   for (const s of series){
     ctx.strokeStyle = s.color;
-    ctx.lineWidth = s.name===state.focus ? 2.4 : 1.6;
+    ctx.lineWidth = s.name===state.focus ? 2.6 : 1.9;
+    ctx.lineJoin = "round"; ctx.lineCap = "round";
     ctx.beginPath();
     let pen = false;
     for (let i=0;i<s.points.length;i++){
@@ -1117,6 +1163,7 @@ function fmtAxis(v, def){
 /* Tooltip on hover. */
 const tip = $("tip");
 document.addEventListener("mousemove", e => {
+  if (e.target && e.target.dataset && e.target.dataset.tipOwn) return;
   let hit = null;
   for (const [id, h] of Object.entries(chartHover)){
     const canvas = $(id);
@@ -1159,6 +1206,12 @@ document.addEventListener("mouseleave", () => tip.style.display="none");
  * KPIs + assessment
  * ====================================================================== */
 
+const KPI_ICONS = {
+  queries: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  qps: '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+  success: '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+  latency: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+};
 function tilesHTML(list, primary){
   return list.map(k => {
     const cls = ["kpi", primary ? "primary" : "", k.cls || "", k.quiet ? "quiet" : ""]
@@ -1169,6 +1222,13 @@ function tilesHTML(list, primary){
       : (primary ? '<div class="t"></div>' : "");
     const spark = k.spark
       ? '<canvas class="kpi-spark" data-spark="'+k.spark+'" aria-hidden="true"></canvas>' : "";
+    const icon = k.icon
+      ? '<span class="kpi-ico tone-'+k.tone+'" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" '+
+        'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" '+
+        'focusable="false">'+KPI_ICONS[k.icon]+'</svg></span>' : "";
+    if (primary)
+      return '<div class="'+cls+'"><div class="kpi-head"><div class="k">'+k.k+'</div>'+icon+
+        '</div><div class="v">'+k.v+'</div><div class="kpi-foot">'+t+state+'</div></div>';
     return '<div class="'+cls+'"><div class="kpi-head"><div class="k">'+k.k+'</div>'+
       state+'</div><div class="v">'+k.v+'</div>'+t+spark+'</div>';
   }).join("");
@@ -1209,36 +1269,32 @@ function renderKpis(){
     : {cls:"warn", txt:"cold"};
   const idle = intOf(s.queries_total) === 0;
 
-  /* ---- DNS service: six primary health/traffic cards ---- */
+  /* ---- DNS service: four primary health/traffic cards ---- */
   const primary = [
-    {k:"Queries", v:String(intOf(s.queries_total)), spark:"queries",
+    {k:"Queries", v:String(intOf(s.queries_total)), icon:"queries", tone:"blue",
       state: idle ? {cls:"quiet", txt:"idle"} : null,
       t:{txt:intOf(s.queries_udp)+" udp · "+intOf(s.queries_tcp)+" tcp", cls:"flat"}},
-    {k:"Success", v: measured ? (s.success_rate*100).toFixed(1)+"%" : "N/A",
-      cls: successState.cls, state: successState, spark:"success_pct",
-      t: measured ? {txt:intOf(s.success_count)+" ok", cls:"flat"}
-                  : {txt:"no responses yet", cls:"flat"}},
-    {k:"P95 now", v:fmtVal(s.latency.p95_ms,"ms"), cls:p95State.cls, state:p95State,
-      spark:"p95_ms", t:trendEl(p95L, p95P, "ms", true)},
-    {k:"QPS", v:fmtVal(s.qps,"qps"), spark:"qps",
+    {k:"QPS", v:fmtVal(s.qps,"qps"), icon:"qps", tone:"purple",
       state: idle ? {cls:"quiet", txt:"idle"} : {cls:"good", txt:"live"},
       t:trendEl(qpsL, qpsP, "qps", false)},
-    {k:"Cache hit", v: cacheOff ? "off" : cacheRate == null ? "N/A" : cacheRate.toFixed(0)+"%",
-      cls:cacheState.cls, state:cacheState, spark:"cache_hit_pct",
-      t:{txt:s.cache.entries+" entries", cls:"flat"}},
-    {k:"Error rate", v:errorText,
-      cls: !errorKnown ? "quiet" : errorPct > 1 ? "crit" : errorPct > 0 ? "warn" : "good",
-      state: !errorKnown ? {cls:"quiet", txt:"no data"}
-        : errorPct > 1 ? {cls:"crit", txt:">1%"}
-        : errorPct > 0 ? {cls:"warn", txt:"observed"}
-        : {cls:"good", txt:"none"},
-      spark:"error_pct",
-      t:{txt:intOf(s.error_count)+" failed queries", cls: s.error_count ? "dn":"flat"}},
+    {k:"Success", v: measured ? (s.success_rate*100).toFixed(1)+"%" : "N/A", icon:"success", tone:"green",
+      cls: successState.cls, state: successState,
+      t: measured ? {txt:intOf(s.success_count)+" ok · "+intOf(s.error_count)+" failed", cls: s.error_count ? "dn":"flat"}
+                  : {txt:"no responses yet", cls:"flat"}},
+    {k:"P95 latency", v:fmtVal(s.latency.p95_ms,"ms"), icon:"latency", tone:"orange",
+      cls:p95State.cls, state:p95State, t:trendEl(p95L, p95P, "ms", true)},
   ];
   $("kpis").innerHTML = tilesHTML(primary, true);
 
   /* ---- Detailed counters stay behind an explicit disclosure ---- */
   const detail = [
+    {k:"Cache hit", v: cacheOff ? "off" : cacheRate == null ? "N/A" : cacheRate.toFixed(0)+"%",
+      cls:cacheState.cls, quiet: cacheOff || cacheRate == null,
+      t:{txt:s.cache.entries+" entries", cls:"flat"}},
+    {k:"Error rate", v:errorText,
+      cls: !errorKnown ? "quiet" : errorPct > 1 ? "bad" : errorPct > 0 ? "warn" : "good",
+      quiet: !errorKnown,
+      t:{txt:intOf(s.error_count)+" failed queries", cls: s.error_count ? "dn":"flat"}},
     {k:"Responses", v:String(intOf(s.responses_total)),
       quiet:intOf(s.responses_total)===0,
       t:{txt: measured ? intOf(s.success_count)+" ok" : "no responses yet", cls:"flat"}},
@@ -1837,6 +1893,7 @@ function renderSignals(){
   else
     add("ok","OK","Cache "+(s.cache.entries>0?"warm":"empty")+" ("+(s.cache.hit_ratio*100).toFixed(0)+"% hits)", s.cache.entries+" / "+st.cache.max_entries+" entries");
 
+  state.signals = S;
   $("signals").innerHTML = S.map(x =>
     '<div class="sig '+x.level+'"><span class="st">'+x.tag+'</span>'+
     '<div class="tx"><b>'+x.title+'</b><span>'+x.detail+'</span></div></div>'
@@ -1930,8 +1987,7 @@ function renderUpstreams(){
   for (const tr of $("up-rows").querySelectorAll("tr[data-up]")){
     tr.addEventListener("click", () => {
       const n = tr.getAttribute("data-up");
-      state.focus = state.focus===n ? null : n;
-      renderUpstreams(); drawAllCharts();
+      toggleFocus(n);
     });
   }
 }
@@ -2084,7 +2140,7 @@ async function fetchHistory(){
   }
 }
 
-function drawAllCharts(){ for (const def of CHARTS) drawChart(def); drawKpiSparks(); }
+function drawAllCharts(){ for (const def of CHARTS) drawChart(def); drawKpiSparks(); drawWidgets(); }
 
 function historyInterval(){ return (state.range==="5m"||state.range==="15m") ? 5000 : 30000; }
 
@@ -2145,6 +2201,7 @@ async function fetchCurrent(){
     renderVerdict(); renderKpis(); renderTraffic(); renderStatsBlocks();
     renderClientTable(); renderUpState(); renderFailovers();
     renderSignals(); renderUpstreams(); renderEvents(); renderUpstreamMgr();
+    renderOverview();
     hydrateStyles(document);
     $("foot-ev").textContent = state.events.length + " recent";
     maybeReady();
@@ -2931,8 +2988,494 @@ async function saveSelection(){
 /* =========================================================================
  * Wiring
  * ====================================================================== */
+/* =========================================================================
+ * Overview widgets: donut / pie / grouped bars / upstream list
+ * Every value is read from the live stats, upstream state or history
+ * payloads already fetched; nothing here invents data.
+ * ====================================================================== */
+const sliceHit = {};   // canvas id -> pie geometry for hover
+const barHit = {};     // canvas id -> bar rectangles for hover
+
+function setNoData(canvas, msg){
+  const wrap = canvas.parentElement;
+  const old = wrap.querySelector(":scope > .nodata");
+  if (old) old.remove();
+  canvas.style.visibility = msg ? "hidden" : "visible";
+  if (msg){
+    const d = document.createElement("div");
+    d.className = "nodata nodata-overlay";
+    d.textContent = msg;
+    wrap.appendChild(d);
+  }
+}
+function prepCanvas(canvas){
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth || 300, H = canvas.clientHeight || 180;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  return {ctx, W, H};
+}
+const RCODE_COLOR = {
+  NOERROR:"--chart-5", NXDOMAIN:"--chart-2", SERVFAIL:"--chart-4",
+  REFUSED:"--chart-3", FORMERR:"--chart-6", NOTIMP:"--chart-7",
+};
+function sliceColor(label, i){
+  const v = RCODE_COLOR[label];
+  return v ? cssVar(v, "#888") : PALETTE[i % PALETTE.length];
+}
+function drawPieLike(canvas, slices, opts){
+  const total = slices.reduce((a, x) => a + x.value, 0);
+  if (!total){ delete sliceHit[canvas.id]; setNoData(canvas, opts.empty); return 0; }
+  setNoData(canvas, null);
+  const {ctx, W, H} = prepCanvas(canvas);
+  const cx = W / 2, cy = H / 2;
+  const R = Math.max(10, Math.min(W, H) / 2 - 4), r0 = R * (opts.hole || 0);
+  const gap = slices.length > 1 ? 0.03 : 0;
+  const bg = cssVar("--surface", "#fff");
+  const hit = [];
+  let a = -Math.PI / 2;
+  for (const sl of slices){
+    const ang = sl.value / total * Math.PI * 2;
+    ctx.beginPath();
+    if (r0 > 0){
+      ctx.arc(cx, cy, R, a + gap / 2, a + ang - gap / 2);
+      ctx.arc(cx, cy, r0, a + ang - gap / 2, a + gap / 2, true);
+    } else {
+      ctx.moveTo(cx, cy); ctx.arc(cx, cy, R, a, a + ang);
+    }
+    ctx.closePath();
+    ctx.fillStyle = sl.color; ctx.fill();
+    if (!r0 && slices.length > 1){ ctx.strokeStyle = bg; ctx.lineWidth = 2; ctx.stroke(); }
+    hit.push({a0:a, a1:a + ang, label:sl.label, value:sl.value,
+              pct:sl.value / total * 100, color:sl.color});
+    a += ang;
+  }
+  sliceHit[canvas.id] = {cx, cy, R, r0, hit};
+  return total;
+}
+function fillLegend(el, slices, total){
+  el.replaceChildren(...slices.map(sl => {
+    const row = document.createElement("div");
+    row.className = "lg-row";
+    const dot = document.createElement("i"); dot.style.background = sl.color;
+    const name = document.createElement("span"); name.className = "lg-name";
+    name.textContent = sl.label; name.title = sl.label;
+    const val = document.createElement("b"); val.textContent = String(sl.value);
+    const pct = document.createElement("em");
+    pct.textContent = total ? (sl.value / total * 100).toFixed(sl.value / total < 0.1 ? 1 : 0) + "%" : "";
+    row.append(dot, name, val, pct);
+    return row;
+  }));
+}
+function byValueDesc(a, b){ return b.value - a.value || a.label.localeCompare(b.label); }
+
+function renderRcodeDonut(){
+  const s = state.stats;
+  if (!s) return;
+  const rc = s.rcode || {};
+  const slices = Object.keys(rc).map(k => ({label:k, value:intOf(rc[k])}))
+    .filter(x => x.value > 0).sort(byValueDesc)
+    .map((x, i) => ({...x, color:sliceColor(x.label, i)}));
+  const total = drawPieLike($("rc-donut"), slices, {hole:.64, empty:"No responses sent yet"});
+  const c = $("rc-center");
+  c.replaceChildren();
+  if (total){
+    const b = document.createElement("b"); b.textContent = String(total);
+    const sp = document.createElement("span"); sp.textContent = "responses";
+    c.append(b, sp);
+  }
+  $("rc-sub").textContent = total ? "lifetime" : "";
+  fillLegend($("rc-legend"), slices, total);
+}
+
+const PIE_MODES = {
+  health: {title:"Upstream health", empty:"No upstreams configured"},
+  qtypes: {title:"Question types", empty:"No parsed queries yet"},
+  transport: {title:"Transport", empty:"No queries received yet"},
+};
+function pieSlices(mode){
+  const s = state.stats, up = state.upState;
+  const t = (s && s.traffic) || {};
+  if (mode === "health"){
+    if (!up) return [];
+    return [["Healthy", up.healthy, "--ok"], ["Degraded", up.degraded, "--warn"],
+            ["Recovering", up.recovering, "--info"], ["Unhealthy", up.unhealthy, "--crit"],
+            ["Disabled", up.disabled, "--faint"]]
+      .map(([label, v, c]) => ({label, value:intOf(v), color:cssVar(c, "#888")}))
+      .filter(x => x.value > 0);
+  }
+  if (mode === "qtypes"){
+    const qt = t.query_type || {};
+    return Object.keys(qt).map(k => ({label:k, value:intOf(qt[k])}))
+      .filter(x => x.value > 0).sort(byValueDesc)
+      .map((x, i) => ({...x, color:PALETTE[i % PALETTE.length]}));
+  }
+  if (!s) return [];
+  return [{label:"UDP", value:intOf(s.queries_udp), color:cssVar("--chart-1", "#888")},
+          {label:"TCP", value:intOf(s.queries_tcp), color:cssVar("--chart-3", "#888")}]
+    .filter(x => x.value > 0);
+}
+function renderPie(){
+  const mode = $("pie-sel").value in PIE_MODES ? $("pie-sel").value : "health";
+  $("pie-title").textContent = PIE_MODES[mode].title;
+  const slices = pieSlices(mode);
+  const total = drawPieLike($("pie"), slices, {hole:0, empty:PIE_MODES[mode].empty});
+  fillLegend($("pie-legend"), slices, total);
+}
+
+const BAR_MODES = {
+  packets: {title:"Packets in / out", keys:["packets_in", "packets_out"],
+            names:["In", "Out"], colors:["--chart-1", "--chart-8"]},
+  bytes: {title:"Payload size (avg bytes)", keys:["avg_req_bytes", "avg_resp_bytes"],
+          names:["Request", "Response"], colors:["--chart-1", "--chart-8"]},
+};
+const BAR_GROUPS = 8;
+function bucketMeans(h, keys, n){
+  const all = keys.map(k => seriesFrom(h, k));
+  const len = Math.min(...all.map(a => a.length));
+  if (!len) return {labels:[], values:keys.map(() => [])};
+  const size = Math.max(1, Math.ceil(len / n));
+  const labels = [], values = keys.map(() => []);
+  for (let i = 0; i < len; i += size){
+    labels.push(all[0][i][0]);
+    all.forEach((arr, ki) => {
+      let sum = 0, cnt = 0;
+      for (let j = i; j < Math.min(len, i + size); j++){
+        const v = arr[j][1];
+        if (v != null){ sum += v; cnt++; }
+      }
+      values[ki].push(cnt ? sum / cnt : null);
+    });
+  }
+  return {labels, values};
+}
+function roundRectTop(ctx, x, y, w, h, r){
+  r = Math.min(r, w / 2, h);
+  ctx.beginPath();
+  ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h); ctx.closePath();
+}
+function renderBars(){
+  const canvas = $("bar");
+  const mode = $("bar-sel").value in BAR_MODES ? $("bar-sel").value : "packets";
+  const def = BAR_MODES[mode];
+  $("bar-title").textContent = def.title;
+  const colors = def.colors.map(c => cssVar(c, "#888"));
+  const legend = $("bar-legend");
+  legend.replaceChildren(...def.names.map((n, i) => {
+    const row = document.createElement("div"); row.className = "lg-row";
+    const dot = document.createElement("i"); dot.style.background = colors[i];
+    const name = document.createElement("span"); name.className = "lg-name"; name.textContent = n;
+    row.append(dot, name); return row;
+  }));
+  const {labels, values} = bucketMeans(state.hist, def.keys, BAR_GROUPS);
+  const hasData = values.some(v => v.some(x => x != null));
+  if (!hasData){
+    delete barHit.bar;
+    setNoData(canvas, state.hist ? "No data in this window" : "Waiting for history…");
+    return;
+  }
+  setNoData(canvas, null);
+  const {ctx, W, H} = prepCanvas(canvas);
+  const L = 38, R = 4, T = 6, B = 20, pw = W - L - R, ph = H - T - B;
+  let vmax = 0;
+  for (const v of values) for (const x of v) if (x != null && x > vmax) vmax = x;
+  vmax = niceMax(vmax);
+  ctx.font = '10px "Shabnam", sans-serif';
+  ctx.strokeStyle = cssVar("--chart-grid", "#ddd");
+  ctx.fillStyle = cssVar("--chart-axis", "#888");
+  ctx.textAlign = "right"; ctx.lineWidth = 1;
+  ctx.setLineDash([3, 4]);
+  for (let i = 0; i <= 4; i++){
+    const y = T + ph - ph * i / 4;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.fillText(fmtAxis(vmax * i / 4, {}), L - 5, y + 3);
+  }
+  ctx.setLineDash([]);
+  const n = labels.length, gw = pw / n, bw = Math.max(3, Math.min(18, gw * 0.62 / values.length));
+  const rects = [];
+  ctx.textAlign = "center";
+  for (let g = 0; g < n; g++){
+    const gx = L + g * gw + gw / 2 - (bw * values.length) / 2;
+    values.forEach((vs, si) => {
+      const v = vs[g];
+      if (v == null) return;
+      const h = Math.max(1, v / vmax * ph), x = gx + si * bw, y = T + ph - h;
+      ctx.fillStyle = colors[si];
+      roundRectTop(ctx, x + 0.5, y, bw - 1, h, 2); ctx.fill();
+      rects.push({x, y, w:bw, h, label:def.names[si], value:v, t:labels[g], color:colors[si]});
+    });
+    ctx.fillStyle = cssVar("--chart-axis", "#888");
+    if (n <= 6 || g % 2 === 0)
+      ctx.fillText(fmtClockShort(labels[g]), L + g * gw + gw / 2, H - 6);
+  }
+  barHit.bar = {rects, gw, L, n, labels, values, names:def.names, colors};
+}
+
+function renderUpList(){
+  const ul = $("up-list");
+  const ups = state.upstreams || [];
+  $("ul-sub").textContent = ups.length ? ups.length + " configured" : "";
+  if (!ups.length){
+    ul.innerHTML = '<li class="pop-empty">No upstreams configured</li>';
+    return;
+  }
+  ul.innerHTML = ups.map((u, i) => {
+    const color = state.upColors[u.name] || PALETTE[i % PALETTE.length];
+    const addr = escapeHtml(u.address) + ":" + escapeHtml(String(u.port)) + " · " + escapeHtml(protoLabel(u));
+    return '<li class="rrow'+(state.focus === u.name ? " focus" : "")+'" tabindex="0" role="button" ' +
+      'data-up="'+escapeHtml(u.name)+'" aria-pressed="'+(state.focus === u.name)+'" ' +
+      'title="Click to highlight in the charts">' +
+      '<i class="rdot" data-bg="'+color+'"></i>' +
+      '<span class="rmain"><span class="rname">'+escapeHtml(u.name)+'</span>' +
+      '<span class="raddr">'+addr+'</span></span>' + stateChip(u) + '</li>';
+  }).join("");
+  hydrateStyles(ul);
+}
+function toggleFocus(name){
+  state.focus = state.focus === name ? null : name;
+  renderUpstreams(); renderUpList(); drawAllCharts();
+}
+function drawWidgets(){
+  if (state.stats){ renderRcodeDonut(); renderPie(); }
+  renderBars();
+}
+function renderOverview(){
+  renderUpList(); renderNotifications(); drawWidgets();
+}
+
+/* Hover tooltips for the pie, donut and bar canvases. */
+function showTip(html, e){
+  tip.innerHTML = html;
+  hydrateStyles(tip);
+  tip.style.display = "block";
+  const tw = tip.offsetWidth;
+  tip.style.left = Math.min(e.clientX + 14, window.innerWidth - tw - 8) + "px";
+  tip.style.top = (e.clientY + 14) + "px";
+}
+function wireWidgetHover(){
+  for (const id of ["rc-donut", "pie"]){
+    const c = $(id);
+    c.addEventListener("mousemove", e => {
+      const g = sliceHit[id];
+      if (!g){ tip.style.display = "none"; return; }
+      const r = c.getBoundingClientRect();
+      const dx = e.clientX - r.left - g.cx, dy = e.clientY - r.top - g.cy;
+      const dist = Math.hypot(dx, dy);
+      if (dist > g.R || dist < g.r0){ tip.style.display = "none"; return; }
+      let ang = Math.atan2(dy, dx);
+      if (ang < -Math.PI / 2) ang += Math.PI * 2;
+      const s = g.hit.find(x => ang >= x.a0 && ang < x.a1) || g.hit[g.hit.length - 1];
+      showTip('<div class="row"><span><i data-bg="'+s.color+'"></i>'+escapeHtml(s.label)+
+        '</span><b>'+s.value+' · '+s.pct.toFixed(1)+'%</b></div>', e);
+    });
+    c.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  }
+  const bar = $("bar");
+  bar.addEventListener("mousemove", e => {
+    const g = barHit.bar;
+    if (!g){ tip.style.display = "none"; return; }
+    const r = bar.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const idx = Math.floor((x - g.L) / g.gw);
+    if (idx < 0 || idx >= g.n){ tip.style.display = "none"; return; }
+    let html = '<div class="tt">'+fmtClock(g.labels[idx])+'</div>';
+    g.values.forEach((vs, si) => {
+      if (vs[idx] == null) return;
+      html += '<div class="row"><span><i data-bg="'+g.colors[si]+'"></i>'+escapeHtml(g.names[si])+
+        '</span><b>'+fmtVal(vs[idx], "")+'</b></div>';
+    });
+    showTip(html, e);
+  });
+  bar.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  $("pie-sel").addEventListener("change", renderPie);
+  $("bar-sel").addEventListener("change", renderBars);
+  const list = $("up-list");
+  list.addEventListener("click", e => {
+    const row = e.target.closest("[data-up]");
+    if (row) toggleFocus(row.getAttribute("data-up"));
+  });
+  list.addEventListener("keydown", e => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const row = e.target.closest("[data-up]");
+    if (!row) return;
+    e.preventDefault();
+    toggleFocus(row.getAttribute("data-up"));
+    const again = list.querySelector('[data-up="'+CSS.escape(row.getAttribute("data-up"))+'"]');
+    if (again) again.focus();
+  });
+}
+
+/* Analytics card: switch between the latency and query-rate panes. */
+function selectPane(id){
+  for (const b of $("an-tabs").querySelectorAll("button"))
+    b.setAttribute("aria-pressed", String(b.dataset.pane === id));
+  for (const p of document.querySelectorAll(".card-main .chartpane"))
+    p.hidden = p.id !== "w-" + id;
+  $("an-title").textContent = id === "ch-lat" ? "Client latency (ms)" : "Query rate";
+  const def = CHARTS.find(d => d.id === id);
+  if (def) requestAnimationFrame(() => drawChart(def));
+}
+
+/* =========================================================================
+ * Header: greeting, section search, notifications, account menu
+ * ====================================================================== */
+function renderHeaderIdentity(){
+  const h = new Date().getHours();
+  const part = h < 5 ? "Good night" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+  const user = AUTH.user || "";
+  $("greet").textContent = user ? part + ", " + user : part;
+  $("hdr-date").textContent = new Date().toLocaleDateString(undefined,
+    {weekday:"long", year:"numeric", month:"long", day:"numeric"});
+  const name = AUTH.open ? "no auth" : (AUTH.user || AUTH.role || "signed out");
+  const initial = (AUTH.user || AUTH.role || "?").charAt(0).toUpperCase();
+  $("who").textContent = name;
+  $("pm-user").textContent = name;
+  $("avatar").textContent = initial;
+  $("avatar-lg").textContent = initial;
+}
+const POPS = [["bell-btn", "bell-menu"], ["profile-btn", "profile-menu"]];
+function setPop(btnId, menuId, on){
+  $(menuId).hidden = !on;
+  $(btnId).setAttribute("aria-expanded", String(on));
+}
+function closePops(exceptMenu){
+  for (const [b, m] of POPS) if (m !== exceptMenu) setPop(b, m, false);
+  if (exceptMenu !== "search-results") closeSearch();
+}
+function closeSearch(){
+  $("search-results").hidden = true;
+  $("nav-search").setAttribute("aria-expanded", "false");
+}
+function searchHits(q){
+  q = q.trim().toLowerCase();
+  if (!q) return [];
+  return navSections().map(sec => {
+    const sub = sec.querySelector(":scope > h2 .sub");
+    return {id:sec.id, label:sec.querySelector(".sec-title").textContent.trim(),
+            group:NAV_GROUP_OF[sec.id] || "", hint:sub ? sub.textContent.trim() : ""};
+  }).filter(x => (x.label + " " + x.group + " " + x.hint).toLowerCase().includes(q)).slice(0, 8);
+}
+function goToSection(id){
+  expandSection(id);
+  setActiveSection(id);
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView();
+  history.replaceState(null, "", "#" + id);
+}
+function renderSearch(){
+  const box = $("search-results");
+  const q = $("nav-search").value;
+  if (!q.trim()){ closeSearch(); return; }
+  const hits = searchHits(q);
+  box.replaceChildren();
+  if (!hits.length){
+    const d = document.createElement("div"); d.className = "pop-empty";
+    d.textContent = "No matching section"; box.appendChild(d);
+  }
+  for (const h of hits){
+    const a = document.createElement("a");
+    a.className = "pop-item"; a.href = "#" + h.id; a.setAttribute("role", "option");
+    a.dataset.id = h.id;
+    const b = document.createElement("b"); b.textContent = h.label;
+    const sp = document.createElement("span"); sp.textContent = h.group;
+    a.append(b, sp);
+    box.appendChild(a);
+  }
+  box.hidden = false;
+  $("nav-search").setAttribute("aria-expanded", "true");
+}
+let seenNotes = "";
+let noteSig = "";
+function renderNotifications(){
+  const items = [];
+  const sigs = state.signals || [];
+  for (const x of sigs) if (x.level === "crit" || x.level === "warn") items.push(x);
+  if (!$("apiproblem").hidden)
+    items.unshift({level:"warn", tag:"API", title:"Control-plane API unreachable",
+                   detail:"charts and live data are stale"});
+  noteSig = items.map(x => x.level + x.title).join("|");
+  const list = $("bell-list");
+  list.replaceChildren();
+  if (!items.length){
+    const d = document.createElement("div"); d.className = "pop-empty";
+    d.textContent = "All clear — no warnings from the live assessment.";
+    list.appendChild(d);
+  }
+  for (const x of items){
+    const row = document.createElement("div"); row.className = "pop-note " + x.level;
+    const st = document.createElement("span"); st.className = "st"; st.textContent = x.tag;
+    const tx = document.createElement("div");
+    const b = document.createElement("b"); b.textContent = x.title.replace(/<[^>]+>/g, "");
+    const sp = document.createElement("span"); sp.textContent = x.detail.replace(/<[^>]+>/g, "");
+    tx.append(b, sp); row.append(st, tx); list.appendChild(row);
+  }
+  $("bell-dot").hidden = !items.length || noteSig === seenNotes;
+  $("bell-btn").setAttribute("aria-label", items.length
+    ? "Notifications (" + items.length + ")" : "Notifications");
+}
+function wireHeader(){
+  renderHeaderIdentity();
+  for (const [b, m] of POPS){
+    $(b).addEventListener("click", e => {
+      e.stopPropagation();
+      const open = $(m).hidden;
+      closePops(open ? m : null);
+      setPop(b, m, open);
+      if (open && m === "bell-menu"){ seenNotes = noteSig; $("bell-dot").hidden = true; }
+    });
+  }
+  const input = $("nav-search");
+  input.addEventListener("input", () => { closePops("search-results"); renderSearch(); });
+  input.addEventListener("focus", () => { if (input.value.trim()) renderSearch(); });
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter"){
+      const first = searchHits(input.value)[0];
+      if (first){ e.preventDefault(); goToSection(first.id); input.value = ""; closeSearch(); input.blur(); }
+    } else if (e.key === "ArrowDown"){
+      const a = $("search-results").querySelector("a");
+      if (a){ e.preventDefault(); a.focus(); }
+    } else if (e.key === "Escape"){ input.value = ""; closeSearch(); }
+  });
+  $("search-results").addEventListener("click", e => {
+    const a = e.target.closest("a[data-id]");
+    if (!a) return;
+    e.preventDefault();
+    goToSection(a.dataset.id);
+    input.value = ""; closeSearch();
+  });
+  $("search-results").addEventListener("keydown", e => {
+    const items = [...$("search-results").querySelectorAll("a")];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown"){ e.preventDefault(); (items[at + 1] || items[0]).focus(); }
+    else if (e.key === "ArrowUp"){ e.preventDefault(); (at > 0 ? items[at - 1] : input).focus(); }
+    else if (e.key === "Escape"){ closeSearch(); input.focus(); }
+  });
+  document.addEventListener("click", e => {
+    if (!e.target.closest(".pop-wrap")) closePops(null);
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Escape") return;
+    for (const [b, m] of POPS){
+      if (!$(m).hidden){ setPop(b, m, false); $(b).focus(); }
+    }
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)){
+      e.preventDefault(); input.focus();
+    }
+  });
+  for (const b of $("an-tabs").querySelectorAll("button"))
+    b.addEventListener("click", () => selectPane(b.dataset.pane));
+  wireWidgetHover();
+}
+
 function wire(){
   initTheme();
+  wireHeader();
   $("range-sel").addEventListener("change", e => {
     state.range = e.target.value;
     if (!RANGES.includes(state.range)) state.range = "5m";

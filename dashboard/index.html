@@ -63,100 +63,21 @@
   </div>
 </div>
 
-<header id="top">
-  <div class="hbar hbar-primary">
-    <button id="nav-toggle" class="nav-toggle" type="button"
-            aria-label="Open navigation" aria-expanded="false" aria-controls="sidenav">
-      <span></span><span></span><span></span>
-    </button>
-    <a class="brand" href="#top" aria-label="res dashboard home">
-      <span class="brand-mark">res</span>
-      <span class="brand-sub">DNS gateway <span class="v" id="version">v…</span></span>
-    </a>
-    <span class="pill ok" id="verdict" role="status" aria-live="polite">
-      <span class="dot"></span><span id="verdict-text">…</span>
-    </span>
-    <span class="hspace"></span>
-    <div class="live-meta">
-      <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
-      <span id="updated" class="updated">connecting…</span>
-    </div>
-    <div class="user-area">
-      <div class="theme-switch">
-        <button id="theme-toggle" class="btn btn-ghost btn-sm theme-btn" type="button"
-                aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu"
-                title="Color theme: system, light or dark">
-          <span class="theme-ico" aria-hidden="true">
-            <svg class="ico ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
-              <circle cx="12" cy="12" r="4"></circle>
-              <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
-            </svg>
-            <svg class="ico ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-            </svg>
-            <svg class="ico ico-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
-              <circle cx="12" cy="12" r="9"></circle>
-              <path d="M12 3v18"></path>
-              <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"></path>
-            </svg>
-          </span>
-          <span class="theme-label">Auto</span>
-        </button>
-        <div id="theme-menu" class="theme-menu" role="menu" aria-label="Color theme" hidden>
-          <button type="button" role="menuitemradio" data-theme-choice="system" aria-checked="true">
-            <span>System</span><span class="theme-hint">follows your OS</span>
-          </button>
-          <button type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false">
-            <span>Light</span><span class="theme-hint">always light</span>
-          </button>
-          <button type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false">
-            <span>Dark</span><span class="theme-hint">always dark</span>
-          </button>
-        </div>
-      </div>
-      <span class="chip auth-chip" id="auth-chip" title="Session status">…</span>
-      <button id="logout-btn" class="btn btn-ghost btn-sm" type="button"
-              title="Sign out" aria-label="Sign out" hidden>Sign out</button>
-    </div>
-  </div>
-  <div class="hbar hbar-secondary">
-    <span class="ctl uptime" id="uptime-wrap">Uptime <b id="uptime">—</b></span>
-    <span class="toolbar-sep" aria-hidden="true"></span>
-    <label class="ctl">Range
-      <select id="range-sel">
-        <option value="5m" selected>5 min</option>
-        <option value="15m">15 min</option>
-        <option value="1h">1 hour</option>
-        <option value="6h">6 hours</option>
-        <option value="24h">24 hours</option>
-        <option value="7d">7 days</option>
-      </select>
-    </label>
-    <label class="ctl">Source
-      <select id="source-sel">
-        <option value="native" selected>native</option>
-        <option value="auto">auto</option>
-        <option value="prometheus">prometheus</option>
-      </select>
-    </label>
-    <label class="check" title="Auto-refresh live status and history">
-      <input type="checkbox" id="auto-chk" checked> <span>Auto-refresh</span>
-    </label>
-    <span class="hspace"></span>
-    <button id="refresh-btn" class="btn btn-ghost btn-sm" type="button">Refresh now</button>
-  </div>
-</header>
-
 <div class="app-shell">
   <aside class="sidenav" id="sidenav" aria-label="Panel sections">
     <div class="nav-head">
-      <span class="nav-head-title">Sections</span>
+      <a class="brand" href="#top" aria-label="res dashboard home">
+        <span class="brand-mark">res</span>
+        <span class="brand-sub">DNS gateway <span class="v" id="version">v…</span></span>
+      </a>
       <button id="side-collapse" class="side-collapse" type="button"
-              aria-label="Hide section navigation" aria-expanded="true"
-              aria-controls="sidenav" title="Hide section navigation">‹</button>
+              aria-label="Collapse sidebar" aria-expanded="true"
+              aria-controls="sidenav" title="Collapse sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M9 4v16"></path>
+        </svg>
+      </button>
     </div>
     <nav class="nav-scroll" id="sidenav-links"></nav>
     <div class="nav-foot">
@@ -166,26 +87,133 @@
   </aside>
   <div class="nav-backdrop" id="nav-backdrop" hidden></div>
 
-<main class="wrap" id="content" tabindex="-1">
-  <button id="side-reopen" class="side-reopen" type="button"
-          aria-controls="sidenav" title="Show section navigation">Show sections</button>
-  <div class="page-head">
-    <div>
-      <div class="eyebrow-row">
-        <div class="eyebrow">Control plane</div>
-        <span class="live-badge" id="live-badge" role="status" aria-live="polite"
-              title="Live data is refreshing">
-          <span class="pulse" aria-hidden="true"></span><span id="live-text">Live</span>
-        </span>
-      </div>
-      <h1>Service overview</h1>
-      <p>Live health, traffic and configuration for this DNS gateway. All values are read from the running process; no sample data is shown.</p>
+<div class="app-main">
+<header id="top">
+  <div class="hbar">
+    <button id="nav-toggle" class="nav-toggle" type="button"
+            aria-label="Open navigation" aria-expanded="false" aria-controls="sidenav">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="greet">
+      <div class="greet-main" id="greet">Hello</div>
+      <div class="greet-sub" id="hdr-date">—</div>
     </div>
-    <dl class="page-facts">
-      <div><dt>Version</dt><dd id="page-version">—</dd></div>
-      <div><dt>API bind</dt><dd class="mono ip" id="page-api">—</dd></div>
-      <div><dt>Session</dt><dd id="page-auth">—</dd></div>
-    </dl>
+    <span class="pill ok" id="verdict" role="status" aria-live="polite">
+      <span class="dot"></span><span id="verdict-text">…</span>
+    </span>
+    <span class="hspace"></span>
+
+    <div class="pop-wrap hsearch">
+      <svg class="hsearch-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true">
+        <circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path>
+      </svg>
+      <input id="nav-search" type="search" placeholder="Search sections" autocomplete="off"
+             spellcheck="false" aria-label="Search dashboard sections"
+             aria-controls="search-results" aria-expanded="false" role="combobox">
+      <div id="search-results" class="pop pop-left" role="listbox" aria-label="Matching sections" hidden></div>
+    </div>
+
+    <div class="theme-switch">
+      <button id="theme-toggle" class="icon-btn theme-btn" type="button"
+              aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu"
+              aria-label="Color theme: system, light or dark" title="Color theme: system, light or dark">
+        <span class="theme-ico" aria-hidden="true">
+          <svg class="ico ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </svg>
+          <svg class="ico ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+          <svg class="ico ico-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+            <circle cx="12" cy="12" r="9"></circle>
+            <path d="M12 3v18"></path>
+            <path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"></path>
+          </svg>
+        </span>
+        <span class="theme-label sr-only">Auto</span>
+      </button>
+      <div id="theme-menu" class="theme-menu" role="menu" aria-label="Color theme" hidden>
+        <button type="button" role="menuitemradio" data-theme-choice="system" aria-checked="true">
+          <span>System</span><span class="theme-hint">follows your OS</span>
+        </button>
+        <button type="button" role="menuitemradio" data-theme-choice="light" aria-checked="false">
+          <span>Light</span><span class="theme-hint">always light</span>
+        </button>
+        <button type="button" role="menuitemradio" data-theme-choice="dark" aria-checked="false">
+          <span>Dark</span><span class="theme-hint">always dark</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="pop-wrap">
+      <button id="bell-btn" class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false"
+              aria-controls="bell-menu" aria-label="Notifications" title="Notifications">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" focusable="false" aria-hidden="true">
+          <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.7 21a2 2 0 0 1-3.4 0"></path>
+        </svg>
+        <span class="bell-dot" id="bell-dot" hidden></span>
+      </button>
+      <div id="bell-menu" class="pop" role="region" aria-label="Notifications" hidden>
+        <div class="pop-title">Notifications</div>
+        <div id="bell-list" class="pop-list"><div class="pop-empty">Nothing to report.</div></div>
+      </div>
+    </div>
+
+    <div class="pop-wrap user-area">
+      <button id="profile-btn" class="avatar-btn" type="button" aria-haspopup="true" aria-expanded="false"
+              aria-controls="profile-menu" aria-label="Account menu">
+        <span class="avatar" id="avatar" aria-hidden="true">?</span>
+        <span class="who" id="who">—</span>
+        <span class="chev" aria-hidden="true"></span>
+      </button>
+      <div id="profile-menu" class="pop" role="region" aria-label="Account" hidden>
+        <div class="pm-head">
+          <span class="avatar avatar-lg" id="avatar-lg" aria-hidden="true">?</span>
+          <div class="pm-id"><b id="pm-user">—</b><span class="chip auth-chip" id="auth-chip" title="Session status">…</span></div>
+        </div>
+        <button id="logout-btn" class="btn btn-ghost pm-logout" type="button"
+                title="Sign out" aria-label="Sign out" hidden>Sign out</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap" id="content" tabindex="-1">
+  <div class="page-head">
+    <div class="title-block">
+      <h1>Service overview</h1>
+      <dl class="page-facts">
+        <div><dt>Version</dt><dd id="page-version">—</dd></div>
+        <div><dt>API bind</dt><dd class="mono ip" id="page-api">—</dd></div>
+        <div><dt>Session</dt><dd id="page-auth">—</dd></div>
+      </dl>
+    </div>
+    <div class="title-tools">
+      <span class="live-badge" id="live-badge" role="status" aria-live="polite"
+            title="Live data is refreshing">
+        <span class="pulse" aria-hidden="true"></span><span id="live-text">Live</span>
+      </span>
+      <span class="ctl uptime" id="uptime-wrap">Uptime <b id="uptime">—</b></span>
+      <span class="chip" id="src-chip" title="Time-series source of the last history fetch">—</span>
+      <span id="updated" class="updated">connecting…</span>
+      <label class="ctl">Source
+        <select id="source-sel">
+          <option value="native" selected>native</option>
+          <option value="auto">auto</option>
+          <option value="prometheus">prometheus</option>
+        </select>
+      </label>
+      <label class="check" title="Auto-refresh live status and history">
+        <input type="checkbox" id="auto-chk" checked> <span>Auto-refresh</span>
+      </label>
+      <button id="refresh-btn" class="btn btn-sm" type="button">Refresh now</button>
+    </div>
   </div>
   <div class="banner-stack">
     <div id="role-banner" class="banner info" hidden></div>
@@ -199,6 +227,81 @@
   <!-- ============ DNS SERVICE (primary) ============ -->
   <h2>DNS service <span class="sub">live query-path health · refreshed every 2s from /api/status and /api/stats</span></h2>
   <div class="kpi-primary" id="kpis"></div>
+
+  <div class="analytics">
+    <section class="card card-main" aria-labelledby="an-title">
+      <div class="card-head">
+        <h3 class="card-title" id="an-title">Latency &amp; query rate</h3>
+        <div class="card-tools">
+          <div class="seg" role="group" aria-label="Chart metric" id="an-tabs">
+            <button type="button" data-pane="ch-lat" aria-pressed="true">Latency</button>
+            <button type="button" data-pane="ch-qps" aria-pressed="false">Query rate</button>
+          </div>
+          <label class="mini-sel"><span class="sr-only">Time range</span>
+            <select id="range-sel" aria-label="Time range">
+              <option value="5m" selected>5 min</option>
+              <option value="15m">15 min</option>
+              <option value="1h">1 hour</option>
+              <option value="6h">6 hours</option>
+              <option value="24h">24 hours</option>
+              <option value="7d">7 days</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="chartpane" id="w-ch-lat"><span class="legend" data-legend="ch-lat"></span><canvas id="ch-lat" aria-label="Client latency percentiles over time"></canvas></div>
+      <div class="chartpane" id="w-ch-qps" hidden><span class="legend" data-legend="ch-qps"></span><canvas id="ch-qps" aria-label="Query rate over time"></canvas></div>
+    </section>
+    <section class="card card-side" aria-labelledby="rc-title">
+      <div class="card-head">
+        <h3 class="card-title" id="rc-title">Response codes</h3>
+        <span class="card-sub" id="rc-sub"></span>
+      </div>
+      <div class="donut-wrap">
+        <canvas id="rc-donut" class="donut" data-tip-own="1" role="img" aria-label="Response code distribution"></canvas>
+        <div class="donut-center" id="rc-center"></div>
+      </div>
+      <div class="legend-list" id="rc-legend"></div>
+    </section>
+  </div>
+
+  <div class="widgets">
+    <section class="card" aria-labelledby="pie-title">
+      <div class="card-head">
+        <h3 class="card-title" id="pie-title">Upstream health</h3>
+        <label class="mini-sel"><span class="sr-only">Breakdown</span>
+          <select id="pie-sel" aria-label="Pie breakdown">
+            <option value="health" selected>Upstream health</option>
+            <option value="qtypes">Question types</option>
+            <option value="transport">Transport</option>
+          </select>
+        </label>
+      </div>
+      <div class="pie-wrap"><canvas id="pie" class="pie" data-tip-own="1" role="img" aria-label="Breakdown chart"></canvas></div>
+      <div class="legend-list" id="pie-legend"></div>
+    </section>
+    <section class="card" aria-labelledby="bar-title">
+      <div class="card-head">
+        <h3 class="card-title" id="bar-title">Packets in / out</h3>
+        <label class="mini-sel"><span class="sr-only">Metric</span>
+          <select id="bar-sel" aria-label="Bar chart metric">
+            <option value="packets" selected>Packets</option>
+            <option value="bytes">Payload size</option>
+          </select>
+        </label>
+      </div>
+      <div class="bar-wrap"><canvas id="bar" class="bar" data-tip-own="1" role="img" aria-label="Grouped bars over the selected time range"></canvas></div>
+      <div class="legend-list legend-inline" id="bar-legend"></div>
+    </section>
+    <section class="card" aria-labelledby="ul-title">
+      <div class="card-head">
+        <h3 class="card-title" id="ul-title">Upstreams</h3>
+        <span class="card-sub" id="ul-sub"></span>
+      </div>
+      <ul class="rlist" id="up-list"><li class="pop-empty">loading…</li></ul>
+    </section>
+  </div>
+
   <details class="advanced-metrics" id="kpi-advanced">
     <summary>
       <span class="adv-title">
@@ -209,16 +312,6 @@
     </summary>
     <div class="kpis kpi-detail" id="kpis-detail"></div>
   </details>
-  <div class="overview-trend">
-    <div class="trend-head">
-      <span class="trend-title">Live trend</span>
-      <span class="trend-sub">query rate and client latency across the selected window</span>
-    </div>
-    <div class="grid">
-      <div class="chart" id="w-ch-qps"><div class="chead"><span class="ctitle">Query rate</span><span class="legend" data-legend="ch-qps"></span></div><canvas id="ch-qps"></canvas></div>
-      <div class="chart" id="w-ch-lat"><div class="chead"><span class="ctitle">Client latency (ms)</span><span class="legend" data-legend="ch-lat"></span></div><canvas id="ch-lat"></canvas></div>
-    </div>
-  </div>
 
   <!-- ============ SERVICE STATISTICS ============ -->
   <h2>Service statistics <span class="sub">totals plus measured rates — unmeasured values stay <b>N/A</b>, measured zeros stay <b>0</b></span></h2>
@@ -702,6 +795,7 @@
     <span id="foot-ready">render: —</span>
   </footer>
 </main>
+</div>
 </div>
 
 <div id="tip"></div>

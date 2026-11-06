@@ -873,9 +873,10 @@ body[data-role="viewer"] #acl-table button[data-act]{
 @media (max-width:980px){
   .app-shell{grid-template-columns:minmax(0,1fr)}
   .sidenav{position:fixed;left:0;top:var(--header-h);bottom:0;height:auto;width:280px;
-    transform:translateX(-102%);transition:transform .2s ease;
-    background:var(--surface);z-index:36;box-shadow:18px 0 50px rgba(0,0,0,.45)}
-  .sidenav.open{transform:translateX(0)}
+    transform:translateX(-102%);transition:transform .2s ease,visibility 0s linear .2s;
+    visibility:hidden;background:var(--surface);z-index:36}
+  .sidenav.open{transform:translateX(0);visibility:visible;transition-delay:0s;
+    box-shadow:18px 0 50px rgba(0,0,0,.45)}
   .nav-toggle{display:block}
   .side-reopen{display:none!important}
   .wrap{padding:22px 20px 56px}

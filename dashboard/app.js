@@ -1003,7 +1003,7 @@ function median(arr){
 function trendEl(cur, prev, unit, invertGood){
   if (cur==null || prev==null) return {txt:"", cls:"flat"};
   const d = cur - prev;
-  if (Math.abs(d) < Math.abs(cur)*0.03) return {txt:"→ "+fmtVal(cur,unit), cls:"flat"};
+  if (Math.abs(d) <= Math.abs(cur)*0.03) return {txt:"→ "+fmtVal(cur,unit), cls:"flat"};
   const arrow = d>0 ? "▲" : "▼";
   const good = invertGood ? d<0 : d>0;
   return {txt: arrow+" "+fmtVal(Math.abs(d),unit)+" vs prev", cls: good?"up":"dn"};
@@ -1135,7 +1135,7 @@ function drawChart(def){
     const lv = lastVal(s.points);
     const m = Object.values(META).find(v => v[0]===s.name);
     const u = def.up ? (def.up.endsWith("_ms")?"ms":def.up.endsWith("_pct")?"%":"") : (m?m[1]:"");
-    return '<span><i data-bg="'+s.color+'"></i>'+s.name+
+    return '<span><i data-bg="'+s.color+'"></i>'+escapeHtml(s.name)+
       ' <span class="lv">'+fmtVal(lv,u)+'</span></span>';
   }).join("");
   hydrateStyles(legendEl);
@@ -1185,7 +1185,7 @@ document.addEventListener("mousemove", e => {
     const p = s.points.find(p => p[0]===bestT);
     const v = p ? p[1] : null;
     if (v==null) continue;
-    html += '<div class="row"><span><i data-bg="'+s.color+'"></i>'+s.name+'</span><b>'+fmtVal(v,"")+'</b></div>';
+    html += '<div class="row"><span><i data-bg="'+s.color+'"></i>'+escapeHtml(s.name)+'</span><b>'+fmtVal(v,"")+'</b></div>';
   }
   tip.innerHTML = html;
   hydrateStyles(tip);

@@ -27,16 +27,24 @@ impl Counter {
 
     /// Strictly acquire one slot if `max` is not yet reached.
     pub fn try_acquire(self: &Arc<Self>, max: usize) -> Option<LimitGuard> {
-        let acquired = self
-            .count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                if v < max {
-                    Some(v + 1)
-                } else {
-                    None
-                }
-            })
-            .is_ok();
+        // Explicit compare-and-swap loop: equivalent to `fetch_update` but
+        // independent of that method's rename (`try_update`) across Rust
+        // versions, so it compiles warning-free on the declared MSRV and newer.
+        let mut cur = self.count.load(Ordering::Relaxed);
+        let acquired = loop {
+            if cur >= max {
+                break false;
+            }
+            match self.count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => cur = actual,
+            }
+        };
         acquired.then(|| LimitGuard {
             counter: Arc::clone(self),
         })
@@ -340,6 +348,27 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::dns::msg::{self, Rcode};
+
+    #[test]
+    fn counter_never_exceeds_max_under_contention_and_releases_on_drop() {
+        let counter = Arc::new(Counter::default());
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let c = Arc::clone(&counter);
+                std::thread::spawn(move || c.try_acquire(10))
+            })
+            .collect();
+        let guards: Vec<_> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(guards.len(), 10, "exactly `max` slots may be handed out");
+        assert_eq!(counter.current(), 10);
+        assert!(counter.try_acquire(10).is_none());
+        drop(guards);
+        assert_eq!(counter.current(), 0);
+        assert!(counter.try_acquire(10).is_some());
+    }
 
     /// Poll a condition for up to ~2s (metrics are written by sibling tasks).
     async fn wait_for(mut f: impl FnMut() -> bool) {

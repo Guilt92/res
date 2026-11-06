@@ -1074,8 +1074,7 @@ mod tests {
         let result = auth.set_admin_password(&cfg_path, "new-secret");
         assert!(
             result.is_ok(),
-            "set_admin_password should succeed: {:?}",
-            result
+            "set_admin_password should succeed: {result:?}"
         );
         assert!(matches!(
             auth.login("admin", "old", IP),

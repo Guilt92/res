@@ -91,7 +91,8 @@ impl Assets {
         }
     }
 
-    /// Number of assets currently held in memory (diagnostics/tests).
+    /// Number of assets currently held in memory (tests).
+    #[cfg(test)]
     pub fn cached(&self) -> usize {
         self.cache.read().unwrap_or_else(|e| e.into_inner()).len()
     }

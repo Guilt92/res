@@ -154,7 +154,7 @@ pub async fn forward(
                 runtime.record_forward(kind, ok.latency);
                 metrics
                     .upstream_rcode_total
-                    .with_label_values(&[&name, ok.view.rcode.as_str()])
+                    .with_label_values(&[name.as_str(), ok.view.rcode.as_str()])
                     .inc();
                 metrics
                     .upstream_latency

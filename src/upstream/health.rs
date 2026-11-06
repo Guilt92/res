@@ -280,7 +280,7 @@ async fn check_upstream(
         shared
             .metrics
             .healthcheck_reason_total
-            .with_label_values(&[&cfg.name, fail_reason])
+            .with_label_values(&[cfg.name.as_str(), fail_reason])
             .inc();
     }
 

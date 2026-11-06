@@ -18,6 +18,7 @@
 //! no credentials is refused unless `[auth].allow_open_mode = true` is set
 //! explicitly for isolated development.
 
+mod assets;
 mod auth_routes;
 mod client_ip;
 mod prom;
@@ -444,10 +445,18 @@ pub fn router(shared: Arc<Shared>, auth: Arc<AuthState>) -> Router {
         .with_state(state.clone());
 
     let app = match dashboard {
-        Some(dir) => app.fallback(move |req: axum::extract::Request| {
-            let dir = dir.clone();
-            async move { dashboard_fallback(&dir, &req) }
-        }),
+        Some(dir) => {
+            // Async, in-memory, ETag/compression-aware (see `assets`).
+            let assets = Arc::new(assets::Assets::new(dir));
+            app.fallback(move |req: axum::extract::Request| {
+                let assets = Arc::clone(&assets);
+                async move {
+                    assets
+                        .serve(req.method(), req.uri().path(), req.headers())
+                        .await
+                }
+            })
+        }
         // No dashboard: still answer unknown paths with JSON, never an
         // empty opaque 404 (clients get a machine-readable error).
         None => app.fallback(|req: axum::extract::Request| async move {
@@ -542,84 +551,6 @@ async fn security_headers(
         h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     }
     res
-}
-
-/// Hardened dashboard/static fallback (replaces `ServeDir` + index
-/// fallback):
-///
-/// * `/api/*` (and `/metrics`) that matched no route answer **JSON 404** —
-///   serving `index.html` with status 200 would mask broken clients;
-/// * `..` segments and dotfiles are never served (the config, credentials
-///   and `.git` material can sit next to the dashboard directory);
-/// * a missing *asset* (has a file extension) is a visible 404; only
-///   extensionless paths fall back to `index.html` (SPA entry);
-/// * non-GET/HEAD methods are refused.
-fn dashboard_fallback(dir: &std::path::Path, req: &axum::extract::Request) -> Response {
-    let path = req.uri().path().to_string();
-    if path.starts_with("/api/") || path == "/metrics" {
-        return ApiError::NotFound(format!("no route for {path}")).into_response();
-    }
-    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
-        return (
-            StatusCode::METHOD_NOT_ALLOWED,
-            Json(json!({
-                "error": "method not allowed",
-                "code": "method_not_allowed",
-            })),
-        )
-            .into_response();
-    }
-
-    let rel = path.trim_start_matches('/');
-    let mut clean = std::path::PathBuf::from(&dir);
-    let mut last_seg = "";
-    if !rel.is_empty() {
-        for seg in rel.split('/') {
-            if seg.is_empty() || seg == "." || seg == ".." || seg.starts_with('.') {
-                return ApiError::NotFound(format!("no route for {path}")).into_response();
-            }
-            clean.push(seg);
-            last_seg = seg;
-        }
-    }
-    if !clean.starts_with(dir) {
-        return ApiError::NotFound(format!("no route for {path}")).into_response();
-    }
-
-    match std::fs::read(&clean) {
-        Ok(bytes) => {
-            let mime = match clean.extension().and_then(|e| e.to_str()) {
-                Some("html") => "text/html; charset=utf-8",
-                Some("css") => "text/css",
-                Some("js") => "application/javascript",
-                Some("ttf") => "font/ttf",
-                Some("woff") => "font/woff",
-                Some("woff2") => "font/woff2",
-                Some("svg") => "image/svg+xml",
-                Some("png") => "image/png",
-                Some("ico") => "image/x-icon",
-                _ => "application/octet-stream",
-            };
-            ([(header::CONTENT_TYPE, mime)], bytes).into_response()
-        }
-        Err(_) => {
-            if last_seg.contains('.') {
-                // An asset that does not exist must be a visible failure,
-                // not a silently-rending HTML page.
-                ApiError::NotFound(format!("asset not found: {path}")).into_response()
-            } else {
-                let index = dir.join("index.html");
-                match std::fs::read(&index) {
-                    Ok(b) => {
-                        ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], b).into_response()
-                    }
-                    Err(e) => {
-                        ApiError::Internal(format!("index.html unreadable: {e}")).into_response()
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Read-route guard: whenever any credential is configured (password auth or

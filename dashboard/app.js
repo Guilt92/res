@@ -1,4 +1,20 @@
 "use strict";
+import {
+  pad,
+  fmtClock,
+  fmtAgo,
+  fmtUptime,
+  rateClass,
+  fmtVal,
+  fmtBytes,
+  intOf,
+  escapeHtml,
+  median,
+  lastVal,
+  prevVal,
+  seriesFrom
+} from "./js/format.js";
+
 /* =========================================================================
  * State
  * ====================================================================== */
@@ -926,36 +942,15 @@ function csrfHeaders(){
   return h;
 }
 
-const pad = n => String(n).padStart(2, "0");
-function fmtClock(ms){ const d=new Date(ms); return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds()); }
 function fmtClockShort(ms){
   const d=new Date(ms);
   if (state.range==="24h"||state.range==="7d")
     return pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+pad(d.getHours())+":"+pad(d.getMinutes());
   return pad(d.getHours())+":"+pad(d.getMinutes());
 }
-function fmtAgo(secs){
-  if (secs==null) return "never";
-  if (secs < 60) return secs+"s ago";
-  if (secs < 3600) return Math.floor(secs/60)+"m ago";
-  if (secs < 86400) return Math.floor(secs/3600)+"h ago";
-  return Math.floor(secs/86400)+"d ago";
-}
-function fmtUptime(secs){
-  const d=Math.floor(secs/86400), h=Math.floor(secs%86400/3600), m=Math.floor(secs%3600/60);
-  if (d) return d+"d "+h+"h";
-  if (h) return h+"h "+m+"m";
-  return m+"m "+(secs%60)+"s";
-}
 /* `null`/undefined means "not measured yet" — never render it as a number.
    Zero is only ever shown when the gateway actually counted zero. */
 
-function rateClass(rate){
-  if (rate == null) return "";
-  if (rate >= 0.99) return "ok-num";
-  if (rate >= 0.95) return "warn-num";
-  return "bad-num";
-}
 function hydrateStyles(root){
   if (!root || !root.querySelectorAll) return;
   for (const el of root.querySelectorAll("[data-bg]")) el.style.backgroundColor = el.dataset.bg;
@@ -963,43 +958,7 @@ function hydrateStyles(root){
   for (const el of root.querySelectorAll("[data-width]")) el.style.width = el.dataset.width + "%";
 }
 
-function fmtVal(v, unit){
-  if (v==null || !isFinite(v)) return "N/A";
-  if (unit==="B") return fmtBytes(v);
-  const a = Math.abs(v);
-  let s;
-  if (unit==="%" || unit==="ms") s = a<10 ? v.toFixed(1) : v.toFixed(a<100?1:0);
-  else if (unit==="qps") s = a<10 ? v.toFixed(1) : v.toFixed(0);
-  else if (unit==="MB") s = v.toFixed(0);
-  else s = a<10 ? v.toFixed(1) : v.toFixed(0);
-  return s + (unit==="%" ? "%" : unit==="ms" ? "ms" : unit==="MB" ? "MB" : unit==="qps" ? "" : "");
-}
 /* Percent with an explicit "N/A" when there is no denominator. */
-function fmtPct(v, digits){
-  if (v==null || !isFinite(v)) return "N/A";
-  return (v*100).toFixed(digits==null?1:digits)+"%";
-}
-function seriesFrom(payload, key){
-  return (payload && payload.series && payload.series[key]) || [];
-}
-function lastVal(points){
-  for (let i=points.length-1;i>=0;i--) if (points[i][1]!=null) return points[i][1];
-  return null;
-}
-function prevVal(points){
-  let seen=false;
-  for (let i=points.length-1;i>=0;i--){
-    if (points[i][1]==null) continue;
-    if (seen) return points[i][1];
-    seen=true;
-  }
-  return null;
-}
-function median(arr){
-  if (!arr.length) return null;
-  const a=[...arr].sort((x,y)=>x-y), m=Math.floor(a.length/2);
-  return a.length%2 ? a[m] : (a[m-1]+a[m])/2;
-}
 function trendEl(cur, prev, unit, invertGood){
   if (cur==null || prev==null) return {txt:"", cls:"flat"};
   const d = cur - prev;
@@ -1199,13 +1158,6 @@ document.addEventListener("mouseleave", () => tip.style.display="none");
 /* =========================================================================
  * KPIs + assessment
  * ====================================================================== */
-function fmtBytes(n){
-  if (n==null || !isFinite(n)) return "N/A";
-  if (n >= 1048576) return (n/1048576).toFixed(1)+" MB";
-  if (n >= 1024) return (n/1024).toFixed(1)+" KB";
-  return Math.round(n)+" B";
-}
-function intOf(v){ return (v==null || !isFinite(v)) ? 0 : v; }
 
 function tilesHTML(list, primary){
   return list.map(k => {
@@ -1982,9 +1934,6 @@ function renderUpstreams(){
       renderUpstreams(); drawAllCharts();
     });
   }
-}
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
 /* =========================================================================

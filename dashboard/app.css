@@ -962,6 +962,19 @@ body[data-role="viewer"] #acl-table button[data-act]{
   .ev .k,.ev .m{grid-column:1}
   .pager{flex-wrap:wrap}
 }
+/* Touch targets: on narrow or coarse-pointer devices every control that sits
+   in the header, toolbar or form rows is at least 44x44 CSS px (the common
+   touch guideline). Small icon toggles keep their visual size and get an
+   invisible 44px hit area instead, so the layout does not change. */
+@media (max-width:980px),(pointer:coarse){
+  .hbar .btn,.ctl select,.ctl button,.theme-btn,.nav-toggle{min-height:44px;min-width:44px}
+  .ctl select{padding-top:0;padding-bottom:0}
+  .ghost,.primary,.danger,.pager button,.btn-sm{min-height:40px}
+  .sec-toggle,.side-collapse{position:relative}
+  .sec-toggle::after,.side-collapse::after{content:"";position:absolute;inset:-7px}
+  .nav-link{min-height:44px}
+  .hbar-secondary{height:auto;min-height:52px}
+}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;
     animation-iteration-count:1!important;transition-duration:.001ms!important}

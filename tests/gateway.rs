@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::*;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::RData;
+use rustls::pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Minimal HTTPS client for the management listener, trusting only the test
@@ -15,8 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn tls_http_get(addr: std::net::SocketAddr, path: &str) -> String {
     let pem = std::fs::read(TLS_CA_PATH).expect("read test CA");
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut std::io::Cursor::new(pem)).expect("parse test CA") {
-        roots.add(cert.into()).expect("add test CA");
+    for cert in rustls::pki_types::CertificateDer::pem_reader_iter(&mut std::io::Cursor::new(pem)) {
+        roots
+            .add(cert.expect("parse test CA"))
+            .expect("add test CA");
     }
     let config = std::sync::Arc::new(
         rustls::ClientConfig::builder()

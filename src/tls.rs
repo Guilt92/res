@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use rustls::pki_types::pem::{Error as PemError, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
@@ -31,11 +32,10 @@ pub fn load_server_config(
 ) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     let cert_file = File::open(cert_path)
         .with_context(|| format!("open TLS certificate {}", cert_path.display()))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .with_context(|| format!("parse TLS certificate {}", cert_path.display()))?
-        .into_iter()
-        .map(CertificateDer::from)
-        .collect();
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
+            .collect::<Result<_, _>>()
+            .with_context(|| format!("parse TLS certificate {}", cert_path.display()))?;
     if certs.is_empty() {
         return Err(anyhow!(
             "TLS certificate file {} contains no certificates",
@@ -45,40 +45,25 @@ pub fn load_server_config(
 
     let key_file = File::open(key_path)
         .with_context(|| format!("open TLS private key {}", key_path.display()))?;
-    let key = read_private_key(&mut BufReader::new(key_file))
-        .with_context(|| format!("parse TLS private key {}", key_path.display()))?
-        .ok_or_else(|| {
-            anyhow!(
+    let key = match PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)) {
+        Ok(key) => key,
+        Err(PemError::NoItemsFound) => {
+            return Err(anyhow!(
                 "TLS private key file {} contains no supported private key",
                 key_path.display()
-            )
-        })?;
+            ))
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("parse TLS private key {}", key_path.display()))
+        }
+    };
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("certificate and private key do not form a valid TLS identity")?;
     Ok(Arc::new(config))
-}
-
-fn read_private_key(
-    reader: &mut dyn std::io::BufRead,
-) -> std::io::Result<Option<PrivateKeyDer<'static>>> {
-    loop {
-        match rustls_pemfile::read_one(reader)? {
-            None => return Ok(None),
-            Some(rustls_pemfile::Item::RSAKey(key)) => {
-                return Ok(Some(PrivateKeyDer::Pkcs1(key.into())))
-            }
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => {
-                return Ok(Some(PrivateKeyDer::Pkcs8(key.into())))
-            }
-            Some(rustls_pemfile::Item::ECKey(key)) => {
-                return Ok(Some(PrivateKeyDer::Sec1(key.into())))
-            }
-            Some(_) => continue,
-        }
-    }
 }
 
 /// Load the trust anchors for a DoT upstream. `ca_file` is an operator PEM
@@ -90,8 +75,10 @@ pub fn upstream_roots(ca_file: Option<&Path>) -> anyhow::Result<rustls::RootCert
         Some(path) => {
             let file = File::open(path)
                 .with_context(|| format!("open TLS CA bundle {}", path.display()))?;
-            let certs = rustls_pemfile::certs(&mut BufReader::new(file))
-                .with_context(|| format!("parse TLS CA bundle {}", path.display()))?;
+            let certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_reader_iter(&mut BufReader::new(file))
+                    .collect::<Result<_, _>>()
+                    .with_context(|| format!("parse TLS CA bundle {}", path.display()))?;
             if certs.is_empty() {
                 return Err(anyhow!(
                     "TLS CA bundle {} contains no certificates",
@@ -100,7 +87,7 @@ pub fn upstream_roots(ca_file: Option<&Path>) -> anyhow::Result<rustls::RootCert
             }
             for cert in certs {
                 roots
-                    .add(CertificateDer::from(cert))
+                    .add(cert)
                     .with_context(|| format!("invalid CA certificate in {}", path.display()))?;
             }
         }
